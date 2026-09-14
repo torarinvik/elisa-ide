@@ -1,0 +1,117 @@
+# M00 spike: subprocess launch, stdout/stderr capture, cancellation, reaping.
+#
+# Proves the process service contract the build supervisor needs:
+#   * structured argument launch (no shell string concatenation);
+#   * simultaneous stdout and stderr capture without deadlock;
+#   * exit status and signal reporting;
+#   * prompt cancellation with escalation and reaping;
+#   * a missing executable fails closed instead of hanging.
+#
+# Exit codes identify the failed step.
+
+include "../../src/platform/posix/posix_process.elisa"
+
+@link_name("designer_report_text")
+extern designer_report_text(text: cstr) -> void
+
+module ProcessSpike:
+    private:
+        def bytes_equal(bytes: darray[u8], expected: sview) -> bool:
+            return false if bytes.count != expected.len.usize()
+            for index in 0..<expected.len |bytes, expected|:
+                return false if bytes[index] != expected[index]
+            return true
+
+        def argv_of(first: cstr, second: cstr, third: cstr) -> darray[cstr]:
+            arguments: mutable darray[cstr] = []
+            arguments.push(first)
+            arguments.push(second)
+            arguments.push(third)
+            return arguments
+
+        # Takes the handle by value: `&reference_parameter` did not produce the
+        # same pointer as `&local`, so the poll loop receives its own copy.
+        def wait_finish(process: PosixProcess::Process, budget_ms: i64) -> bool:
+            elapsed: mutable i64 = 0
+            while elapsed < budget_ms:
+                if PosixProcess::poll(&process, 20):
+                    return true
+                elapsed <- elapsed + 20
+            return false
+
+    public:
+        def run() -> i64:
+            # 1. Capture both streams and the exit status of a normal command.
+            arguments: darray[cstr] = argv_of("sh", "-c", "printf 'out-line\\n'; printf 'err-line\\n' 1>&2")
+            first: mutable PosixProcess::Process = PosixProcess::start(&arguments)
+            return 10 if not PosixProcess::valid(&first)
+            return 11 if not wait_finish(first, 5000)
+            stdout: mutable darray[u8] = []
+            stderr: mutable darray[u8] = []
+            _ = PosixProcess::read_stdout(&first, &stdout, 1024)
+            _ = PosixProcess::read_stderr(&first, &stderr, 1024)
+            first_status: PosixProcess::Status = PosixProcess::status(&first)
+            return 12 if not bytes_equal(stdout, "out-line\n")
+            return 13 if not bytes_equal(stderr, "err-line\n")
+            return 14 if first_status.exit_code != 0 or first_status.cancelled
+            PosixProcess::dispose(&first)
+
+            # 2. Nonzero exit status is reported, not treated as a spawn failure.
+            failing_args: darray[cstr] = argv_of("sh", "-c", "exit 7")
+            second: mutable PosixProcess::Process = PosixProcess::start(&failing_args)
+            return 15 if not PosixProcess::valid(&second)
+            return 16 if not wait_finish(second, 5000)
+            second_status: PosixProcess::Status = PosixProcess::status(&second)
+            return 17 if second_status.exit_code != 7
+            PosixProcess::dispose(&second)
+
+            # 3. Cancellation: SIGTERM, escalation if needed, reaped promptly.
+            sleepy_args: darray[cstr] = argv_of("sh", "-c", "sleep 30")
+            third: mutable PosixProcess::Process = PosixProcess::start(&sleepy_args)
+            return 18 if not PosixProcess::valid(&third)
+            return 19 if PosixProcess::poll(&third, 50)
+            started_ms: i64 = PosixProcess::monotonic_ms()
+            _ = PosixProcess::cancel(&third)
+            elapsed_ms: i64 = PosixProcess::monotonic_ms() - started_ms
+            third_status: PosixProcess::Status = PosixProcess::status(&third)
+            PosixProcess::dispose(&third)
+            return 20 if not third_status.finished
+            return 21 if not third_status.cancelled
+            return 22 if third_status.term_signal != 15 and third_status.term_signal != 9
+            return 23 if elapsed_ms > 5000
+
+            # 4. Large simultaneous output on both streams must not deadlock.
+            flood_args: darray[cstr] = argv_of("sh", "-c", "yes out | head -c 262144; yes err | head -c 262144 1>&2")
+            fourth: mutable PosixProcess::Process = PosixProcess::start(&flood_args)
+            return 24 if not PosixProcess::valid(&fourth)
+            return 25 if not wait_finish(fourth, 20000)
+            flood_out: mutable darray[u8] = []
+            flood_err: mutable darray[u8] = []
+            out_count: usize = PosixProcess::read_stdout(&fourth, &flood_out, 1048576)
+            err_count: usize = PosixProcess::read_stderr(&fourth, &flood_err, 1048576)
+            PosixProcess::dispose(&fourth)
+            return 26 if out_count != 262144
+            return 27 if err_count != 262144
+
+            # 5. A descendant may inherit stdout/stderr and keep those pipes
+            # open after the managed child exits. Child reaping must not wait
+            # for unrelated descendants to close the capture descriptors.
+            inherited_pipe_args: darray[cstr] = argv_of("sh", "-c", "sleep 2 & exit 0")
+            inherited_pipe: mutable PosixProcess::Process = PosixProcess::start(&inherited_pipe_args)
+            return 29 if not PosixProcess::valid(&inherited_pipe)
+            return 30 if not wait_finish(inherited_pipe, 1000)
+            inherited_pipe_status: PosixProcess::Status = PosixProcess::status(&inherited_pipe)
+            PosixProcess::dispose(&inherited_pipe)
+            return 31 if not inherited_pipe_status.finished or inherited_pipe_status.exit_code != 0
+
+            # 6. A missing executable fails closed.
+            missing_args: darray[cstr] = argv_of("designer_no_such_binary_xyz", "--version", "")
+            missing: mutable PosixProcess::Process = PosixProcess::start(&missing_args)
+            return 28 if PosixProcess::valid(&missing)
+            PosixProcess::dispose(&missing)
+
+            designer_report_text("spike process_spawn: ok")
+            return 0
+
+def main() -> i64:
+    return ProcessSpike::run()

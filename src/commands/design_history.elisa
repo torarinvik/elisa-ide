@@ -1,0 +1,164 @@
+# Undo/redo history with saved-state identity.
+#
+# Each entry stores the document before and after the command. Undo restores
+# the before state, redo the after state, so both directions are exact. Dirty
+# state compares the current encoded content fingerprint with the fingerprint
+# recorded at the last successful save, which stays correct across undo/redo
+# and history pruning.
+#
+# History is bounded by an estimated byte budget; the oldest entries are
+# dropped first, and pruning never drops past the current position.
+
+include "../model/design_limits.elisa"
+include "../model/design_text.elisa"
+include "../model/design_ids.elisa"
+include "../model/design_values.elisa"
+include "../model/design_node.elisa"
+include "../model/design_form.elisa"
+include "../model/design_clone.elisa"
+include "../model/fingerprint.elisa"
+include "../schema/design_json_encode.elisa"
+include "design_command.elisa"
+
+include "../../compiler/elisacore_std/elisacore_runtime.elisa"
+include "../../compiler/elisacore_std/collections.elisa"
+
+module DesignHistory:
+    private:
+        global mutable history_arena: Arena = Arena{begin: null, end: null, end_index: 0, strategy: 0}
+
+    public:
+        struct Entry:
+            description: mutable darray[u8]
+            before: mutable DesignForms::Form
+            after: mutable DesignForms::Form
+            bytes: mutable i64
+
+        def copy_entry_into(target: mutable Entry&, source: Entry&) -> void:
+            target.description <- source.description
+            DesignClone::clone_form_into(&target.before, &source.before)
+            DesignClone::clone_form_into(&target.after, &source.after)
+            target.bytes <- source.bytes
+
+        struct History:
+            entries: mutable darray[Entry]
+            position: mutable i64
+            saved_fingerprint: mutable u64
+            bytes_used: mutable i64
+            byte_budget: mutable i64
+
+        # The entries array is reserved in the history arena so a History held
+        # in a longer-lived struct (the session's state) does not dangle when
+        # this function returns (stage1-notes.md).
+        def empty_history(byte_budget: i64) -> History:
+            entries: mutable darray[Entry] = []
+            _ = arena_da_reserve(&history_arena, &entries, 1)
+            return History{entries: entries, position: 0, saved_fingerprint: 0, bytes_used: 0, byte_budget: byte_budget}
+
+        def snapshot_bytes(form: DesignForms::Form&) -> i64:
+            total: mutable i64 = form.strings.bytes.count.i64() + form.extensions.count.i64()
+            total <- total + form.nodes.count.i64() * 160
+            index: mutable i64 = 0
+            while index < form.nodes.count.i64():
+                total <- total + form.nodes[index.usize()].children.count.i64() * 32
+                total <- total + form.nodes[index.usize()].properties.count.i64() * 48
+                total <- total + form.nodes[index.usize()].events.count.i64() * 48
+                total <- total + form.nodes[index.usize()].extension_json.count.i64()
+                index <- index + 1
+            return total
+
+        def can_undo(history: History&) -> bool:
+            return history.position > 0
+
+        def can_redo(history: History&) -> bool:
+            return history.position < history.entries.count.i64()
+
+        def entry_label(history: History&, position: i64) -> sview:
+            if position < 0 or position >= history.entries.count.i64():
+                return ""
+            return DesignText::view_of(history.entries[position.usize()].description)
+
+        def undo_label(history: History&) -> sview:
+            return "" if not can_undo(history)
+            return DesignText::view_of(history.entries[(history.position - 1).usize()].description)
+
+        # Prepare -> commit -> record. False when the prepared command is
+        # invalid or stale, in which case the document and history are
+        # untouched.
+        def apply(history: mutable History&, form: mutable DesignForms::Form&, prepared: DesignCommand::Prepared&) -> bool:
+            if not DesignCommand::is_current(form, prepared):
+                return false
+            before: mutable DesignForms::Form = DesignForms::empty_form()
+            DesignClone::clone_form_into(&before, form)
+            if not DesignCommand::commit(form, prepared):
+                return false
+            after: mutable DesignForms::Form = DesignForms::empty_form()
+            DesignClone::clone_form_into(&after, form)
+            entry_bytes: i64 = snapshot_bytes(before) + snapshot_bytes(after)
+
+            # A new command discards the redo tail. Keep the accounting in
+            # sync with the retained entries so pruning continues to enforce
+            # the configured history budget after branching from an undo.
+            discarded_index: mutable i64 = history.position
+            while discarded_index < history.entries.count.i64():
+                history.bytes_used <- history.bytes_used - history.entries[discarded_index.usize()].bytes
+                discarded_index <- discarded_index + 1
+            history.entries.resize(history.position.usize())
+            _ = arena_da_reserve(&history_arena, &history.entries, history.entries.count + 1)
+            history.entries.push(Entry{
+                description: DesignText::copy_of(DesignText::view_of(prepared.description)),
+                before: DesignForms::empty_form(),
+                after: DesignForms::empty_form(),
+                bytes: entry_bytes,
+            })
+            entry_index: usize = history.entries.count - 1.usize()
+            DesignClone::clone_form_into(&history.entries[entry_index].before, &before)
+            DesignClone::clone_form_into(&history.entries[entry_index].after, &after)
+            history.position <- history.position + 1
+            history.bytes_used <- history.bytes_used + entry_bytes
+            prune(history)
+            return true
+
+        def undo(history: mutable History&, form: mutable DesignForms::Form&) -> bool:
+            if not can_undo(history):
+                return false
+            DesignClone::clone_form_into(form, &history.entries[(history.position - 1).usize()].before)
+            form.revision <- form.revision + 1
+            history.position <- history.position - 1
+            return true
+
+        def redo(history: mutable History&, form: mutable DesignForms::Form&) -> bool:
+            if not can_redo(history):
+                return false
+            DesignClone::clone_form_into(form, &history.entries[history.position.usize()].after)
+            form.revision <- form.revision + 1
+            history.position <- history.position + 1
+            return true
+
+        # Drop the oldest entries until the budget is met. Pruning never moves
+        # the current position past zero, so the current document state is
+        # always representable; older undo targets simply disappear.
+        def prune(history: mutable History&) -> void:
+            while history.bytes_used > history.byte_budget and history.entries.count > 1 and history.position > 0:
+                first: DesignHistory::Entry = history.entries[0.usize()]
+                history.bytes_used <- history.bytes_used - first.bytes
+                write: mutable i64 = 0
+                read: mutable i64 = 1
+                while read < history.entries.count.i64():
+                    copy_entry_into(&history.entries[write.usize()], &history.entries[read.usize()])
+                    write <- write + 1
+                    read <- read + 1
+                history.entries.resize(write.usize())
+                history.position <- history.position - 1
+
+        # Content identity, not revision identity: undoing back to the saved
+        # content clears the dirty flag even though the revision advanced.
+        def is_dirty(form: DesignForms::Form&, history: History&) -> bool:
+            current: u64 = Fingerprint::fnv1a64(DesignText::view_of(DesignEncode::encode_form(form)))
+            return current != history.saved_fingerprint
+
+        def mark_saved(form: DesignForms::Form&, history: mutable History&) -> void:
+            history.saved_fingerprint <- Fingerprint::fnv1a64(DesignText::view_of(DesignEncode::encode_form(form)))
+
+        def has_saved_state(history: History&) -> bool:
+            return history.saved_fingerprint != 0

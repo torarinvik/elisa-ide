@@ -1,0 +1,409 @@
+# Versioned little-endian payload schemas for preview messages.
+#
+# These codecs are deliberately independent of envelope encoding, IPC, and
+# message dispatch. Every payload starts with `ELPD`, a u16 schema version, and
+# a u16 payload-kind tag. Integer fields are little-endian. Geometry values use
+# unsigned Q10 fixed point (1/1024 logical unit) rather than target-native
+# floating-point bytes, so the wire representation is deterministic across
+# architectures. Decoded IDs and frame pixels borrow the input payload's
+# lifetime.
+
+include "../canvas/design_geometry.elisa"
+include "../model/design_ids.elisa"
+
+include "../../compiler/elisacore_std/elisacore_runtime.elisa"
+include "../../compiler/elisacore_std/collections.elisa"
+
+module PreviewPayloads:
+    private:
+        const PREFIX_BYTES: i64 = 8
+        const VIEWPORT_BYTES: i64 = 28
+        const FRAME_FIXED_BYTES: i64 = 36
+        const GEOMETRY_FIXED_BYTES: i64 = 12
+        const PIXEL_BYTES_LIMIT: i64 = 4194268
+        const GEOMETRY_RECORD_LIMIT: i64 = 4096
+        const COORDINATE_SCALE: f64 = 1024.0
+        const MAX_COORDINATE: f64 = 1000000000000.0
+        const MAX_FIXED_COORDINATE: u64 = 1024000000000000
+        const MAX_DEVICE_SCALE_MILLI: u32 = 16000
+
+        def push_u8(out: mutable darray[u8]&, value: u8) -> void:
+            out.push(value)
+
+        def push_u16(out: mutable darray[u8]&, value: u16) -> void:
+            out.push((value & 255).u8())
+            out.push((value >> 8).u8())
+
+        def push_u32(out: mutable darray[u8]&, value: u32) -> void:
+            for shift in 0..<4:
+                out.push(((value >> (shift * 8)) & 255).u8())
+
+        def push_u64(out: mutable darray[u8]&, value: u64) -> void:
+            for shift in 0..<8:
+                out.push(((value >> (shift * 8)) & 255).u8())
+
+        def read_u8(bytes: sview, offset: i64) -> u8:
+            return bytes[offset]
+
+        def read_u16(bytes: sview, offset: i64) -> u16:
+            return bytes[offset].u16() | (bytes[offset + 1].u16() << 8)
+
+        def read_u32(bytes: sview, offset: i64) -> u32:
+            value: mutable u32 = 0
+            for shift in 0..<4:
+                value <- value | (bytes[offset + shift].u32() << (shift * 8))
+            return value
+
+        def read_u64(bytes: sview, offset: i64) -> u64:
+            value: mutable u64 = 0
+            for shift in 0..<8:
+                value <- value | (bytes[offset + shift].u64() << (shift * 8))
+            return value
+
+        def has_magic(bytes: sview) -> bool:
+            return bytes[0] == 69 and bytes[1] == 76 and bytes[2] == 80 and bytes[3] == 68
+
+        def push_prefix(out: mutable darray[u8]&, kind: PayloadKind) -> void:
+            out.push(69)
+            out.push(76)
+            out.push(80)
+            out.push(68)
+            push_u16(out, VERSION)
+            push_u16(out, kind.u16())
+
+        def prefix_issue(bytes: sview, expected_kind: PayloadKind) -> Issue:
+            return Issue.Truncated if bytes.len < PREFIX_BYTES
+            return Issue.InvalidMagic if not has_magic(bytes)
+            return Issue.InvalidVersion if read_u16(bytes, 4) != VERSION
+            return Issue.InvalidPayloadKind if read_u16(bytes, 6) != expected_kind.u16()
+            return Issue.None
+
+        def fixed_length_issue(bytes: sview, expected_length: i64) -> Issue:
+            return Issue.Truncated if bytes.len < expected_length
+            return Issue.TrailingBytes if bytes.len > expected_length
+            return Issue.None
+
+        def image_layout_issue(width: u32, height: u32, bytes_per_pixel: u8, row_stride: u32) -> Issue:
+            return Issue.InvalidDimensions if width == 0 or height == 0
+            return Issue.InvalidBytesPerPixel if bytes_per_pixel < 1 or bytes_per_pixel > 4
+            minimum_row_bytes: u64 = width.u64() * bytes_per_pixel.u64()
+            return Issue.InvalidStride if row_stride.u64() < minimum_row_bytes
+            total_bytes: u64 = row_stride.u64() * height.u64()
+            return Issue.ImageTooLarge if total_bytes > PIXEL_BYTES_LIMIT.u64()
+            return Issue.None
+
+        def image_byte_count(height: u32, row_stride: u32) -> u64:
+            return row_stride.u64() * height.u64()
+
+        def viewport_issue(width: f64, height: f64, device_scale_milli: u32) -> Issue:
+            return Issue.InvalidDeviceScale if device_scale_milli == 0 or device_scale_milli > MAX_DEVICE_SCALE_MILLI
+            return Issue.InvalidDimensions if not DesignGeometry::valid_viewport(DesignGeometry::rect(0.0, 0.0, width, height))
+            return Issue.InvalidDimensions if fixed_coordinate(width) == 0 or fixed_coordinate(height) == 0
+            return Issue.InvalidDimensions if fixed_coordinate(width) > MAX_FIXED_COORDINATE or fixed_coordinate(height) > MAX_FIXED_COORDINATE
+            return Issue.None
+
+        def valid_id(id: sview) -> bool:
+            return false if id.len <= 0 or id.len > 24
+            parsed: DesignIds::DesignId = DesignIds::from_text(id)
+            return false if parsed.length != id.len
+            index: mutable i64 = 0
+            while index < id.len:
+                return false if DesignIds::byte_at(&parsed, index) != id[index]
+                index <- index + 1
+            return true
+
+        def same_id(left: sview, right: sview) -> bool:
+            return false if left.len != right.len
+            index: mutable i64 = 0
+            while index < left.len:
+                return false if left[index] != right[index]
+                index <- index + 1
+            return true
+
+        def valid_bounds(bounds: DesignGeometry::Rect) -> bool:
+            return false if not DesignGeometry::valid_rect(bounds)
+            return false if bounds.x < 0.0 or bounds.y < 0.0
+            return bounds.x <= MAX_COORDINATE and bounds.y <= MAX_COORDINATE and bounds.width <= MAX_COORDINATE and bounds.height <= MAX_COORDINATE
+
+        def valid_region_rect(rectangle: DesignGeometry::Rect) -> bool:
+            return valid_bounds(rectangle) and DesignGeometry::valid_viewport(rectangle)
+
+        def fixed_coordinate(value: f64) -> u64:
+            return (value * COORDINATE_SCALE).u64()
+
+        def decode_coordinate(value: u64) -> f64:
+            return value.f64() / COORDINATE_SCALE
+
+        def geometry_records_issue(records: darray[GeometryRecord]) -> Issue:
+            return Issue.TooManyGeometryRecords if records.count.i64() > GEOMETRY_RECORD_LIMIT
+            index: mutable i64 = 0
+            while index < records.count.i64():
+                record: GeometryRecord = records[index.usize()]
+                return Issue.InvalidId if not valid_id(record.id)
+                return Issue.InvalidRectangle if not valid_region_rect(record.bounds) or not valid_region_rect(record.clip)
+                previous: mutable i64 = 0
+                while previous < index:
+                    return Issue.DuplicateId if same_id(records[previous.usize()].id, record.id)
+                    previous <- previous + 1
+                index <- index + 1
+            return Issue.None
+
+    public:
+        const VERSION: u16 = 1
+        const MAX_IMAGE_BYTES: i64 = PIXEL_BYTES_LIMIT
+        const MAX_GEOMETRY_RECORDS: i64 = GEOMETRY_RECORD_LIMIT
+        const MAX_DEVICE_SCALE: u32 = MAX_DEVICE_SCALE_MILLI
+
+        const enum PayloadKind of u16:
+            SetViewport = 1
+            FrameReady = 2
+            GeometrySnapshot = 3
+
+        const enum Issue of i32:
+            None = 0
+            Truncated = 1
+            TrailingBytes = 2
+            InvalidMagic = 3
+            InvalidVersion = 4
+            InvalidPayloadKind = 5
+            ReservedBitsSet = 6
+            InvalidDimensions = 7
+            InvalidBytesPerPixel = 8
+            InvalidStride = 9
+            ImageTooLarge = 10
+            InvalidImageLength = 11
+            InvalidFrameId = 12
+            TooManyGeometryRecords = 13
+            InvalidId = 14
+            DuplicateId = 15
+            InvalidRectangle = 16
+            InvalidDeviceScale = 17
+
+        struct Viewport:
+            width: mutable f64
+            height: mutable f64
+            device_scale_milli: mutable u32
+
+        struct Frame:
+            frame_id: mutable u64
+            width: mutable u32
+            height: mutable u32
+            bytes_per_pixel: mutable u8
+            row_stride: mutable u32
+            pixels: mutable sview
+
+        struct GeometryRecord:
+            id: mutable sview
+            bounds: mutable DesignGeometry::Rect
+            clip: mutable DesignGeometry::Rect
+            visible: mutable bool
+            selectable: mutable bool
+
+        struct Geometry:
+            records: mutable darray[GeometryRecord]
+
+        struct ViewportEncodeResult:
+            code: mutable Issue
+            bytes: mutable darray[u8]
+
+        struct ViewportDecodeResult:
+            code: mutable Issue
+            value: mutable Viewport
+
+        struct FrameEncodeResult:
+            code: mutable Issue
+            bytes: mutable darray[u8]
+
+        struct FrameDecodeResult:
+            code: mutable Issue
+            value: mutable Frame
+
+        struct GeometryEncodeResult:
+            code: mutable Issue
+            bytes: mutable darray[u8]
+
+        struct GeometryDecodeResult:
+            code: mutable Issue
+            value: mutable Geometry
+
+        def encode_viewport(value: Viewport) -> ViewportEncodeResult:
+            issue: Issue = viewport_issue(value.width, value.height, value.device_scale_milli)
+            return ViewportEncodeResult{code: issue, bytes: []} if issue != Issue.None
+            out: mutable darray[u8] = []
+            push_prefix(&out, PayloadKind.SetViewport)
+            push_u64(&out, fixed_coordinate(value.width))
+            push_u64(&out, fixed_coordinate(value.height))
+            push_u32(&out, value.device_scale_milli)
+            return ViewportEncodeResult{code: Issue.None, bytes: out}
+
+        def decode_viewport(bytes: sview) -> ViewportDecodeResult:
+            empty: mutable ViewportDecodeResult = ViewportDecodeResult{code: Issue.Truncated, value: Viewport{width: 0.0, height: 0.0, device_scale_milli: 0}}
+            issue: mutable Issue = prefix_issue(bytes, PayloadKind.SetViewport)
+            empty.code <- issue
+            return empty if issue != Issue.None
+            issue <- fixed_length_issue(bytes, VIEWPORT_BYTES)
+            empty.code <- issue
+            return empty if issue != Issue.None
+            width_fixed: u64 = read_u64(bytes, 8)
+            height_fixed: u64 = read_u64(bytes, 16)
+            device_scale_milli: u32 = read_u32(bytes, 24)
+            if width_fixed > MAX_FIXED_COORDINATE or height_fixed > MAX_FIXED_COORDINATE:
+                empty.code <- Issue.InvalidDimensions
+                return empty
+            value: mutable Viewport = Viewport{width: decode_coordinate(width_fixed), height: decode_coordinate(height_fixed), device_scale_milli: device_scale_milli}
+            issue <- viewport_issue(value.width, value.height, value.device_scale_milli)
+            empty.code <- issue
+            return empty if issue != Issue.None
+            return ViewportDecodeResult{code: Issue.None, value: value}
+
+        def encode_frame(value: Frame) -> FrameEncodeResult:
+            return FrameEncodeResult{code: Issue.InvalidFrameId, bytes: []} if value.frame_id == 0
+            issue: Issue = image_layout_issue(value.width, value.height, value.bytes_per_pixel, value.row_stride)
+            return FrameEncodeResult{code: issue, bytes: []} if issue != Issue.None
+            required_bytes: u64 = image_byte_count(value.height, value.row_stride)
+            return FrameEncodeResult{code: Issue.InvalidImageLength, bytes: []} if value.pixels.len < 0 or value.pixels.len.u64() != required_bytes
+            out: mutable darray[u8] = []
+            push_prefix(&out, PayloadKind.FrameReady)
+            push_u64(&out, value.frame_id)
+            push_u32(&out, value.width)
+            push_u32(&out, value.height)
+            push_u8(&out, value.bytes_per_pixel)
+            push_u8(&out, 0)
+            push_u8(&out, 0)
+            push_u8(&out, 0)
+            push_u32(&out, value.row_stride)
+            push_u32(&out, value.pixels.len.u32())
+            index: mutable i64 = 0
+            while index < value.pixels.len:
+                out.push(value.pixels[index])
+                index <- index + 1
+            return FrameEncodeResult{code: Issue.None, bytes: out}
+
+        def decode_frame(bytes: sview) -> FrameDecodeResult:
+            empty: mutable FrameDecodeResult = FrameDecodeResult{code: Issue.Truncated, value: Frame{frame_id: 0, width: 0, height: 0, bytes_per_pixel: 0, row_stride: 0, pixels: ""}}
+            issue: mutable Issue = prefix_issue(bytes, PayloadKind.FrameReady)
+            empty.code <- issue
+            return empty if issue != Issue.None
+            return empty if bytes.len < FRAME_FIXED_BYTES
+            frame_id: u64 = read_u64(bytes, 8)
+            if frame_id == 0:
+                empty.code <- Issue.InvalidFrameId
+                return empty
+            width: u32 = read_u32(bytes, 16)
+            height: u32 = read_u32(bytes, 20)
+            bytes_per_pixel: u8 = read_u8(bytes, 24)
+            if read_u8(bytes, 25) != 0 or read_u8(bytes, 26) != 0 or read_u8(bytes, 27) != 0:
+                empty.code <- Issue.ReservedBitsSet
+                return empty
+            row_stride: u32 = read_u32(bytes, 28)
+            declared_pixels: u32 = read_u32(bytes, 32)
+            issue <- image_layout_issue(width, height, bytes_per_pixel, row_stride)
+            empty.code <- issue
+            return empty if issue != Issue.None
+            required_pixels: u64 = image_byte_count(height, row_stride)
+            if declared_pixels.u64() != required_pixels:
+                empty.code <- Issue.InvalidImageLength
+                return empty
+            expected_length: i64 = FRAME_FIXED_BYTES + declared_pixels.i64()
+            issue <- fixed_length_issue(bytes, expected_length)
+            empty.code <- issue
+            return empty if issue != Issue.None
+            frame: Frame = Frame{frame_id: frame_id, width: width, height: height, bytes_per_pixel: bytes_per_pixel, row_stride: row_stride, pixels: string_view_slice(bytes_view(bytes), FRAME_FIXED_BYTES, expected_length)}
+            return FrameDecodeResult{code: Issue.None, value: frame}
+
+        def encode_geometry(value: Geometry) -> GeometryEncodeResult:
+            issue: Issue = geometry_records_issue(value.records)
+            return GeometryEncodeResult{code: issue, bytes: []} if issue != Issue.None
+            out: mutable darray[u8] = []
+            push_prefix(&out, PayloadKind.GeometrySnapshot)
+            push_u32(&out, value.records.count.u32())
+            index: mutable i64 = 0
+            while index < value.records.count.i64():
+                record: GeometryRecord = value.records[index.usize()]
+                push_u8(&out, record.id.len.u8())
+                id_index: mutable i64 = 0
+                while id_index < record.id.len:
+                    out.push(record.id[id_index])
+                    id_index <- id_index + 1
+                push_u64(&out, fixed_coordinate(record.bounds.x))
+                push_u64(&out, fixed_coordinate(record.bounds.y))
+                push_u64(&out, fixed_coordinate(record.bounds.width))
+                push_u64(&out, fixed_coordinate(record.bounds.height))
+                push_u64(&out, fixed_coordinate(record.clip.x))
+                push_u64(&out, fixed_coordinate(record.clip.y))
+                push_u64(&out, fixed_coordinate(record.clip.width))
+                push_u64(&out, fixed_coordinate(record.clip.height))
+                flags: mutable u8 = 0
+                flags <- flags | 1 if record.visible
+                flags <- flags | 2 if record.selectable
+                push_u8(&out, flags)
+                index <- index + 1
+            return GeometryEncodeResult{code: Issue.None, bytes: out}
+
+        def decode_geometry(bytes: sview) -> GeometryDecodeResult:
+            empty: mutable GeometryDecodeResult = GeometryDecodeResult{code: Issue.Truncated, value: Geometry{records: []}}
+            issue: Issue = prefix_issue(bytes, PayloadKind.GeometrySnapshot)
+            empty.code <- issue
+            return empty if issue != Issue.None
+            return empty if bytes.len < GEOMETRY_FIXED_BYTES
+            count: u32 = read_u32(bytes, 8)
+            if count.i64() > GEOMETRY_RECORD_LIMIT:
+                empty.code <- Issue.TooManyGeometryRecords
+                return empty
+            records: mutable darray[GeometryRecord] = []
+            offset: mutable i64 = GEOMETRY_FIXED_BYTES
+            index: mutable i64 = 0
+            while index < count.i64():
+                if offset >= bytes.len:
+                    empty.code <- Issue.Truncated
+                    return empty
+                id_length: i64 = read_u8(bytes, offset).i64()
+                offset <- offset + 1
+                if id_length <= 0 or id_length > 24:
+                    empty.code <- Issue.InvalidId
+                    return empty
+                if offset + id_length > bytes.len:
+                    empty.code <- Issue.Truncated
+                    return empty
+                id: sview = string_view_slice(bytes_view(bytes), offset, offset + id_length)
+                if not valid_id(id):
+                    empty.code <- Issue.InvalidId
+                    return empty
+                offset <- offset + id_length
+                if offset + 65 > bytes.len:
+                    empty.code <- Issue.Truncated
+                    return empty
+                x_fixed: u64 = read_u64(bytes, offset)
+                y_fixed: u64 = read_u64(bytes, offset + 8)
+                width_fixed: u64 = read_u64(bytes, offset + 16)
+                height_fixed: u64 = read_u64(bytes, offset + 24)
+                clip_x_fixed: u64 = read_u64(bytes, offset + 32)
+                clip_y_fixed: u64 = read_u64(bytes, offset + 40)
+                clip_width_fixed: u64 = read_u64(bytes, offset + 48)
+                clip_height_fixed: u64 = read_u64(bytes, offset + 56)
+                flags: u8 = read_u8(bytes, offset + 64)
+                if flags & 252 != 0:
+                    empty.code <- Issue.ReservedBitsSet
+                    return empty
+                if x_fixed > MAX_FIXED_COORDINATE or y_fixed > MAX_FIXED_COORDINATE or width_fixed > MAX_FIXED_COORDINATE or height_fixed > MAX_FIXED_COORDINATE or clip_x_fixed > MAX_FIXED_COORDINATE or clip_y_fixed > MAX_FIXED_COORDINATE or clip_width_fixed > MAX_FIXED_COORDINATE or clip_height_fixed > MAX_FIXED_COORDINATE:
+                    empty.code <- Issue.InvalidRectangle
+                    return empty
+                bounds: DesignGeometry::Rect = DesignGeometry::rect(decode_coordinate(x_fixed), decode_coordinate(y_fixed), decode_coordinate(width_fixed), decode_coordinate(height_fixed))
+                clip: DesignGeometry::Rect = DesignGeometry::rect(decode_coordinate(clip_x_fixed), decode_coordinate(clip_y_fixed), decode_coordinate(clip_width_fixed), decode_coordinate(clip_height_fixed))
+                if not valid_region_rect(bounds) or not valid_region_rect(clip):
+                    empty.code <- Issue.InvalidRectangle
+                    return empty
+                record: GeometryRecord = GeometryRecord{id: id, bounds: bounds, clip: clip, visible: flags & 1 != 0, selectable: flags & 2 != 0}
+                previous: mutable i64 = 0
+                while previous < records.count.i64():
+                    if same_id(records[previous.usize()].id, record.id):
+                        empty.code <- Issue.DuplicateId
+                        return empty
+                    previous <- previous + 1
+                records.push(record)
+                offset <- offset + 65
+                index <- index + 1
+            if offset < bytes.len:
+                empty.code <- Issue.TrailingBytes
+                return empty
+            return GeometryDecodeResult{code: Issue.None, value: Geometry{records: records}}

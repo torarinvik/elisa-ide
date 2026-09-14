@@ -1,0 +1,219 @@
+# Framework-free geometry for the designer canvas.
+#
+# Coordinates use f64 logical units throughout this module. The shell converts
+# from its own logical coordinates at the viewport boundary; renderers may cast
+# to their preferred precision only when issuing draw calls. For a viewport
+# with shell origin O, view state (zoom Z, pan P), and form point F:
+#
+#   canvas = shell - O
+#   canvas = P + Z * F
+#
+# All public mutating/conversion helpers are checked. On failure they leave
+# their output/state unchanged. Finite geometry is bounded as well so later
+# additions and multiplications cannot silently produce unusable coordinates.
+
+module DesignGeometry:
+    public:
+        struct Point:
+            x: mutable f64
+            y: mutable f64
+
+        struct Rect:
+            x: mutable f64
+            y: mutable f64
+            width: mutable f64
+            height: mutable f64
+
+        struct ViewState:
+            zoom: mutable f64
+            pan_x: mutable f64
+            pan_y: mutable f64
+
+        const MIN_ZOOM: f64 = 0.05
+        const MAX_ZOOM: f64 = 32.0
+        const DEFAULT_ZOOM: f64 = 1.0
+        const MAX_COORDINATE: f64 = 1000000000000.0
+
+        def point(x: f64, y: f64) -> Point:
+            return Point{x: x, y: y}
+
+        def rect(x: f64, y: f64, width: f64, height: f64) -> Rect:
+            return Rect{x: x, y: y, width: width, height: height}
+
+        def identity_view() -> ViewState:
+            return ViewState{zoom: DEFAULT_ZOOM, pan_x: 0.0, pan_y: 0.0}
+
+        # This predicate rejects NaN, infinities, and finite values outside
+        # the safe logical-coordinate envelope.
+        def valid_scalar(value: f64) -> bool:
+            return value == value and value >= -MAX_COORDINATE and value <= MAX_COORDINATE
+
+        def valid_point(value: Point) -> bool:
+            return valid_scalar(value.x) and valid_scalar(value.y)
+
+        # Degenerate rectangles are useful for points/lines. Use
+        # valid_viewport when dimensions must be non-zero.
+        def valid_rect(value: Rect) -> bool:
+            return false if not valid_scalar(value.x) or not valid_scalar(value.y)
+            return false if not valid_scalar(value.width) or not valid_scalar(value.height)
+            return false if value.width < 0.0 or value.height < 0.0
+            return valid_scalar(value.x + value.width) and valid_scalar(value.y + value.height)
+
+        def valid_viewport(value: Rect) -> bool:
+            return valid_rect(value) and value.width > 0.0 and value.height > 0.0
+
+        def valid_view(value: ViewState) -> bool:
+            return value.zoom >= MIN_ZOOM and value.zoom <= MAX_ZOOM and valid_scalar(value.pan_x) and valid_scalar(value.pan_y)
+
+        def clamp_zoom(requested: f64, output: mutable f64&) -> bool:
+            return false if not valid_scalar(requested)
+            output <- MIN_ZOOM if requested < MIN_ZOOM
+            output <- MAX_ZOOM if requested > MAX_ZOOM
+            output <- requested if requested >= MIN_ZOOM and requested <= MAX_ZOOM
+            return true
+
+        # Zoom requests are clamped to a useful positive range. Pan is bounded
+        # by valid_scalar. The combined setter validates before mutating.
+        def set_zoom(view: mutable ViewState&, requested: f64) -> bool:
+            zoom: mutable f64 = DEFAULT_ZOOM
+            return false if not clamp_zoom(requested, &zoom)
+            view.zoom <- zoom
+            return true
+
+        def set_pan(view: mutable ViewState&, pan_x: f64, pan_y: f64) -> bool:
+            return false if not valid_scalar(pan_x) or not valid_scalar(pan_y)
+            view.pan_x <- pan_x
+            view.pan_y <- pan_y
+            return true
+
+        def set_view(view: mutable ViewState&, requested_zoom: f64, pan_x: f64, pan_y: f64) -> bool:
+            return false if not valid_scalar(pan_x) or not valid_scalar(pan_y)
+            zoom: mutable f64 = DEFAULT_ZOOM
+            return false if not clamp_zoom(requested_zoom, &zoom)
+            view.zoom <- zoom
+            view.pan_x <- pan_x
+            view.pan_y <- pan_y
+            return true
+
+        def contains(rectangle: Rect, value: Point) -> bool:
+            return false if not valid_viewport(rectangle) or not valid_point(value)
+            return value.x >= rectangle.x and value.y >= rectangle.y and value.x <= rectangle.x + rectangle.width and value.y <= rectangle.y + rectangle.height
+
+        # Convert between shell logical coordinates and canvas viewport-local
+        # coordinates. The viewport must have positive dimensions so a zero or
+        # invalid window size never enters pointer math.
+        def shell_to_canvas(viewport: Rect, shell_point: Point, output: mutable Point&) -> bool:
+            return false if not valid_viewport(viewport) or not valid_point(shell_point)
+            candidate: Point = point(shell_point.x - viewport.x, shell_point.y - viewport.y)
+            return false if not valid_point(candidate)
+            output.x <- candidate.x
+            output.y <- candidate.y
+            return true
+
+        def canvas_to_shell(viewport: Rect, canvas_point: Point, output: mutable Point&) -> bool:
+            return false if not valid_viewport(viewport) or not valid_point(canvas_point)
+            candidate: Point = point(canvas_point.x + viewport.x, canvas_point.y + viewport.y)
+            return false if not valid_point(candidate)
+            output.x <- candidate.x
+            output.y <- candidate.y
+            return true
+
+        # Form/design coordinates -> viewport-local canvas coordinates.
+        def form_to_canvas(view: ViewState, form_point: Point, output: mutable Point&) -> bool:
+            return false if not valid_view(view) or not valid_point(form_point)
+            candidate: Point = point(view.pan_x + view.zoom * form_point.x, view.pan_y + view.zoom * form_point.y)
+            return false if not valid_point(candidate)
+            output.x <- candidate.x
+            output.y <- candidate.y
+            return true
+
+        # Inverse of form_to_canvas. Zoom validation guarantees a non-zero
+        # divisor; the checked result also catches overflow/out-of-range input.
+        def canvas_to_form(view: ViewState, canvas_point: Point, output: mutable Point&) -> bool:
+            return false if not valid_view(view) or not valid_point(canvas_point)
+            candidate: Point = point((canvas_point.x - view.pan_x) / view.zoom, (canvas_point.y - view.pan_y) / view.zoom)
+            return false if not valid_point(candidate)
+            output.x <- candidate.x
+            output.y <- candidate.y
+            return true
+
+        def form_to_shell(viewport: Rect, view: ViewState, form_point: Point, output: mutable Point&) -> bool:
+            canvas: mutable Point = point(0.0, 0.0)
+            return false if not form_to_canvas(view, form_point, &canvas)
+            return canvas_to_shell(viewport, canvas, output)
+
+        def shell_to_form(viewport: Rect, view: ViewState, shell_point: Point, output: mutable Point&) -> bool:
+            canvas: mutable Point = point(0.0, 0.0)
+            return false if not shell_to_canvas(viewport, shell_point, &canvas)
+            return canvas_to_form(view, canvas, output)
+
+        def form_rect_to_canvas(view: ViewState, form_rect: Rect, output: mutable Rect&) -> bool:
+            return false if not valid_view(view) or not valid_rect(form_rect)
+            candidate: Rect = rect(view.pan_x + view.zoom * form_rect.x, view.pan_y + view.zoom * form_rect.y, view.zoom * form_rect.width, view.zoom * form_rect.height)
+            return false if not valid_rect(candidate)
+            output.x <- candidate.x
+            output.y <- candidate.y
+            output.width <- candidate.width
+            output.height <- candidate.height
+            return true
+
+        def canvas_rect_to_form(view: ViewState, canvas_rect: Rect, output: mutable Rect&) -> bool:
+            return false if not valid_view(view) or not valid_rect(canvas_rect)
+            candidate: Rect = rect((canvas_rect.x - view.pan_x) / view.zoom, (canvas_rect.y - view.pan_y) / view.zoom, canvas_rect.width / view.zoom, canvas_rect.height / view.zoom)
+            return false if not valid_rect(candidate)
+            output.x <- candidate.x
+            output.y <- candidate.y
+            output.width <- candidate.width
+            output.height <- candidate.height
+            return true
+
+        # Zoom around a shell-space pointer anchor while preserving the same
+        # design point underneath it. The pointer must be inside a non-empty
+        # viewport; all checks happen before the view is changed.
+        def zoom_at(view: mutable ViewState&, viewport: Rect, shell_anchor: Point, requested_zoom: f64) -> bool:
+            return false if not valid_view(view) or not valid_viewport(viewport) or not contains(viewport, shell_anchor)
+            anchor_canvas: mutable Point = point(0.0, 0.0)
+            return false if not shell_to_canvas(viewport, shell_anchor, &anchor_canvas)
+            anchor_form: mutable Point = point(0.0, 0.0)
+            return false if not canvas_to_form(view, anchor_canvas, &anchor_form)
+            zoom: mutable f64 = DEFAULT_ZOOM
+            return false if not clamp_zoom(requested_zoom, &zoom)
+            candidate: mutable ViewState = identity_view()
+            candidate.zoom <- zoom
+            candidate.pan_x <- anchor_canvas.x - zoom * anchor_form.x
+            candidate.pan_y <- anchor_canvas.y - zoom * anchor_form.y
+            return false if not valid_view(candidate)
+            view.zoom <- candidate.zoom
+            view.pan_x <- candidate.pan_x
+            view.pan_y <- candidate.pan_y
+            return true
+
+        # Fit a positive-sized form rectangle inside a positive viewport with
+        # symmetric logical-unit padding. A degenerate viewport/form or padding
+        # that consumes the viewport is rejected without changing the view.
+        def fit_to_viewport(view: mutable ViewState&, form_rect: Rect, viewport: Rect, padding: f64) -> bool:
+            return false if not valid_rect(form_rect) or form_rect.width <= 0.0 or form_rect.height <= 0.0
+            return false if not valid_viewport(viewport) or not valid_scalar(padding) or padding < 0.0
+            inner_width: f64 = viewport.width - 2.0 * padding
+            inner_height: f64 = viewport.height - 2.0 * padding
+            return false if inner_width <= 0.0 or inner_height <= 0.0
+            fit_x: f64 = inner_width / form_rect.width
+            fit_y: f64 = inner_height / form_rect.height
+            requested: f64 = fit_x if fit_x < fit_y else fit_y
+            zoom: mutable f64 = DEFAULT_ZOOM
+            return false if not clamp_zoom(requested, &zoom)
+            form_center_x: f64 = form_rect.x + form_rect.width / 2.0
+            form_center_y: f64 = form_rect.y + form_rect.height / 2.0
+            # Pan is viewport-local. The shell origin is applied later by
+            # form_to_shell, so it must not be included in the centered pan.
+            viewport_center_x: f64 = viewport.width / 2.0
+            viewport_center_y: f64 = viewport.height / 2.0
+            candidate: mutable ViewState = identity_view()
+            candidate.zoom <- zoom
+            candidate.pan_x <- viewport_center_x - zoom * form_center_x
+            candidate.pan_y <- viewport_center_y - zoom * form_center_y
+            return false if not valid_view(candidate)
+            view.zoom <- candidate.zoom
+            view.pan_x <- candidate.pan_x
+            view.pan_y <- candidate.pan_y
+            return true

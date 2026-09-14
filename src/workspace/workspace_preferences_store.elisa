@@ -1,0 +1,189 @@
+# POSIX persistence adapter for local editor preferences.
+#
+# WorkspacePreferences owns the versioned, validated data model and JSON
+# codec. This module supplies the native file location and atomic disk I/O.
+# The path can be overridden for tests and portable launches; otherwise it
+# follows the XDG config-home convention and finally falls back to ~/.config.
+
+include "workspace_preferences.elisa"
+include "../platform/posix/posix_file.elisa"
+
+module WorkspacePreferencesStore:
+    private:
+        const MAX_CONFIG_PATH_BYTES: i64 = 4096
+        const MAX_PREFERENCES_BYTES: usize = 1048576
+
+        def valid_path(path: sview, absolute_required: bool) -> bool:
+            return false if path.len <= 0 or path.len > MAX_CONFIG_PATH_BYTES
+            return false if absolute_required and path[0] != 47
+            index: mutable i64 = 0
+            while index < path.len:
+                byte: u8 = path[index]
+                return false if byte == 0 or byte < 32 or byte == 127
+                index <- index + 1
+            return true
+
+        def append_view(target: mutable darray[u8]&, value: sview) -> void:
+            DesignText::push_view(target, value)
+
+        def append_joined(target: mutable darray[u8]&, base: sview, suffix: sview) -> void:
+            append_view(target, base)
+            if base.len > 0 and base[base.len - 1] != 47:
+                target.push(47)
+            append_view(target, suffix)
+
+        def as_cstr(path: mutable darray[u8]&) -> cstr:
+            return (&path[0]).cast[cstr] can Unsafe.PointerCast
+
+        def path_length(path: mutable darray[u8]&) -> i64:
+            return 0 if path.count == 0
+            return path.count.i64() - 1 if path[path.count - 1] == 0
+            return path.count.i64()
+
+        # Create each directory component above `path`. Only the parent path
+        # is touched; the final component is always the preferences file.
+        def ensure_parent_directories(path: mutable darray[u8]&) -> bool:
+            length: i64 = path_length(path)
+            return false if length <= 0 or length > MAX_CONFIG_PATH_BYTES
+            last_slash: mutable i64 = -1
+            index: mutable i64 = 0
+            while index < length:
+                last_slash <- index if path[index.usize()] == 47
+                index <- index + 1
+            return true if last_slash < 0
+
+            index <- 0
+            while index <= last_slash:
+                # A separator closes a parent prefix. Passing each prefix to
+                # mkdir is idempotent because the POSIX adapter treats EEXIST
+                # as success, and it correctly handles absolute and relative
+                # paths without rewriting their spelling.
+                if path[index.usize()] == 47 and index > 0:
+                    prefix: mutable darray[u8] = []
+                    copy_index: mutable i64 = 0
+                    while copy_index < index:
+                        prefix.push(path[copy_index.usize()])
+                        copy_index <- copy_index + 1
+                    prefix.push(0)
+                    if not PosixFile::ensure_directory(as_cstr(&prefix)):
+                        return false
+                index <- index + 1
+            return true
+
+        def load_at(path: cstr, sink: mutable DesignDiagnostics::Sink&) -> WorkspacePreferences::Preferences:
+            can Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast:
+                preferences: mutable WorkspacePreferences::Preferences = WorkspacePreferences::empty()
+                bytes: mutable darray[u8] = []
+                amount: i64 = PosixFile::read_bytes_result(&bytes, path, MAX_PREFERENCES_BYTES)
+                if amount < 0:
+                    if not PosixFile::read_error_is_not_found(amount):
+                        _ = DesignDiagnostics::report_warning(sink, DesignDiagnostics::Code.InvalidReference, "workspacePreferences", "could not read workspace preferences; default pane sizes are used")
+                    return preferences
+                if amount == 0:
+                    return preferences
+                return WorkspacePreferences::decode(DesignText::view_of(bytes), sink)
+
+        def save_ratios_at(path: mutable darray[u8]&, left: f64, right: f64, bottom: f64) -> bool:
+            can Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast:
+                return false if path_length(path) <= 0
+
+                # Preserve other recognized local preferences from the same
+                # file. Refuse to replace corrupt or future-schema data; a
+                # layout save must not destroy settings this build cannot read.
+                bytes: mutable darray[u8] = []
+                path_c: cstr = as_cstr(path)
+                amount: i64 = PosixFile::read_bytes_result(&bytes, path_c, MAX_PREFERENCES_BYTES)
+                preferences: mutable WorkspacePreferences::Preferences = WorkspacePreferences::empty()
+                if amount >= 0:
+                    if amount > 0:
+                        existing_sink: mutable DesignDiagnostics::Sink = DesignDiagnostics::empty_sink()
+                        preferences <- WorkspacePreferences::decode(DesignText::view_of(bytes), &existing_sink)
+                        return false if existing_sink.error_count > 0
+                elif not PosixFile::read_error_is_not_found(amount):
+                    return false
+
+                preferences.left_pane_ratio <- left
+                preferences.right_pane_ratio <- right
+                preferences.bottom_pane_ratio <- bottom
+                encode_sink: mutable DesignDiagnostics::Sink = DesignDiagnostics::empty_sink()
+                encoded: darray[u8] = WorkspacePreferences::encode(preferences, &encode_sink)
+                return false if encoded.count == 0 or encode_sink.error_count > 0
+                return false if not ensure_parent_directories(path)
+
+                payload: sview = DesignText::view_of(encoded)
+                source: i64 error[FileReplaceError] = PosixFile::atomic_write(path_c, payload)
+                written: i64 = catch source:
+                    value:
+                        value
+                    FileReplaceError.CommittedButNotDurable:
+                        encoded.count.i64()
+                    error e:
+                        -1
+                return written >= 0
+
+    public:
+        # Resolve in priority order: explicit file override, XDG config home,
+        # then HOME/.config. The returned byte array includes its C terminator.
+        # XDG_CONFIG_HOME and HOME are required to be absolute; an invalid or
+        # empty value falls through to the next option.
+        def resolve_config_path(explicit_file: sview, xdg_config_home: sview, home: sview) -> darray[u8]:
+            path: mutable darray[u8] = []
+            if valid_path(explicit_file, false):
+                append_view(&path, explicit_file)
+            elif valid_path(xdg_config_home, true):
+                append_joined(&path, xdg_config_home, "elisa-ide/preferences.json")
+            elif valid_path(home, true):
+                append_joined(&path, home, ".config/elisa-ide/preferences.json")
+            else:
+                return path
+            return [] if path.count.i64() > MAX_CONFIG_PATH_BYTES
+            path.push(0)
+            return path
+
+        def config_path_text(path: darray[u8]) -> sview:
+            return "" if path.count == 0
+            length: mutable usize = path.count
+            length <- length - 1 if path[length - 1] == 0
+            return sview(&path[0], 0, length.i64())
+
+        def current_config_path() -> darray[u8]:
+            explicit_opt: cstr? = getenv("ELISA_IDE_CONFIG")
+            xdg_opt: cstr? = getenv("XDG_CONFIG_HOME")
+            home_opt: cstr? = getenv("HOME")
+            explicit: mutable sview = ""
+            xdg: mutable sview = ""
+            home: mutable sview = ""
+            if explicit_opt is value:
+                explicit <- sview(value, 0, -1)
+            else:
+                legacy_opt: cstr? = getenv("ELISA_UI_DESIGNER_CONFIG")
+                if legacy_opt is value:
+                    explicit <- sview(value, 0, -1)
+            if xdg_opt is value:
+                xdg <- sview(value, 0, -1)
+            if home_opt is value:
+                home <- sview(value, 0, -1)
+            return resolve_config_path(explicit, xdg, home)
+
+        def load_at_path(path: cstr, sink: mutable DesignDiagnostics::Sink&) -> WorkspacePreferences::Preferences:
+            return load_at(path, sink)
+
+        def load_at_buffer(path: mutable darray[u8]&, sink: mutable DesignDiagnostics::Sink&) -> WorkspacePreferences::Preferences:
+            can Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast:
+                return WorkspacePreferences::empty() if path_length(path) <= 0
+                return load_at(as_cstr(path), sink)
+
+        def load_current(sink: mutable DesignDiagnostics::Sink&) -> WorkspacePreferences::Preferences:
+            can Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast:
+                path: mutable darray[u8] = current_config_path()
+                return WorkspacePreferences::empty() if path.count == 0
+                return load_at(as_cstr(&path), sink)
+
+        def save_ratios_at_path(path: mutable darray[u8]&, left: f64, right: f64, bottom: f64) -> bool:
+            return save_ratios_at(path, left, right, bottom)
+
+        def save_current_ratios(left: f64, right: f64, bottom: f64) -> bool:
+            can Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast:
+                path: darray[u8] = current_config_path()
+                return false if path.count == 0
+                return save_ratios_at(path, left, right, bottom)

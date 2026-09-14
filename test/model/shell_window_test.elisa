@@ -1,0 +1,34 @@
+# Shell row-window behavior for bounded palette/panel widget pools.
+
+include "../../src/shell/shell_window.elisa"
+include "test_support.elisa"
+
+module ShellWindowTest:
+    public:
+        def run() -> i64:
+            empty: ShellWindow::Window = ShellWindow::resolve(0, 0, 12)
+            TestSupport::check("empty window has no pages", empty.page_count == 0 and empty.first == 0 and empty.finish == 0)
+            TestSupport::check("empty window exposes no row", ShellWindow::logical_index(empty, 0) == -1)
+
+            first: ShellWindow::Window = ShellWindow::resolve(256, 0, 12)
+            TestSupport::check("first page has twelve rows", first.page == 0 and first.first == 0 and first.finish == 12)
+            TestSupport::check("first page has a next page", ShellWindow::has_next(first) and not ShellWindow::has_previous(first))
+            TestSupport::check("first page slot maps to logical row", ShellWindow::logical_index(first, 11) == 11)
+
+            middle: ShellWindow::Window = ShellWindow::resolve(256, 10, 12)
+            TestSupport::check("middle page maps to logical rows", middle.page == 10 and middle.first == 120 and middle.finish == 132)
+            TestSupport::check("middle page has both directions", ShellWindow::has_previous(middle) and ShellWindow::has_next(middle))
+
+            last: ShellWindow::Window = ShellWindow::resolve(256, 99, 12)
+            TestSupport::check("out of range page clamps to end", last.page == 21 and last.first == 252 and last.finish == 256)
+            TestSupport::check("partial final page hides spare slots", ShellWindow::logical_index(last, 3) == 255 and ShellWindow::logical_index(last, 4) == -1)
+            TestSupport::check("last page has no next page", not ShellWindow::has_next(last))
+
+            negative: ShellWindow::Window = ShellWindow::resolve(-5, -2, 0)
+            TestSupport::check("bad counts and sizes normalize", negative.total == 0 and negative.page_size == 1 and negative.page_count == 0)
+            singleton: ShellWindow::Window = ShellWindow::resolve(1, -3, 1)
+            TestSupport::check("negative page clamps to start", singleton.page == 0 and singleton.finish == 1 and not ShellWindow::has_next(singleton))
+            return TestSupport::report("shell_window")
+
+def main() -> i64:
+    return ShellWindowTest::run()

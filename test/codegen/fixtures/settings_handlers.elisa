@@ -1,0 +1,13 @@
+# User-owned handlers included explicitly by the generated application file.
+# The generated view references these names; this module stays outside generator
+# ownership so regeneration cannot replace application behavior.
+module SettingsHandlers:
+    public:
+        def name_changed(widget: usize, event: i32) -> void:
+            pass
+
+        def reset_clicked(widget: usize, event: i32) -> void:
+            pass
+
+        def save_clicked(widget: usize, event: i32) -> void:
+            pass

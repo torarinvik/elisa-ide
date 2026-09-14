@@ -1,0 +1,153 @@
+# Editor shell retained handles and projection state.
+#
+# The shell is a UI unit (elisa-ui framework only). All shell state lives in one
+# `Shell` record that is passed by reference to every function: a file-scope
+# `darray` global cannot be indexed or resized on stage1, but a `darray` field
+# of a reference parameter can (docs/development/stage1-notes.md).
+
+include "../../framework/src/platform/sdl3/ui_sdl3_flat.elisa"
+
+const MAX_HIERARCHY_ROWS: i32 = 12
+const MAX_PALETTE_ROWS: i32 = 12
+const MAX_INSPECTOR_ROWS: i32 = 12
+const MAX_PROBLEM_ROWS: i32 = 12
+const STATUS_CAPACITY: usize = 256
+
+struct ShellProjection:
+    hierarchy_count: mutable i64
+    palette_count: mutable i64
+    inspector_count: mutable i64
+    problem_count: mutable i64
+    node_count: mutable i64
+    selection_count: mutable i64
+    dirty: mutable bool
+
+struct Shell:
+    root: mutable UiHandles::Handle
+    menu_bar: mutable UiHandles::Handle
+    toolbar: mutable UiHandles::Handle
+    compact_navigation: mutable UiHandles::Handle
+    compact_path_row: mutable UiHandles::Handle
+    compact_open_path_field: mutable UiHandles::Handle
+    compact_open_button: mutable UiHandles::Handle
+    compact_save_as_button: mutable UiHandles::Handle
+    compact_palette_button: mutable UiHandles::Handle
+    compact_canvas_button: mutable UiHandles::Handle
+    compact_inspector_button: mutable UiHandles::Handle
+    body: mutable UiHandles::Handle
+    left_pane: mutable UiHandles::Handle
+    left_splitter: mutable UiHandles::Handle
+    center_pane: mutable UiHandles::Handle
+    right_splitter: mutable UiHandles::Handle
+    right_pane: mutable UiHandles::Handle
+    surface_pane: mutable UiHandles::Handle
+    preview_status: mutable UiHandles::Handle
+    preview_canvas: mutable UiHandles::Handle
+    bottom_splitter: mutable UiHandles::Handle
+    bottom_pane: mutable UiHandles::Handle
+    inspector_list: mutable UiHandles::Handle
+    palette_list: mutable UiHandles::Handle
+    hierarchy_list: mutable UiHandles::Handle
+    problem_list: mutable UiHandles::Handle
+    hierarchy_previous_button: mutable UiHandles::Handle
+    hierarchy_next_button: mutable UiHandles::Handle
+    hierarchy_page_label: mutable UiHandles::Handle
+    problem_previous_button: mutable UiHandles::Handle
+    problem_next_button: mutable UiHandles::Handle
+    problem_page_label: mutable UiHandles::Handle
+    status_line: mutable UiHandles::Handle
+    title_label: mutable UiHandles::Handle
+    palette_search: mutable UiHandles::Handle
+    new_button: mutable UiHandles::Handle
+    save_button: mutable UiHandles::Handle
+    undo_button: mutable UiHandles::Handle
+    redo_button: mutable UiHandles::Handle
+    delete_button: mutable UiHandles::Handle
+    duplicate_button: mutable UiHandles::Handle
+    open_path_field: mutable UiHandles::Handle
+    open_button: mutable UiHandles::Handle
+    save_as_button: mutable UiHandles::Handle
+    # Fixed arrays, not `darray`: a `darray` field of a long-lived record loses
+    # its contents on stage1, while a fixed array field is indexed and assigned
+    # reliably (docs/development/stage1-notes.md).
+    hierarchy_rows: mutable UiHandles::Handle[12]
+    palette_rows: mutable UiHandles::Handle[12]
+    palette_source_indices: mutable i32[12]
+    inspector_rows: mutable UiHandles::Handle[12]
+    inspector_editors: mutable UiHandles::Handle[12]
+    inspector_action_buttons: mutable UiHandles::Handle[12]
+    inspector_readonly_values: mutable UiHandles::Handle[12]
+    inspector_tags: mutable i32[12]
+    inspector_edit_dirty: mutable bool[12]
+    refreshing_inspector: mutable bool
+    problem_rows: mutable UiHandles::Handle[12]
+    palette_count: mutable i32
+    hierarchy_count: mutable i32
+    inspector_count: mutable i32
+    problem_count: mutable i32
+    hierarchy_page: mutable i32
+    problem_page: mutable i32
+    projection: mutable ShellProjection
+    status_storage: mutable u8[256]
+    status_length: mutable i64
+    form_title_storage: mutable u8[256]
+    form_title_length: mutable i64
+    left_ratio: mutable f32
+    right_ratio: mutable f32
+    bottom_ratio: mutable f32
+    pane_preferences_dirty: mutable bool
+    active_split: mutable i32
+    compact_mode: mutable bool
+    compact_panel: mutable i32
+    dark: mutable bool
+    host_running: mutable bool
+    preview_resource: mutable UiResources::ResourceHandle
+    preview_image: mutable UiCore::ImageRef
+    preview_revision: mutable u64
+    preview_pending: mutable bool
+    preview_ready: mutable bool
+    preview_width: mutable usize
+    preview_height: mutable usize
+    preview_row_stride: mutable usize
+
+def empty_handle() -> UiHandles::Handle:
+    return UiHandles::Handle{widget_id: UiFlat::NONE.u32(), tree_id: 0}
+
+def new_shell() -> Shell:
+    return Shell{
+        root: empty_handle(), menu_bar: empty_handle(), toolbar: empty_handle(), compact_navigation: empty_handle(), compact_path_row: empty_handle(),
+        compact_open_path_field: empty_handle(), compact_open_button: empty_handle(), compact_save_as_button: empty_handle(),
+        compact_palette_button: empty_handle(), compact_canvas_button: empty_handle(), compact_inspector_button: empty_handle(),
+        body: empty_handle(), left_pane: empty_handle(), left_splitter: empty_handle(), center_pane: empty_handle(),
+        right_splitter: empty_handle(), right_pane: empty_handle(), surface_pane: empty_handle(), preview_status: empty_handle(),
+        preview_canvas: empty_handle(), bottom_splitter: empty_handle(),
+        bottom_pane: empty_handle(), inspector_list: empty_handle(), palette_list: empty_handle(),
+        hierarchy_list: empty_handle(), problem_list: empty_handle(), status_line: empty_handle(),
+        hierarchy_previous_button: empty_handle(), hierarchy_next_button: empty_handle(), hierarchy_page_label: empty_handle(),
+        problem_previous_button: empty_handle(), problem_next_button: empty_handle(), problem_page_label: empty_handle(),
+        title_label: empty_handle(), palette_search: empty_handle(), new_button: empty_handle(), save_button: empty_handle(),
+        undo_button: empty_handle(), redo_button: empty_handle(), delete_button: empty_handle(),
+        duplicate_button: empty_handle(), open_path_field: empty_handle(), open_button: empty_handle(), save_as_button: empty_handle(),
+        hierarchy_rows: zeroed, palette_rows: zeroed, palette_source_indices: zeroed, inspector_rows: zeroed, inspector_editors: zeroed,
+        inspector_action_buttons: zeroed, inspector_readonly_values: zeroed, inspector_tags: zeroed, inspector_edit_dirty: zeroed,
+        refreshing_inspector: false, problem_rows: zeroed,
+        palette_count: 0, hierarchy_count: 0, inspector_count: 0, problem_count: 0,
+        hierarchy_page: 0, problem_page: 0,
+        projection: ShellProjection{hierarchy_count: -1, palette_count: -1, inspector_count: -1, problem_count: -1, node_count: -1, selection_count: -1, dirty: false},
+        status_storage: zeroed, status_length: 0,
+        form_title_storage: zeroed, form_title_length: 0,
+        left_ratio: 0.22, right_ratio: 0.25, bottom_ratio: 0.20,
+        pane_preferences_dirty: false,
+        active_split: 0,
+        compact_mode: false, compact_panel: 0,
+        dark: true, host_running: false,
+        preview_resource: UiResources::ResourceHandle{slot: 0, generation: 0},
+        preview_image: UiCore::ImageRef{slot: 0, generation: 0},
+        preview_revision: 0, preview_pending: false, preview_ready: false,
+        preview_width: 0, preview_height: 0, preview_row_stride: 0,
+    }
+
+def shell_color(r: u8, g: u8, b: u8) -> UiCore::Color:
+    return UiCore::rgb(r, g, b)
+
+global mutable shell: Shell = new_shell()

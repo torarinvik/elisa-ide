@@ -1,0 +1,223 @@
+# Headless CLI: validate and migrate project/form documents without a GUI.
+#
+# Shares the same parser, model, validation, and migration code as the editor.
+# Exit codes: 0 success, 1 validation errors, 2 usage or I/O failure.
+#
+# Usage:
+#   elisa-ide-cli validate <project-or-form.json>
+#   elisa-ide-cli migrate  <input.json> <output.json>
+#   elisa-ide-cli generate <form.json> <output.elisa>
+
+include "../registry/design_registry.elisa"
+include "../schema/design_json_decode.elisa"
+include "../schema/design_json_encode.elisa"
+include "../validation/design_validate.elisa"
+include "../lowering/design_lower.elisa"
+include "../codegen/elisa_emit.elisa"
+include "../platform/posix/posix_file.elisa"
+
+include "../../compiler/elisacore_std/elisacore_runtime.elisa"
+include "../../compiler/elisacore_std/collections.elisa"
+include "../../compiler/elisacore_std/elisacore_fileio.elisa"
+
+module ElisaIdeCli:
+    private:
+        def usage() -> i64:
+            print("usage: elisa-ide-cli validate <document.json>\n")
+            print("       elisa-ide-cli migrate  <input.json> <output.json>\n")
+            print("       elisa-ide-cli generate <form.json> <output.elisa>\n")
+            return 2
+
+        def is_project_path(path: sview) -> bool:
+            return DesignText::has_text(path, ".elisaproject.json")
+
+        def print_sink(sink: DesignDiagnostics::Sink&) -> void:
+            index: mutable i64 = 0
+            while index < sink.items.count.i64():
+                diagnostic: DesignDiagnostics::Diagnostic = sink.items[index.usize()]
+                if diagnostic.severity == DesignDiagnostics::Severity.Error:
+                    print("error: ")
+                else:
+                    print("warning: ")
+                print(DesignDiagnostics::code_name(diagnostic.code))
+                if diagnostic.path.count > 0:
+                    print(" at ")
+                    print(DesignText::view_of(diagnostic.path))
+                print(": ")
+                print(DesignText::view_of(diagnostic.message))
+                print("\n")
+                index <- index + 1
+
+        def read_document(path: cstr, arena: mutable Arena&) -> darray[u8]:
+            bytes: darray[u8] = catch read_entire_file(arena, path):
+                value:
+                    value
+                error e:
+                    []
+            return bytes
+
+        def validate_document(path: cstr) -> i64:
+            arena: mutable Arena = Arena{begin: null, end: null, end_index: 0, strategy: 0}
+            bytes: darray[u8] = read_document(path, &arena)
+            if bytes.count == 0:
+                print("error: cannot read ")
+                print(path)
+                print("\n")
+                return 2
+            registry: DesignRegistry::Registry = DesignRegistry::build_builtin()
+            sink: mutable DesignDiagnostics::Sink = DesignDiagnostics::empty_sink()
+            if is_project_path(sview(path, 0, -1)):
+                project: DesignProjects::Project = DesignDecode::decode_project(DesignText::view_of(bytes), &sink)
+                DesignValidate::validate_project(project, &sink)
+            else:
+                form: DesignForms::Form = DesignDecode::decode_form(DesignText::view_of(bytes), registry, &sink)
+                DesignValidate::validate_form(form, registry, &sink)
+            print_sink(&sink)
+            if DesignDiagnostics::has_errors(sink):
+                return 1
+            print("ok: ")
+            print(path)
+            print("\n")
+            return 0
+
+        def migrate_document(input_path: cstr, output_path: cstr) -> i64:
+            arena: mutable Arena = Arena{begin: null, end: null, end_index: 0, strategy: 0}
+            bytes: darray[u8] = read_document(input_path, &arena)
+            if bytes.count == 0:
+                print("error: cannot read ")
+                print(input_path)
+                print("\n")
+                return 2
+            registry: DesignRegistry::Registry = DesignRegistry::build_builtin()
+            sink: mutable DesignDiagnostics::Sink = DesignDiagnostics::empty_sink()
+            output: mutable darray[u8] = []
+            if is_project_path(sview(input_path, 0, -1)):
+                project: DesignProjects::Project = DesignDecode::decode_project(DesignText::view_of(bytes), &sink)
+                if DesignDiagnostics::has_errors(sink):
+                    print_sink(&sink)
+                    return 1
+                output <- DesignEncode::encode_project(project)
+            else:
+                form: DesignForms::Form = DesignDecode::decode_form(DesignText::view_of(bytes), registry, &sink)
+                if DesignDiagnostics::has_errors(sink):
+                    print_sink(&sink)
+                    return 1
+                output <- DesignEncode::encode_form(form)
+            written: i64 = catch write_entire_file(output_path, DesignText::view_of(output)):
+                value:
+                    value
+                error e:
+                    -1
+            if written < 0:
+                print("error: cannot write ")
+                print(output_path)
+                print("\n")
+                return 2
+            print_sink(&sink)
+            print("migrated: ")
+            print(input_path)
+            print(" -> ")
+            print(output_path)
+            print("\n")
+            return 0
+
+        def generate_view(input_path: cstr, output_path: cstr) -> i64:
+            arena: mutable Arena = Arena{begin: null, end: null, end_index: 0, strategy: 0}
+            bytes: darray[u8] = read_document(input_path, &arena)
+            if bytes.count == 0:
+                print("error: cannot read ")
+                print(input_path)
+                print("\n")
+                return 2
+
+            registry: DesignRegistry::Registry = DesignRegistry::build_builtin()
+            sink: mutable DesignDiagnostics::Sink = DesignDiagnostics::empty_sink()
+            form: mutable DesignForms::Form = DesignDecode::decode_form(DesignText::view_of(bytes), registry, &sink)
+            if DesignDiagnostics::has_errors(sink):
+                print_sink(&sink)
+                return 1
+
+            # lower_form performs the canonical form validation before it
+            # constructs target-specific operations.
+            lowered: DesignLower::LoweredForm = DesignLower::lower_form(form, registry, &sink)
+            if not lowered.valid or DesignDiagnostics::has_errors(sink):
+                print_sink(&sink)
+                return 1
+
+            emission: ElisaEmit::Emission = ElisaEmit::emit_view(form, registry, lowered, &sink)
+            if not emission.valid or DesignDiagnostics::has_errors(sink):
+                print_sink(&sink)
+                return 1
+
+            existing: mutable darray[u8] = []
+            output_status: i64 = PosixFile::read_bytes_result(&existing, output_path, DesignLimits::MAX_INPUT_BYTES)
+            if output_status >= 0:
+                print("error: output already exists; refusing to replace ")
+                print(output_path)
+                print("\n")
+                return 2
+            if not PosixFile::read_error_is_not_found(output_status):
+                print("error: output path is not available ")
+                print(output_path)
+                print("\n")
+                return 2
+
+            # This command publishes exactly one generated view file. The
+            # POSIX service stages and syncs the complete source before
+            # publishing it, and its link-based publication refuses to
+            # replace a destination even if another process creates it after
+            # generation begins.
+            publish_source: i64 error[FileReplaceError] = PosixFile::atomic_write_new(output_path, DesignText::view_of(emission.source))
+            written: mutable i64 = catch publish_source:
+                value:
+                    value
+                FileReplaceError.DestinationExists:
+                    -2
+                FileReplaceError.CommittedButNotDurable:
+                    -3
+                error e:
+                    -1
+            if written == -2:
+                print("error: output already exists; refusing to replace ")
+                print(output_path)
+                print("\n")
+                return 2
+            if written == -3:
+                print("warning: generated output is visible, but directory durability could not be confirmed: ")
+                print(output_path)
+                print("\n")
+                written <- emission.source.count.i64()
+            if written < 0:
+                print("error: could not publish generated source to ")
+                print(output_path)
+                print("\n")
+                return 2
+
+            print_sink(&sink)
+            print("generated: ")
+            print(input_path)
+            print(" -> ")
+            print(output_path)
+            print("\n")
+            return 0
+
+    public:
+        def run(argc: i64, argv: mutable void&) -> i64:
+            if argc < 3:
+                return usage()
+            slots: mutable cstr&& = argv.cast[mutable cstr&&]
+            command: cstr = slots[1.usize()].cast[cstr]
+            if DesignText::equal(sview(command, 0, -1), "validate"):
+                return validate_document(slots[2.usize()].cast[cstr])
+            if DesignText::equal(sview(command, 0, -1), "migrate"):
+                if argc < 4:
+                    return usage()
+                return migrate_document(slots[2.usize()].cast[cstr], slots[3.usize()].cast[cstr])
+            if DesignText::equal(sview(command, 0, -1), "generate"):
+                if argc != 4:
+                    return usage()
+                return generate_view(slots[2.usize()].cast[cstr], slots[3.usize()].cast[cstr])
+            return usage()
+
+def main(argc: i64, argv: mutable void&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
+    return DesignerCli::run(argc, argv)

@@ -1,0 +1,36 @@
+{
+  "format": "elisa-ide-form",
+  "schemaVersion": 1,
+  "id": "form-unknown",
+  "name": "Unknown components",
+  "moduleSymbol": "unknown_view",
+  "viewport": {
+    "width": 320,
+    "height": 200
+  },
+  "root": "node-root",
+  "futureTopLevelField": {
+    "kept": true
+  },
+  "nodes": [
+    {
+      "id": "node-root",
+      "type": "elisa.ui.mystery",
+      "name": "Mystery node",
+      "symbol": "mystery_node",
+      "properties": {
+        "customThing": {
+          "a": 1
+        },
+        "knownText": "still text"
+      },
+      "children": [],
+      "events": {
+        "unknownEvent": {
+          "handler": "Handlers::unknown"
+        }
+      },
+      "futureNodeField": [1, 2, 3]
+    }
+  ]
+}

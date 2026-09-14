@@ -1,0 +1,220 @@
+# First M03 editing slice through the real shell widgets and document host.
+#
+# The headless harness delivers physical pointer events to the retained shell.
+# The test creates a form, inserts a button from the palette, edits and undoes
+# its caption, saves it, then opens that file through the shell and verifies
+# the persisted value in the inspector projection.
+
+include "../../framework/src/platform/sdl3/ui_sdl3_flat.elisa"
+include "../../framework/src/test/ui_harness.elisa"
+include "../../src/shell/shell_app.elisa"
+
+const SAVE_PATH: cstr = "build/shell-integration-main.elisaform.json"
+const PREVIEW_INPUT_PATH: cstr = "build/shell-integration-preview.bin"
+const PREVIEW_FRAME_PATH: cstr = "build/shell-integration-preview.png"
+
+global mutable integration_failure: i64 = 0
+
+@link_name("designer_setenv")
+extern integration_setenv(name: cstr, value: cstr) -> i64
+
+@link_name("designer_report_i64")
+extern integration_report_i64(label: cstr, value: i64) -> void
+
+def expect_integration(condition: bool, code: i64) -> void:
+    if not condition and integration_failure == 0:
+        integration_failure <- code
+
+def same_text(left: sview, right: sview) -> bool:
+    return false if left.len != right.len
+    index: mutable i64 = 0
+    while index < left.len:
+        return false if left[index] != right[index]
+        index <- index + 1
+    return true
+
+def bytes_contain(bytes: darray[u8]&, needle: sview) -> bool:
+    return false if needle.len == 0 or bytes.count.i64() < needle.len
+    start: mutable i64 = 0
+    while start + needle.len <= bytes.count.i64():
+        matched: mutable bool = true
+        offset: mutable i64 = 0
+        while offset < needle.len:
+            if bytes[(start + offset).usize()] != needle[offset]:
+                matched <- false
+                break
+            offset <- offset + 1
+        if matched:
+            return true
+        start <- start + 1
+    return false
+
+def bytes_equal(left: darray[u8]&, right: darray[u8]&) -> bool:
+    return false if left.count != right.count
+    for index in 0..<left.count:
+        return false if left[index] != right[index]
+    return true
+
+def wait_preview_worker(process: mutable PosixProcess::Process&, budget_ms: i64) -> bool:
+    elapsed: mutable i64 = 0
+    while elapsed < budget_ms:
+        if PosixProcess::poll(&process, 20):
+            return true
+        elapsed <- elapsed + 20
+    return false
+
+def fail_preview(stage: i64) -> bool:
+    integration_report_i64("preview_failure_stage=", stage)
+    return false
+
+def run_preview(snapshot: HostClient::HostReply, stdout_out: mutable darray[u8]&, frame_out: mutable darray[u8]&) -> bool:
+    return fail_preview(1) if snapshot.result != 1 or snapshot.text.count == 0
+    _ = PosixFile::remove(PREVIEW_INPUT_PATH)
+    return fail_preview(2) if PosixFile::write_bytes_plain(PREVIEW_INPUT_PATH, snapshot.text) != snapshot.text.count.i64()
+    _ = PosixFile::remove(PREVIEW_FRAME_PATH)
+    return fail_preview(3) if integration_setenv("ELISA_UI_PREVIEW_INPUT", PREVIEW_INPUT_PATH) != 0
+    return fail_preview(4) if integration_setenv("ELISA_UI_SNAPSHOT", PREVIEW_FRAME_PATH) != 0
+    return fail_preview(5) if integration_setenv("ELISA_UI_SMOKE_FRAMES", "1") != 0
+
+    arguments: mutable darray[cstr] = []
+    arguments.push("build/preview_worker")
+    worker: mutable PosixProcess::Process = PosixProcess::start(&arguments)
+    return fail_preview(6) if not PosixProcess::valid(&worker)
+    if not wait_preview_worker(&worker, 60000):
+        _ = PosixProcess::cancel(&worker)
+        PosixProcess::dispose(&worker)
+        return fail_preview(7)
+    status: PosixProcess::Status = PosixProcess::status(&worker)
+    _ = PosixProcess::read_stdout(&worker, &stdout_out, 1048576)
+    PosixProcess::dispose(&worker)
+    return fail_preview(8) if not status.finished or status.exit_code != 0 or status.stdout_truncated
+    frame_length: usize = PosixFile::read_bytes(&frame_out, PREVIEW_FRAME_PATH, 8388608)
+    return fail_preview(9) if frame_length < 1000 or frame_out.count < 8
+    return fail_preview(10) if frame_out[0] != 137 or frame_out[1] != 80 or frame_out[2] != 78 or frame_out[3] != 71
+    return fail_preview(11) if not bytes_contain(stdout_out, "preview_revision=") or not bytes_contain(stdout_out, "rect ")
+    return true
+
+def click(handle: UiHandles::Handle) -> void:
+    return if not UiHandles::is_valid(handle) or not UiHandles::is_visible(handle) or not UiHandles::is_enabled(handle)
+    if UiHandles::widget(handle) is widget:
+        x: f32 = widget.x + widget.width * 0.5
+        y: f32 = widget.y + widget.height * 0.5
+        UiHarness::dispatch(UiCore::PointerEvent.Down(at: UiCore::Vec2(x, y), button: UiCore::PointerButton.Primary.i32()))
+        UiHarness::dispatch(UiCore::PointerEvent.Up(at: UiCore::Vec2(x, y), button: UiCore::PointerButton.Primary.i32()))
+
+def type_editor_value(handle: UiHandles::Handle, value: sview) -> void:
+    return if not UiHandles::request_focus(handle)
+    original: sview = UiHandles::text_value(handle)
+    UiHandles::set_selection_utf16(handle, 0, original.len.usize())
+    app_text_input(value)
+    UiHarness::dispatch(UiCore::KeyEvent.Down(UiCore::Key.Enter))
+
+def clean_host() -> void:
+    return if not shell.host_running
+    HostClient::stop(&host_process)
+    _ = PosixProcess::poll(&host_process, 1000)
+    PosixProcess::dispose(&host_process)
+    shell.host_running <- false
+
+def app_init() -> void:
+    _ = PosixFile::remove(SAVE_PATH)
+    _ = PosixFile::remove("build/shell-integration-preferences.json")
+    _ = integration_setenv("ELISA_IDE_CONFIG", "build/shell-integration-preferences.json")
+    init(shell)
+
+def app_widget_event(widget: usize, event: i32) -> void:
+    widget_event(shell, widget, event)
+
+def app_event(event: UiCore::Event) -> void:
+    handle_shell_event(shell, event)
+
+def app_text_input(text: sview) -> void:
+    UiHandles::insert_text(text)
+
+def app_text_editing(text: sview, selected_start: i32, selected_length: i32) -> void:
+    UiHandles::update_marked_text_utf8_characters(text, selected_start, selected_length)
+
+def app_frame() -> void:
+    frame(shell)
+
+def main() -> i64:
+    UiHarness::start(1180.0, 760.0)
+    UiHarness::focus_gained()
+
+    # Cold launch owns a clean untitled form: New/Open remain usable and Save
+    # is disabled until this document has a destination.
+    expect_integration(shell.host_running, 1)
+    expect_integration(shell.projection.hierarchy_count == 1, 2)
+    expect_integration(not shell.projection.dirty, 3)
+    expect_integration(UiHandles::is_enabled(shell.new_button), 4)
+    expect_integration(UiHandles::is_enabled(shell.open_button), 5)
+    expect_integration(not UiHandles::is_enabled(shell.save_button), 6)
+
+    # Use the actual retained callbacks for New, palette insertion, and
+    # hierarchy selection. The button is palette row 4 in the built-in set.
+    click(shell.new_button)
+    expect_integration(not shell.projection.dirty, 10)
+    click(shell.palette_rows[4.usize()])
+    expect_integration(shell.projection.node_count == 2 and shell.projection.dirty, 11)
+    expect_integration(not UiHandles::is_enabled(shell.new_button) and not UiHandles::is_enabled(shell.open_button), 12)
+    expect_integration(not UiHandles::is_enabled(shell.save_button), 13)
+    click(shell.hierarchy_rows[1.usize()])
+    expect_integration(shell.projection.selection_count == 1 and shell.projection.inspector_count > 0, 14)
+
+    # Commit a caption through the same inspector submit callback as Enter.
+    type_editor_value(shell.inspector_editors[0.usize()], "Hello from the shell")
+    expect_integration(same_text(UiHandles::text_value(shell.inspector_editors[0.usize()]), "Hello from the shell"), 20)
+    expect_integration(shell.projection.dirty, 21)
+    commit_before_undo: bool = commit_pending_inspector_edits(shell, host_process)
+    expect_integration(commit_before_undo, 27)
+    committed_caption: HostClient::HostReply = HostClient::request(&host_process, 53, 0, 0)
+    expect_integration(same_text(ShellBytes::view_of(&committed_caption.text), "Hello from the shell"), 28)
+    preview_snapshot_before: HostClient::HostReply = HostClient::request(&host_process, 80, 0, 0)
+    expect_integration(bytes_contain(preview_snapshot_before.text, "Hello from the shell"), 29)
+    preview_output_before: mutable darray[u8] = []
+    preview_frame_before: mutable darray[u8] = []
+    expect_integration(run_preview(preview_snapshot_before, &preview_output_before, &preview_frame_before)
+        and bytes_contain(preview_output_before, "preview_revision=")
+        and bytes_contain(preview_output_before, "rect n2 ")
+        and bytes_contain(preview_output_before, "rect n3 "), 35)
+    expect_integration(UiHandles::activate(shell.undo_button), 22)
+    undo_caption: HostClient::HostReply = HostClient::request(&host_process, 53, 0, 0)
+    expect_integration(same_text(ShellBytes::view_of(&undo_caption.text), "Button"), 26)
+    expect_integration(same_text(UiHandles::text_value(shell.inspector_editors[0.usize()]), "Button"), 23)
+    preview_snapshot_after: HostClient::HostReply = HostClient::request(&host_process, 80, 0, 0)
+    expect_integration(bytes_contain(preview_snapshot_after.text, "Button")
+        and not bytes_contain(preview_snapshot_after.text, "Hello from the shell"), 36)
+    preview_output_after: mutable darray[u8] = []
+    preview_frame_after: mutable darray[u8] = []
+    preview_rerendered: bool = run_preview(preview_snapshot_after, &preview_output_after, &preview_frame_after)
+    expect_integration(preview_rerendered and bytes_contain(preview_output_after, "preview_revision=")
+        and not bytes_equal(preview_frame_before, preview_frame_after), 37)
+
+    # Save As is available for the untitled document. Reopen it through the
+    # visible shell controls after the successful commit.
+    UiHandles::replace_text(shell.open_path_field, sview(SAVE_PATH, 0, -1))
+    click(shell.save_as_button)
+    expect_integration(not shell.projection.dirty and not UiHandles::is_enabled(shell.save_button), 30)
+    saved: mutable darray[u8] = []
+    saved_length: usize = PosixFile::read_bytes(&saved, SAVE_PATH, 1048576)
+    expect_integration(saved_length > 0 and bytes_contain(saved, "Button") and not bytes_contain(saved, "Hello from the shell"), 31)
+    expect_integration(UiHandles::is_enabled(shell.new_button) and UiHandles::is_enabled(shell.open_button), 32)
+
+    UiHandles::replace_text(shell.open_path_field, sview(SAVE_PATH, 0, -1))
+    click(shell.open_button)
+    expect_integration(not shell.projection.dirty and shell.projection.node_count == 2, 33)
+    click(shell.hierarchy_rows[1.usize()])
+    expect_integration(same_text(UiHandles::text_value(shell.inspector_editors[0.usize()]), "Button"), 34)
+
+    UiHarness::frame()
+    return finish()
+
+def finish() -> i64:
+    ShellPreview::stop()
+    clean_host()
+    UiHarness::stop()
+    if integration_failure != 0:
+        integration_report_i64("designer shell integration assertion=", integration_failure)
+        return 1
+    integration_report_i64("designer shell integration assertions passed=", 29)
+    return 0

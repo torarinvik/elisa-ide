@@ -1,0 +1,59 @@
+# Design-space hit testing for geometry snapshots supplied by the preview
+# worker. Regions are kept in painter order; the last visible/selectable region
+# under a point wins, matching the item a user sees on top of overlapping
+# controls. This module is independent of runtime widget handles.
+
+include "../model/design_ids.elisa"
+include "./design_geometry.elisa"
+
+include "../../compiler/elisacore_std/elisacore_runtime.elisa"
+include "../../compiler/elisacore_std/collections.elisa"
+
+module DesignHitTest:
+    private:
+        global mutable hit_test_arena: Arena = Arena{begin: null, end: null, end_index: 0, strategy: 0}
+
+        def reserve_regions(regions: mutable darray[Region]&, capacity: usize) -> void:
+            _ = arena_da_reserve(&hit_test_arena, regions, capacity)
+
+    public:
+        struct Region:
+            id: mutable DesignIds::DesignId
+            bounds: mutable DesignGeometry::Rect
+            clip: mutable DesignGeometry::Rect
+            visible: mutable bool
+            selectable: mutable bool
+
+        def empty_regions() -> darray[Region]:
+            return []
+
+        # Appends one snapshot record. Invalid geometry or an empty design ID
+        # is rejected without changing the caller's region list.
+        def append_region(regions: mutable darray[Region]&, id: DesignIds::DesignId&, bounds: DesignGeometry::Rect, clip: DesignGeometry::Rect, visible: bool, selectable: bool) -> bool:
+            return false if DesignIds::is_empty(id)
+            return false if not DesignGeometry::valid_viewport(bounds) or not DesignGeometry::valid_viewport(clip)
+            reserve_regions(regions, regions.count + 1)
+            regions.push(Region{
+                id: DesignIds::empty(),
+                bounds: bounds,
+                clip: clip,
+                visible: visible,
+                selectable: selectable,
+            })
+            DesignIds::copy_into(&regions[regions.count - 1.usize()].id, id)
+            return true
+
+        # Returns a copied stable design ID, or the empty ID when no selectable
+        # region covers `point`. Coordinates are in the same canvas-local space
+        # as the worker's correlated geometry snapshot.
+        def topmost(regions: darray[Region], point: DesignGeometry::Point) -> DesignIds::DesignId:
+            return DesignIds::empty() if not DesignGeometry::valid_point(point)
+            index: mutable i64 = regions.count.i64() - 1
+            while index >= 0:
+                region: Region = regions[index.usize()]
+                if region.visible and region.selectable and DesignGeometry::contains(region.bounds, point) and DesignGeometry::contains(region.clip, point):
+                    result: mutable DesignIds::DesignId = DesignIds::empty()
+                    DesignIds::copy_into(&result, region.id)
+                    return result
+                index <- index - 1
+            return DesignIds::empty()

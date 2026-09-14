@@ -1,0 +1,207 @@
+# Target-aware lowering from editable document records to deterministic,
+# parent-first runtime construction operations.
+#
+# This first target profile mirrors the current Elisa-ui Handles backend: 256
+# realized widgets, the six component types in DesignRegistry::build_builtin,
+# their explicitly mapped constructor/style properties, and the declared event
+# signatures. Unknown preserved document data remains editable but blocks code
+# generation until an extension supplies a lowering rule.
+
+include "../model/design_limits.elisa"
+include "../model/design_text.elisa"
+include "../model/design_ids.elisa"
+include "../model/design_values.elisa"
+include "../model/design_node.elisa"
+include "../model/design_form.elisa"
+include "../registry/design_registry.elisa"
+include "../validation/design_diagnostics.elisa"
+include "../validation/design_validate.elisa"
+
+include "../../compiler/elisacore_std/elisacore_runtime.elisa"
+include "../../compiler/elisacore_std/collections.elisa"
+
+module DesignLower:
+    private:
+        global mutable lower_arena: Arena = Arena{begin: null, end: null, end_index: 0, strategy: 0}
+    
+        def reserve_ids(target: mutable darray[DesignIds::DesignId]&, capacity: usize) -> void:
+            _ = arena_da_reserve(&lower_arena, target, capacity)
+    
+        def reserve_ops(target: mutable darray[Operation]&, capacity: usize) -> void:
+            _ = arena_da_reserve(&lower_arena, target, capacity)
+    
+        def valid_handler_segment(value: sview) -> bool:
+            return false if value.len == 0 or value.len > DesignLimits::MAX_SYMBOL_BYTES.i64()
+            first: u8 = value[0]
+            first_ok: bool = (first >= 65 and first <= 90) or (first >= 97 and first <= 122) or first == 95
+            return false if not first_ok
+            index: mutable i64 = 1
+            while index < value.len:
+                byte: u8 = value[index]
+                accepted: bool = (byte >= 65 and byte <= 90) or (byte >= 97 and byte <= 122) or (byte >= 48 and byte <= 57) or byte == 95
+                return false if not accepted
+                index <- index + 1
+            return true
+    
+        def reserved_handler_word(value: sview) -> bool:
+            return true if DesignText::equal(value, "def") or DesignText::equal(value, "module") or DesignText::equal(value, "include") or DesignText::equal(value, "using")
+            return true if DesignText::equal(value, "struct") or DesignText::equal(value, "enum") or DesignText::equal(value, "match") or DesignText::equal(value, "extend")
+            return true if DesignText::equal(value, "if") or DesignText::equal(value, "elif") or DesignText::equal(value, "else") or DesignText::equal(value, "while")
+            return true if DesignText::equal(value, "for") or DesignText::equal(value, "in") or DesignText::equal(value, "return") or DesignText::equal(value, "break")
+            return true if DesignText::equal(value, "continue") or DesignText::equal(value, "pass") or DesignText::equal(value, "can") or DesignText::equal(value, "mutable")
+            return true if DesignText::equal(value, "global") or DesignText::equal(value, "private") or DesignText::equal(value, "public") or DesignText::equal(value, "extern")
+            return true if DesignText::equal(value, "as") or DesignText::equal(value, "cast") or DesignText::equal(value, "is") or DesignText::equal(value, "and")
+            return true if DesignText::equal(value, "or") or DesignText::equal(value, "not") or DesignText::equal(value, "true") or DesignText::equal(value, "false")
+            return true if DesignText::equal(value, "null") or DesignText::equal(value, "void") or DesignText::equal(value, "error")
+            return false
+    
+        def valid_handler_path(handler: sview) -> bool:
+            return false if handler.len == 0
+            start: mutable i64 = 0
+            segment_count: mutable i64 = 0
+            index: mutable i64 = 0
+            while index <= handler.len:
+                at_end: bool = index == handler.len
+                separator: mutable bool = false
+                if not at_end and handler[index] == 58:
+                    separator <- true if index + 1 < handler.len and handler[index + 1] == 58
+                    return false if not separator
+                if at_end or separator:
+                    segment: sview = handler[start:index]
+                    return false if not valid_handler_segment(segment) or reserved_handler_word(segment)
+                    segment_count <- segment_count + 1
+                    index <- index + 1 if separator else index
+                    start <- index + 1 if separator else index
+                index <- index + 1
+            return segment_count >= 2
+
+        def source_property_supported(type_key: sview, key: sview) -> bool:
+            if DesignText::equal(type_key, "elisa.ui.column") or DesignText::equal(type_key, "elisa.ui.row"):
+                return true if DesignText::equal(key, "padding") or DesignText::equal(key, "spacing") or DesignText::equal(key, "background") or DesignText::equal(key, "grow")
+                return true if DesignText::equal(key, "minimumWidth") or DesignText::equal(key, "minimumHeight") or DesignText::equal(key, "crossAlignment") or DesignText::equal(key, "mainAlignment") or DesignText::equal(key, "visible")
+            if DesignText::equal(type_key, "elisa.ui.panel"):
+                return true if DesignText::equal(key, "padding") or DesignText::equal(key, "spacing") or DesignText::equal(key, "background") or DesignText::equal(key, "grow")
+                return true if DesignText::equal(key, "minimumWidth") or DesignText::equal(key, "minimumHeight") or DesignText::equal(key, "crossAlignment") or DesignText::equal(key, "mainAlignment") or DesignText::equal(key, "visible") or DesignText::equal(key, "axis")
+            if DesignText::equal(type_key, "elisa.ui.label"):
+                return true if DesignText::equal(key, "text") or DesignText::equal(key, "size") or DesignText::equal(key, "color") or DesignText::equal(key, "grow") or DesignText::equal(key, "margin") or DesignText::equal(key, "visible")
+            if DesignText::equal(type_key, "elisa.ui.button"):
+                return true if DesignText::equal(key, "text") or DesignText::equal(key, "size") or DesignText::equal(key, "minimumWidth") or DesignText::equal(key, "minimumHeight") or DesignText::equal(key, "color")
+                return true if DesignText::equal(key, "textColor") or DesignText::equal(key, "hoverColor") or DesignText::equal(key, "pressColor") or DesignText::equal(key, "grow") or DesignText::equal(key, "margin") or DesignText::equal(key, "enabled") or DesignText::equal(key, "visible")
+            if DesignText::equal(type_key, "elisa.ui.text_field"):
+                return true if DesignText::equal(key, "label") or DesignText::equal(key, "placeholder") or DesignText::equal(key, "initial") or DesignText::equal(key, "size") or DesignText::equal(key, "minimumWidth") or DesignText::equal(key, "minimumHeight")
+                return true if DesignText::equal(key, "ink") or DesignText::equal(key, "fill") or DesignText::equal(key, "secure") or DesignText::equal(key, "grow") or DesignText::equal(key, "margin") or DesignText::equal(key, "visible")
+            return false
+    
+        def report_target_error(sink: mutable DesignDiagnostics::Sink&, node_index: i64, suffix: sview, message: sview) -> void:
+            path: darray[u8] = DesignText::indexed_path("nodes", node_index, suffix)
+            _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.UnsupportedTarget, DesignText::view_of(path), message)
+    
+    public:
+        struct Operation:
+            source_node: mutable i64
+            parent_operation: mutable i64
+            component_index: mutable i64
+    
+        struct LoweredForm:
+            operations: mutable darray[Operation]
+            source_revision: mutable i64
+            valid: mutable bool
+    
+        def empty_lowered_form(revision: i64) -> LoweredForm:
+            return LoweredForm{operations: [], source_revision: revision, valid: false}
+    
+        def lower_form(form: DesignForms::Form&, registry: DesignRegistry::Registry&, sink: mutable DesignDiagnostics::Sink&) -> LoweredForm:
+            lowered: mutable LoweredForm = empty_lowered_form(form.revision)
+            errors_before: i64 = sink.error_count
+            DesignValidate::validate_form(form, registry, sink)
+            if sink.error_count > errors_before:
+                return lowered
+    
+            if form.nodes.count == 0 or form.nodes.count > DesignLimits::MAX_REALIZED_WIDGETS:
+                _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.UnsupportedTarget, "nodes", "the selected Elisa-ui Handles target supports at most 256 realized widgets")
+                return lowered
+    
+            pending: mutable darray[DesignIds::DesignId] = []
+            reserve_ids(&pending, form.nodes.count)
+            reserve_ops(&lowered.operations, form.nodes.count)
+            DesignIds::append_copy(&pending, &form.root)
+    
+            while pending.count > 0:
+                last: usize = pending.count - 1.usize()
+                id: DesignIds::DesignId = pending[last]
+                pending.resize(last)
+                source_index: i64 = DesignForms::find_node(form, id)
+                if source_index < 0:
+                    _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.MissingParent, "nodes", "parent-first lowering could not resolve a child identity")
+                    return lowered
+    
+                node: DesignNodes::Node = form.nodes[source_index.usize()]
+                component_index: i64 = DesignRegistry::find_component(registry, DesignValues::text_of(form.strings, node.type_key))
+                if component_index < 0 or node.unsupported:
+                    report_target_error(sink, source_index, ".type", "this component is preserved by the document model but has no selected-target constructor")
+                    return lowered
+    
+                parent_operation: mutable i64 = -1
+                if not DesignIds::is_empty(node.parent):
+                    previous: mutable i64 = 0
+                    while previous < lowered.operations.count.i64():
+                        prior_source: i64 = lowered.operations[previous.usize()].source_node
+                        if DesignIds::equal(form.nodes[prior_source.usize()].id, node.parent):
+                            parent_operation <- previous
+                            break
+                        previous <- previous + 1
+                    if parent_operation < 0:
+                        report_target_error(sink, source_index, ".parent", "a parent must be lowered before its child")
+                        return lowered
+    
+                lowered.operations.push(Operation{source_node: source_index, parent_operation: parent_operation, component_index: component_index})
+    
+                descriptor: DesignRegistry::ComponentDescriptor = registry.components[component_index.usize()]
+                descriptor_property: mutable i64 = 0
+                while descriptor_property < descriptor.properties.count.i64():
+                    descriptor_key: sview = DesignValues::text_of(registry.strings, descriptor.properties[descriptor_property.usize()].key)
+                    if not source_property_supported(DesignValues::text_of(form.strings, node.type_key), descriptor_key):
+                        report_target_error(sink, source_index, ".properties", "a registered property has no verified source mapping for this target")
+                        return lowered
+                    descriptor_property <- descriptor_property + 1
+
+                property_index: mutable i64 = 0
+                while property_index < node.properties.count.i64():
+                    key: sview = DesignValues::text_of(form.strings, node.properties[property_index.usize()].key)
+                    if DesignRegistry::find_property(registry, component_index, key) < 0:
+                        report_target_error(sink, source_index, ".properties", "unknown preserved properties cannot be emitted for this target")
+                        return lowered
+                    property_index <- property_index + 1
+    
+                event_index: mutable i64 = 0
+                while event_index < node.events.count.i64():
+                    event: DesignNodes::EventConnection = node.events[event_index.usize()]
+                    if DesignRegistry::find_event(registry, component_index, DesignValues::text_of(form.strings, event.event_key)) < 0:
+                        report_target_error(sink, source_index, ".events", "unknown preserved event connections cannot be emitted for this target")
+                        return lowered
+                    handler: sview = DesignValues::text_of(form.strings, event.handler)
+                    if not valid_handler_path(handler):
+                        report_target_error(sink, source_index, ".events", "event handler must be a qualified Elisa function path such as AppHandlers::save_clicked")
+                        return lowered
+                    event_index <- event_index + 1
+    
+                child_index: mutable i64 = node.children.count.i64() - 1
+                while child_index >= 0:
+                    DesignIds::append_copy(&pending, &node.children[child_index.usize()])
+                    child_index <- child_index - 1
+    
+            if lowered.operations.count != form.nodes.count:
+                _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.MissingParent, "nodes", "not every node is reachable from the declared root")
+                return lowered
+    
+            lowered.valid <- true
+            return lowered
+    
+        def operation_for_node(form: DesignForms::Form&, lowered: LoweredForm&, id: DesignIds::DesignId) -> i64:
+            index: mutable i64 = 0
+            while index < lowered.operations.count.i64():
+                source: i64 = lowered.operations[index.usize()].source_node
+                if DesignIds::equal(form.nodes[source.usize()].id, id):
+                    return index
+                index <- index + 1
+            return -1

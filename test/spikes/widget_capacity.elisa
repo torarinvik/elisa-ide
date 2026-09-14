@@ -1,0 +1,150 @@
+# M00 spike: measure retained-widget capacity and confirm overflow behavior.
+#
+# The plan's capacity blocker: the flat arena is 256 widgets, and a docked
+# editor shell plus a target form can exceed it. This spike records the real
+# limit, a rough shell budget, the memory cost, and what happens at the
+# boundary so the M03 shell design uses measured numbers.
+#
+# Output is a small report; exit codes identify failed expectations.
+
+include "../../framework/src/platform/sdl3/ui_sdl3_flat.elisa"
+
+# The retained core declares the application contract; the office-piece spike
+# only constructs widgets, so the callbacks are inert stubs.
+def app_init() -> void:
+    return
+
+def app_event(event: UiCore::Event) -> void:
+    return
+
+def app_text_input(text: sview) -> void:
+    return
+
+def app_text_editing(text: sview, selected_start: i32, selected_length: i32) -> void:
+    return
+
+def app_frame() -> void:
+    return
+
+def app_widget_event(widget: usize, event: i32) -> void:
+    return
+
+@link_name("designer_rss_bytes")
+extern designer_rss_bytes() -> i64
+@link_name("designer_report_i64")
+extern designer_report_i64(label: cstr, value: i64) -> void
+@link_name("designer_report_text")
+extern designer_report_text(text: cstr) -> void
+
+module CapacitySpike:
+    private:
+        def color(r: u8, g: u8, b: u8) -> UiCore::Color:
+            return UiCore::rgb(r, g, b)
+
+        def report(label: cstr, value: i64) -> void:
+            designer_report_i64(label, value)
+            return
+
+        # A deliberately ordinary editor shell: toolbar, left palette and
+        # hierarchy, center canvas chrome, right inspector, bottom output.
+        def build_shell() -> i64:
+            UiHandles::reset()
+            root: UiHandles::Handle = UiHandles::column(UiHandles::root_parent(), 4.0, 4.0, color(20, 22, 28))
+            toolbar: UiHandles::Handle = UiHandles::row(root, 2.0, 4.0, color(30, 33, 40))
+            index: mutable i32 = 0
+            while index < 10:
+                _ = UiHandles::button(toolbar, 72.0, 24.0, color(50, 55, 66), color(60, 66, 80), color(40, 44, 54))
+                index <- index + 1
+            body: UiHandles::Handle = UiHandles::row(root, 2.0, 4.0, color(20, 22, 28))
+            UiHandles::set_grow(body, 1.0)
+
+            left: UiHandles::Handle = UiHandles::column(body, 4.0, 2.0, color(28, 31, 38))
+            UiHandles::set_grow(left, 0.0)
+            _ = UiHandles::label(left, "Palette", 13.0, color(200, 205, 215))
+            index <- 0
+            while index < 12:
+                _ = UiHandles::button(left, 120.0, 22.0, color(42, 47, 58), color(52, 58, 72), color(34, 38, 47))
+                index <- index + 1
+            _ = UiHandles::label(left, "Hierarchy", 13.0, color(200, 205, 215))
+            index <- 0
+            while index < 10:
+                _ = UiHandles::label(left, "node", 12.0, color(150, 158, 175))
+                index <- index + 1
+
+            center: UiHandles::Handle = UiHandles::column(body, 6.0, 3.0, color(24, 27, 33))
+            UiHandles::set_grow(center, 1.0)
+            canvas: UiHandles::Handle = UiHandles::panel(center, UiConst::Axis.Column, 8.0, 4.0, color(36, 40, 49))
+            UiHandles::set_grow(canvas, 1.0)
+            _ = UiHandles::label(canvas, "Form", 18.0, color(230, 234, 242))
+            _ = UiHandles::text_field(canvas, "Name", "placeholder", "Sample", 180.0, 26.0, 13.0, color(220, 225, 235), color(30, 34, 42))
+            index <- 0
+            while index < 4:
+                _ = UiHandles::row(canvas, 2.0, 4.0, color(0, 0, 0))
+                index <- index + 1
+            _ = UiHandles::button(canvas, 96.0, 26.0, color(64, 112, 224), color(84, 136, 244), color(48, 90, 190))
+
+            right: UiHandles::Handle = UiHandles::column(body, 4.0, 2.0, color(28, 31, 38))
+            UiHandles::set_grow(right, 0.0)
+            _ = UiHandles::label(right, "Properties", 13.0, color(200, 205, 215))
+            index <- 0
+            while index < 16:
+                _ = UiHandles::label(right, "property", 12.0, color(150, 158, 175))
+                _ = UiHandles::text_field(right, "value", "", "", 120.0, 22.0, 12.0, color(220, 225, 235), color(30, 34, 42))
+                index <- index + 1
+
+            bottom: UiHandles::Handle = UiHandles::column(root, 2.0, 1.0, color(24, 27, 33))
+            index <- 0
+            while index < 12:
+                _ = UiHandles::label(bottom, "output", 12.0, color(150, 158, 175))
+                index <- index + 1
+
+            return UiFlat::count().i64()
+
+        # Create labels until the arena refuses; returns the number accepted.
+        def exhaust(cap: i64) -> i64:
+            UiHandles::reset()
+            root: UiHandles::Handle = UiHandles::column(UiHandles::root_parent(), 0.0, 0.0, color(0, 0, 0))
+            created: mutable i64 = 1
+            while created < cap:
+                handle: UiHandles::Handle = UiHandles::label(root, "x", 12.0, color(0, 0, 0))
+                if not UiHandles::is_valid(handle):
+                    return created
+                created <- created + 1
+            return -1
+
+    public:
+        def run() -> i64:
+            # 1. The declared capacity is the measured capacity, and the
+            # overflow handle `exhaust` stopped on was invalid rather than a
+            # crash or a recycled slot.
+            declared: i64 = UiFlat::MAX_WIDGETS.i64()
+            accepted: i64 = exhaust(4096)
+            if accepted != declared:
+                return 10
+            if not UiFlat::overflowed():
+                return 11
+
+            # 2. Real memory for a full arena (peak RSS includes one-shot
+            # initialization; the second reading after a reuse cycle is the
+            # steady-state cost).
+            before: i64 = designer_rss_bytes()
+            _ = exhaust(declared)
+            after: i64 = designer_rss_bytes()
+            report("capacity.widget_limit=", declared)
+            report("capacity.full_arena_rss_bytes=", after - before)
+
+            # 3. Rough shell budget, reusing the full-size arena after a reset.
+            shell_widgets: i64 = build_shell()
+            report("capacity.rough_shell_widgets=", shell_widgets)
+            shell_rss: i64 = designer_rss_bytes()
+            report("capacity.rough_shell_rss_bytes=", shell_rss - after)
+            if shell_widgets > declared:
+                return 13
+            if UiFlat::overflowed():
+                return 14
+
+            designer_report_text("spike widget_capacity: ok")
+            return 0
+
+def main() -> i64:
+    return CapacitySpike::run()

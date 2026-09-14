@@ -1,0 +1,154 @@
+# Form graph nodes.
+#
+# A node carries durable identity, a component type key, display name and
+# generated symbol, explicit parent and ordered children, typed properties, and
+# event connections. Nothing here is a runtime handle or a native pointer; the
+# graph is document state that survives view rebuilds and preview restarts.
+
+include "./design_limits.elisa"
+include "./design_ids.elisa"
+include "./design_values.elisa"
+include "./design_store.elisa"
+
+include "../../compiler/elisacore_std/elisacore_runtime.elisa"
+include "../../compiler/elisacore_std/collections.elisa"
+
+module DesignNodes:
+    private:
+        # Node, property, and event arrays are long-lived document storage.
+        global mutable node_arena: Arena = Arena{begin: null, end: null, end_index: 0, strategy: 0}
+
+    public:
+        def ensure_nodes(target: mutable darray[Node]&, capacity: usize) -> void:
+            _ = arena_da_reserve(&node_arena, target, capacity)
+
+        def ensure_properties(target: mutable darray[Property]&, capacity: usize) -> void:
+            _ = arena_da_reserve(&node_arena, target, capacity)
+
+        def ensure_events(target: mutable darray[EventConnection]&, capacity: usize) -> void:
+            _ = arena_da_reserve(&node_arena, target, capacity)
+
+        struct Property:
+            key: mutable DesignValues::StringRef
+            value: mutable DesignValues::DesignValue
+
+        struct EventConnection:
+            event_key: mutable DesignValues::StringRef
+            handler: mutable DesignValues::StringRef
+
+        struct Node:
+            id: mutable DesignIds::DesignId
+            type_key: mutable DesignValues::StringRef
+            name: mutable DesignValues::StringRef
+            symbol: mutable DesignValues::StringRef
+            parent: mutable DesignIds::DesignId
+            children: mutable darray[DesignIds::DesignId]
+            properties: mutable darray[Property]
+            events: mutable darray[EventConnection]
+            runtime_hidden: mutable bool
+            editor_locked: mutable bool
+            editor_hidden: mutable bool
+            # True when the component type is unknown to this build. The node
+            # stays editable as a placeholder and is preserved on encode.
+            unsupported: mutable bool
+            extension_json: mutable darray[u8]
+
+        def empty_node() -> Node:
+            return Node{
+                id: DesignIds::empty(),
+                type_key: DesignValues::no_text(),
+                name: DesignValues::no_text(),
+                symbol: DesignValues::no_text(),
+                parent: DesignIds::empty(),
+                children: [],
+                properties: [],
+                events: [],
+                runtime_hidden: false,
+                editor_locked: false,
+                editor_hidden: false,
+                unsupported: false,
+                extension_json: [],
+            }
+
+        def copy_node_into(target: mutable Node&, source: Node&) -> void:
+            DesignIds::copy_into(&target.id, &source.id)
+            target.type_key <- source.type_key
+            target.name <- source.name
+            target.symbol <- source.symbol
+            DesignIds::copy_into(&target.parent, &source.parent)
+            target.children.resize(0)
+            DesignStore::ensure_ids(&target.children, source.children.count)
+            index: mutable i64 = 0
+            while index < source.children.count.i64():
+                DesignIds::append_copy(&target.children, &source.children[index.usize()])
+                index <- index + 1
+            target.properties.resize(0)
+            ensure_properties(&target.properties, source.properties.count)
+            index <- 0
+            while index < source.properties.count.i64():
+                target.properties.push(source.properties[index.usize()])
+                index <- index + 1
+            target.events.resize(0)
+            ensure_events(&target.events, source.events.count)
+            index <- 0
+            while index < source.events.count.i64():
+                target.events.push(source.events[index.usize()])
+                index <- index + 1
+            target.runtime_hidden <- source.runtime_hidden
+            target.editor_locked <- source.editor_locked
+            target.editor_hidden <- source.editor_hidden
+            target.unsupported <- source.unsupported
+            target.extension_json.resize(0)
+            DesignStore::ensure_bytes(&target.extension_json, source.extension_json.count)
+            index <- 0
+            while index < source.extension_json.count.i64():
+                target.extension_json.push(source.extension_json[index.usize()])
+                index <- index + 1
+
+        def new_node(id: DesignIds::DesignId, type_key: DesignValues::StringRef, name: DesignValues::StringRef, symbol: DesignValues::StringRef) -> Node:
+            node: mutable Node = empty_node()
+            DesignIds::copy_into(&node.id, &id)
+            node.type_key <- type_key
+            node.name <- name
+            node.symbol <- symbol
+            return node
+
+        def child_index(node: Node&, child: DesignIds::DesignId) -> i64:
+            index: mutable i64 = 0
+            while index < node.children.count.i64():
+                return index if DesignIds::equal(node.children[index.usize()], child)
+                index <- index + 1
+            return -1
+
+        # Property lookup by key text; -1 when absent.
+        def property_index(node: Node&, pool: DesignValues::StringPool&, key: sview) -> i64:
+            index: mutable i64 = 0
+            while index < node.properties.count.i64():
+                if DesignValues::equal_ref(pool, node.properties[index.usize()].key, key):
+                    return index
+                index <- index + 1
+            return -1
+
+        # Add or replace a property. Keys compare by text through the owning
+        # pool, never by offset: a re-appended key has a different offset.
+        # False when the property budget is full.
+        def set_property(node: mutable Node&, pool: DesignValues::StringPool&, key: DesignValues::StringRef, value: DesignValues::DesignValue) -> bool:
+            key_text: sview = DesignValues::text_of(pool, key)
+            index: mutable i64 = 0
+            while index < node.properties.count.i64():
+                if DesignValues::equal_ref(pool, node.properties[index.usize()].key, key_text):
+                    node.properties[index.usize()].value <- value
+                    return true
+                index <- index + 1
+            return false if node.properties.count >= DesignLimits::MAX_PROPERTIES_PER_NODE
+            DesignNodes::ensure_properties(&node.properties, node.properties.count + 1)
+            node.properties.push(Property{key: key, value: value})
+            return true
+
+        def event_index(node: Node&, pool: DesignValues::StringPool&, event_key: sview) -> i64:
+            index: mutable i64 = 0
+            while index < node.events.count.i64():
+                if DesignValues::equal_ref(pool, node.events[index.usize()].event_key, event_key):
+                    return index
+                index <- index + 1
+            return -1

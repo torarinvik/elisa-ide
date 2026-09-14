@@ -1,0 +1,52 @@
+include "../../src/canvas/design_hit_test.elisa"
+include "test_support.elisa"
+
+module DesignHitTestTest:
+    public:
+        def run() -> i64:
+            regions: mutable darray[DesignHitTest::Region] = DesignHitTest::empty_regions()
+            back_id: mutable DesignIds::DesignId = DesignIds::from_text("node-background")
+            front_id: mutable DesignIds::DesignId = DesignIds::from_text("node-foreground")
+            bounds: DesignGeometry::Rect = DesignGeometry::rect(10.0, 10.0, 100.0, 80.0)
+            whole_clip: DesignGeometry::Rect = DesignGeometry::rect(0.0, 0.0, 160.0, 120.0)
+            TestSupport::check("background region is accepted", DesignHitTest::append_region(&regions, back_id, bounds, whole_clip, true, true))
+            front_bounds: DesignGeometry::Rect = DesignGeometry::rect(20.0, 20.0, 70.0, 60.0)
+            TestSupport::check("foreground region is accepted", DesignHitTest::append_region(&regions, front_id, front_bounds, whole_clip, true, true))
+
+            overlap: DesignIds::DesignId = DesignHitTest::topmost(regions, DesignGeometry::point(30.0, 30.0))
+            TestSupport::check("last painted overlapping control wins", DesignIds::equal(overlap, front_id))
+
+            clipped: mutable darray[DesignHitTest::Region] = DesignHitTest::empty_regions()
+            _ = DesignHitTest::append_region(&clipped, back_id, bounds, whole_clip, true, true)
+            narrow_clip: DesignGeometry::Rect = DesignGeometry::rect(45.0, 0.0, 30.0, 120.0)
+            _ = DesignHitTest::append_region(&clipped, front_id, front_bounds, narrow_clip, true, true)
+            outside_clip: DesignIds::DesignId = DesignHitTest::topmost(clipped, DesignGeometry::point(30.0, 30.0))
+            inside_clip: DesignIds::DesignId = DesignHitTest::topmost(clipped, DesignGeometry::point(50.0, 30.0))
+            TestSupport::check("clipped foreground does not intercept outside its clip", DesignIds::equal(outside_clip, back_id))
+            TestSupport::check("clipped foreground remains selectable inside its clip", DesignIds::equal(inside_clip, front_id))
+
+            hidden: mutable darray[DesignHitTest::Region] = DesignHitTest::empty_regions()
+            _ = DesignHitTest::append_region(&hidden, back_id, bounds, whole_clip, true, true)
+            _ = DesignHitTest::append_region(&hidden, front_id, front_bounds, whole_clip, false, true)
+            hidden_hit: DesignIds::DesignId = DesignHitTest::topmost(hidden, DesignGeometry::point(30.0, 30.0))
+            TestSupport::check("hidden controls are ignored", DesignIds::equal(hidden_hit, back_id))
+
+            non_selectable: mutable darray[DesignHitTest::Region] = DesignHitTest::empty_regions()
+            _ = DesignHitTest::append_region(&non_selectable, back_id, bounds, whole_clip, true, true)
+            _ = DesignHitTest::append_region(&non_selectable, front_id, front_bounds, whole_clip, true, false)
+            selectable_hit: DesignIds::DesignId = DesignHitTest::topmost(non_selectable, DesignGeometry::point(30.0, 30.0))
+            TestSupport::check("non-selectable runtime decoration falls through", DesignIds::equal(selectable_hit, back_id))
+
+            empty_hit: DesignIds::DesignId = DesignHitTest::topmost(regions, DesignGeometry::point(150.0, 110.0))
+            invalid_point_hit: DesignIds::DesignId = DesignHitTest::topmost(regions, DesignGeometry::point(1.0e13, 0.0))
+            TestSupport::check("misses and invalid coordinates return the empty ID", DesignIds::is_empty(empty_hit) and DesignIds::is_empty(invalid_point_hit))
+
+            invalid_id: mutable DesignIds::DesignId = DesignIds::empty()
+            before_count: usize = regions.count
+            zero_bounds: DesignGeometry::Rect = DesignGeometry::rect(0.0, 0.0, 0.0, 10.0)
+            TestSupport::check("invalid ID and degenerate bounds are rejected atomically", not DesignHitTest::append_region(&regions, invalid_id, bounds, whole_clip, true, true) and not DesignHitTest::append_region(&regions, back_id, zero_bounds, whole_clip, true, true) and regions.count == before_count)
+
+            return TestSupport::report("design_hit_test")
+
+def main() -> i64:
+    return DesignHitTestTest::run()

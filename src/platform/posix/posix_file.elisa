@@ -1,0 +1,283 @@
+# POSIX file service: atomic replace with exclusive staging and fsync.
+#
+# The portable policy (what to save, when to save, fingerprints, recovery)
+# lives above this adapter. This file only supplies the mechanics the plan's
+# safe-save transaction requires:
+#
+#   * write new bytes to an exclusively-created sibling temporary file;
+#   * fsync the file before the rename publishes it;
+#   * rename atomically within one filesystem;
+#   * fsync the parent directory so the rename is durable;
+#   * distinguish failures before rename (old destination still present) from
+#     failures after rename (new destination visible, durability unconfirmed).
+#
+# Stale temporary files are never removed implicitly: `remove_temp` exists so
+# the recovery flow can decide, and an existing temporary file makes the save
+# fail closed instead of clobbering unknown state.
+
+# No standard-library includes: this adapter must compile in a UI unit that
+# includes the elisa-ui framework (see ADR-001). All mechanics come from the
+# designer's C shim.
+
+# Externs stay at file scope: stage1's backend declines a call to an extern
+# declared inside the module that calls it.
+#
+# They bind to the designer's own C shim symbols, which wrap the POSIX calls
+# whose raw names collide with declarations the compiler already knows.
+@link_name("designer_file_open_exclusive")
+extern designer_file_open_exclusive(path: cstr) -> i64 can[Blocking.IO]
+@link_name("designer_file_open_directory")
+extern designer_file_open_directory(path: cstr) -> i64 can[Blocking.IO]
+@link_name("designer_file_write")
+extern designer_file_write(descriptor: i64, bytes: void&, count: usize) -> i64 can[Blocking.IO]
+@link_name("designer_file_read")
+extern designer_file_read(path: cstr, out: mutable void&, capacity: usize) -> i64 can[Blocking.IO]
+@link_name("designer_file_sync")
+extern designer_file_sync(descriptor: i64) -> i64 can[Blocking.IO]
+@link_name("designer_file_sync_directory")
+extern designer_file_sync_directory(descriptor: i64) -> i64 can[Blocking.IO]
+@link_name("designer_file_read_is_not_found")
+extern designer_file_read_is_not_found(status: i64) -> i64
+@link_name("designer_file_close")
+extern designer_file_close(descriptor: i64) -> i64 can[Blocking.IO]
+@link_name("designer_file_rename")
+extern designer_file_rename(old_path: cstr, new_path: cstr) -> i64 can[Blocking.IO]
+@link_name("designer_file_link_no_replace")
+extern designer_file_link_no_replace(old_path: cstr, new_path: cstr) -> i64 can[Blocking.IO]
+@link_name("designer_file_status_is_exists")
+extern designer_file_status_is_exists(status: i64) -> i64
+@link_name("designer_file_mkdir")
+extern designer_file_mkdir(path: cstr) -> i64 can[Blocking.IO]
+@link_name("designer_file_unlink")
+extern designer_file_unlink(path: cstr) -> i64 can[Blocking.IO]
+
+# Error set at file scope for the same reason: stage1 declines a catch of a
+# module-scoped error set across the module boundary.
+error FileReplaceError:
+    OpenFailed(path: cstr)
+    WriteFailed(path: cstr)
+    SyncFailed(path: cstr)
+    RenameFailed(path: cstr)
+    DestinationExists(path: cstr)
+    CommittedButNotDurable(path: cstr)
+
+module PosixFile:
+    private:
+        def cstr_length(text: cstr) -> i64:
+            length: mutable i64 = 0
+            while length < 4096:
+                break if text[length.usize()] == 0
+                length <- length + 1
+            return length
+
+        def append_cstr(buffer: mutable darray[u8]&, text: cstr) -> void:
+            length: i64 = cstr_length(text)
+            for index in 0..<length |buffer, text|:
+                buffer.push(text[index.usize()])
+
+        # `path` + `suffix`, NUL-terminated. Returned in a heap buffer the
+        # caller owns; it is small and short-lived by design.
+        def with_suffix(path: cstr, suffix: cstr) -> darray[u8]:
+            buffer: mutable darray[u8] = []
+            append_cstr(&buffer, path)
+            append_cstr(&buffer, suffix)
+            buffer.push(0)
+            return buffer
+
+        # The directory part of `path` including its trailing slash, or "." when
+        # the path is a bare filename. NUL-terminated like with_suffix.
+        def parent_directory(path: cstr) -> darray[u8]:
+            length: i64 = cstr_length(path)
+            last_slash: mutable i64 = -1
+            for index in 0..<length |last_slash, path|:
+                last_slash <- index if path[index.usize()] == 47
+            buffer: mutable darray[u8] = []
+            if last_slash < 0:
+                buffer.push(46)
+            else:
+                for index in 0..<(last_slash + 1) |buffer, path|:
+                    buffer.push(path[index.usize()])
+            buffer.push(0)
+            return buffer
+
+        def as_cstr(buffer: mutable darray[u8]&) -> cstr:
+            return (&buffer[0]).cast[cstr] can Unsafe.PointerCast
+
+    public:
+        # Write `bytes` to `path` atomically. A failure before rename leaves
+        # the previous file untouched and removes a temporary created here. A
+        # CommittedButNotDurable error means rename succeeded and the new bytes
+        # are visible at `path`, but syncing the parent directory failed.
+        # Returns the number of bytes written after a fully durable commit.
+        #
+        # Failure values from the shim are negative errno; every caller here
+        # turns them into a typed FileReplaceError.
+        def atomic_write(path: cstr, bytes: sview) -> i64 error[FileReplaceError]:
+            can Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast:
+                temp: darray[u8] = with_suffix(path, ".tmp")
+                descriptor: i64 = designer_file_open_exclusive(as_cstr(&temp))
+                if descriptor < 0:
+                    raise FileReplaceError.OpenFailed(path)
+                if bytes.len > 0:
+                    amount: i64 = designer_file_write(descriptor, bytes.data.cast[void&], bytes.len)
+                    if amount != bytes.len.i64():
+                        _ = designer_file_close(descriptor)
+                        _ = designer_file_unlink(as_cstr(&temp))
+                        raise FileReplaceError.WriteFailed(path)
+                if designer_file_sync(descriptor) < 0:
+                    _ = designer_file_close(descriptor)
+                    _ = designer_file_unlink(as_cstr(&temp))
+                    raise FileReplaceError.SyncFailed(path)
+                if designer_file_close(descriptor) < 0:
+                    _ = designer_file_unlink(as_cstr(&temp))
+                    raise FileReplaceError.WriteFailed(path)
+                if designer_file_rename(as_cstr(&temp), path) < 0:
+                    _ = designer_file_unlink(as_cstr(&temp))
+                    raise FileReplaceError.RenameFailed(path)
+                # Durability of the rename itself: fsync the containing
+                # directory. A failure here is still reported; the file at
+                # `path` already holds the new bytes.
+                parent: darray[u8] = parent_directory(path)
+                directory: i64 = designer_file_open_directory(as_cstr(&parent))
+                if directory < 0:
+                    raise FileReplaceError.CommittedButNotDurable(path)
+                if designer_file_sync_directory(directory) < 0:
+                    _ = designer_file_close(directory)
+                    raise FileReplaceError.CommittedButNotDurable(path)
+                _ = designer_file_close(directory)
+                return bytes.len.i64()
+
+        # Create a file atomically without replacing an existing directory
+        # entry. Unlike `atomic_write`, this publishes the completed sibling
+        # temporary with `link(2)`, whose EEXIST failure closes the race
+        # between a caller's preflight read and publication.
+        def atomic_write_new(path: cstr, bytes: sview) -> i64 error[FileReplaceError]:
+            can Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast:
+                temp: darray[u8] = with_suffix(path, ".tmp")
+                descriptor: i64 = designer_file_open_exclusive(as_cstr(&temp))
+                if descriptor < 0:
+                    raise FileReplaceError.OpenFailed(path)
+                if bytes.len > 0:
+                    amount: i64 = designer_file_write(descriptor, bytes.data.cast[void&], bytes.len)
+                    if amount != bytes.len.i64():
+                        _ = designer_file_close(descriptor)
+                        _ = designer_file_unlink(as_cstr(&temp))
+                        raise FileReplaceError.WriteFailed(path)
+                if designer_file_sync(descriptor) < 0:
+                    _ = designer_file_close(descriptor)
+                    _ = designer_file_unlink(as_cstr(&temp))
+                    raise FileReplaceError.SyncFailed(path)
+                if designer_file_close(descriptor) < 0:
+                    _ = designer_file_unlink(as_cstr(&temp))
+                    raise FileReplaceError.WriteFailed(path)
+                linked: i64 = designer_file_link_no_replace(as_cstr(&temp), path)
+                if linked < 0:
+                    _ = designer_file_unlink(as_cstr(&temp))
+                    if designer_file_status_is_exists(linked) == 1:
+                        raise FileReplaceError.DestinationExists(path)
+                    raise FileReplaceError.RenameFailed(path)
+                # The destination now references the synced inode. Failure to
+                # remove the staging name cannot undo the committed file.
+                _ = designer_file_unlink(as_cstr(&temp))
+                parent: darray[u8] = parent_directory(path)
+                directory: i64 = designer_file_open_directory(as_cstr(&parent))
+                if directory < 0:
+                    raise FileReplaceError.CommittedButNotDurable(path)
+                if designer_file_sync_directory(directory) < 0:
+                    _ = designer_file_close(directory)
+                    raise FileReplaceError.CommittedButNotDurable(path)
+                _ = designer_file_close(directory)
+                return bytes.len.i64()
+
+        # Non-transactional write for staging files the caller owns and can
+        # regenerate (the host request/reply files). Returns bytes written or
+        # -1. It carries no error union, so a UI unit can call it without
+        # `catch` (which declines inside a module in the framework unit).
+        def write_plain(path: cstr, bytes: sview) -> i64:
+            can Blocking.IO, Memory.Release, Unsafe.PointerCast:
+                descriptor: i64 = designer_file_open_exclusive(path)
+                if descriptor < 0:
+                    return -1
+                amount: mutable i64 = 0
+                if bytes.len > 0:
+                    amount <- designer_file_write(descriptor, bytes.data.cast[void&], bytes.len)
+                _ = designer_file_sync(descriptor)
+                _ = designer_file_close(descriptor)
+                return amount
+
+        # Binary staging writes must use the array's explicit count instead
+        # of a text view. Elisa text views stop at embedded NUL bytes, while
+        # preview snapshots are length-counted binary records and contain NUL
+        # throughout their little-endian fields.
+        def write_bytes_plain(path: cstr, bytes: darray[u8]&) -> i64:
+            can Blocking.IO, Memory.Release, Unsafe.PointerCast:
+                descriptor: i64 = designer_file_open_exclusive(path)
+                if descriptor < 0:
+                    return -1
+                amount: mutable i64 = 0
+                if bytes.count > 0:
+                    pointer: void& = (&bytes[0]).cast[void&] can Unsafe.PointerCast
+                    amount <- designer_file_write(descriptor, pointer, bytes.count)
+                _ = designer_file_sync(descriptor)
+                _ = designer_file_close(descriptor)
+                return amount
+
+        # Remove a staging temporary left by an interrupted save. Only the
+        # explicit `.tmp` sibling of `path` is removed; anything else is left
+        # alone.
+        def remove_temp(path: cstr) -> bool:
+            can Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast:
+                temp: darray[u8] = with_suffix(path, ".tmp")
+                return designer_file_unlink(as_cstr(&temp)) == 0
+
+        # The staging path `atomic_write` uses for `path`, NUL-terminated in a
+        # heap buffer. Callers that need to inspect or remove a stale staging
+        # file use this instead of duplicating the naming rule.
+        def temp_path(path: cstr) -> darray[u8]:
+            can Memory.Allocate:
+                return with_suffix(path, ".tmp")
+
+        # Read up to `capacity` bytes of `path` into `out`, replacing its
+        # contents. Returns a positive byte count, zero for an empty file, or
+        # negative errno when the path cannot be read. Keeping the error is
+        # important to safe-save checks: ENOENT is different from EACCES or
+        # another unreadable destination.
+        def read_bytes_result(out: mutable darray[u8]&, path: cstr, capacity: usize) -> i64:
+            can Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast:
+                out.resize(capacity)
+                out_pointer: mutable void& = (&out[0]).cast[mutable void&] can Unsafe.PointerCast
+                amount: i64 = designer_file_read(path, out_pointer, capacity)
+                if amount < 0:
+                    out.resize(0)
+                    return amount
+                if amount == 0:
+                    out.resize(0)
+                    return 0
+                out.resize(amount.usize())
+                return amount
+
+        # Compatibility read for callers that only need bytes and intentionally
+        # treat any read failure as empty. Safety-sensitive callers should use
+        # read_bytes_result instead.
+        def read_bytes(out: mutable darray[u8]&, path: cstr, capacity: usize) -> usize:
+            can Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast:
+                amount: i64 = read_bytes_result(out, path, capacity)
+                return 0 if amount <= 0
+                return amount.usize()
+
+        # ENOENT is interpreted inside the native adapter instead of relying on
+        # platform-specific errno numbers in portable save policy.
+        def read_error_is_not_found(status: i64) -> bool:
+            return designer_file_read_is_not_found(status) == 1
+
+        # Create `path` as a directory; true when it exists afterwards.
+        def ensure_directory(path: cstr) -> bool:
+            can Blocking.IO:
+                return designer_file_mkdir(path) >= 0
+
+        # Remove `path`; true when the file was removed. Used by fixtures and
+        # recovery cleanup, not by the save path (which only removes its own
+        # staging file).
+        def remove(path: cstr) -> bool:
+            can Blocking.IO:
+                return designer_file_unlink(path) == 0

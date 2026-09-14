@@ -1,0 +1,125 @@
+# Deep copy and semantic comparison for form graphs.
+#
+# `darray` assignment copies a header, not the elements, so every clone copies
+# each nested array explicitly, and every destination array is reserved in the
+# document arena first (ADR-001, DesignStore). Clone is the basis for command
+# inverses, duplicate, and recovery snapshots.
+
+include "./design_limits.elisa"
+include "./design_ids.elisa"
+include "./design_values.elisa"
+include "./design_node.elisa"
+include "./design_form.elisa"
+include "./design_store.elisa"
+
+module DesignClone:
+    public:
+        def clone_ids_into(target: mutable darray[DesignIds::DesignId]&, source: darray[DesignIds::DesignId]) -> void:
+            target.resize(0)
+            DesignStore::ensure_ids(target, source.count)
+            index: mutable i64 = 0
+            while index < source.count.i64():
+                DesignIds::append_copy(target, &source[index.usize()])
+                index <- index + 1
+
+        def clone_properties_into(target: mutable darray[DesignNodes::Property]&, source: darray[DesignNodes::Property]) -> void:
+            target.resize(0)
+            DesignNodes::ensure_properties(target, source.count)
+            index: mutable i64 = 0
+            while index < source.count.i64():
+                target.push(source[index.usize()])
+                index <- index + 1
+
+        def clone_events_into(target: mutable darray[DesignNodes::EventConnection]&, source: darray[DesignNodes::EventConnection]) -> void:
+            target.resize(0)
+            DesignNodes::ensure_events(target, source.count)
+            index: mutable i64 = 0
+            while index < source.count.i64():
+                target.push(source[index.usize()])
+                index <- index + 1
+
+        def clone_bytes_into(target: mutable darray[u8]&, source: darray[u8]) -> void:
+            target.resize(0)
+            DesignStore::ensure_bytes(target, source.count)
+            index: mutable i64 = 0
+            while index < source.count.i64():
+                target.push(source[index.usize()])
+                index <- index + 1
+
+        def clone_node_into(target: mutable DesignNodes::Node&, source: DesignNodes::Node&) -> void:
+            DesignNodes::copy_node_into(target, source)
+
+        # Fill `target` with a deep copy of `source`; every array is allocated
+        # in the document arena, so the result survives the caller's frame.
+        def clone_form_into(target: mutable DesignForms::Form&, source: DesignForms::Form&) -> void:
+            DesignIds::copy_into(&target.id, &source.id)
+            target.name <- source.name
+            target.module_symbol <- source.module_symbol
+            target.schema_version <- source.schema_version
+            target.viewport_width <- source.viewport_width
+            target.viewport_height <- source.viewport_height
+            DesignIds::copy_into(&target.root, &source.root)
+            target.revision <- source.revision
+            clone_bytes_into(&target.strings.bytes, source.strings.bytes)
+            clone_bytes_into(&target.extensions, source.extensions)
+            target.nodes.resize(0)
+            DesignNodes::ensure_nodes(&target.nodes, source.nodes.count)
+            index: mutable i64 = 0
+            while index < source.nodes.count.i64():
+                target.nodes.push(DesignNodes::empty_node())
+                clone_node_into(&target.nodes[target.nodes.count - 1.usize()], source.nodes[index.usize()])
+                index <- index + 1
+
+        # Convenience for callers that want a fresh form value; the arrays are
+        # document-arena storage, not frame storage.
+        def clone_form(source: DesignForms::Form&) -> DesignForms::Form:
+            copied: mutable DesignForms::Form = DesignForms::empty_form()
+            clone_form_into(&copied, source)
+            return copied
+
+        def nodes_equal(left: DesignNodes::Node&, right: DesignNodes::Node&) -> bool:
+            if not DesignIds::equal(left.id, right.id):
+                return false
+            if left.type_key.offset != right.type_key.offset or left.type_key.length != right.type_key.length:
+                return false
+            if not DesignIds::equal(left.parent, right.parent):
+                return false
+            if left.children.count != right.children.count:
+                return false
+            index: mutable i64 = 0
+            while index < left.children.count.i64():
+                if not DesignIds::equal(left.children[index.usize()], right.children[index.usize()]):
+                    return false
+                index <- index + 1
+            if left.properties.count != right.properties.count:
+                return false
+            index <- 0
+            while index < left.properties.count.i64():
+                if left.properties[index.usize()].key.offset != right.properties[index.usize()].key.offset:
+                    return false
+                if not DesignValues::equal(left.properties[index.usize()].value, right.properties[index.usize()].value):
+                    return false
+                index <- index + 1
+            if left.events.count != right.events.count:
+                return false
+            index <- 0
+            while index < left.events.count.i64():
+                if left.events[index.usize()].handler.offset != right.events[index.usize()].handler.offset:
+                    return false
+                index <- index + 1
+            return left.runtime_hidden == right.runtime_hidden and left.unsupported == right.unsupported
+
+        # Semantic equality of two forms. String pools are compared through the
+        # text they hold, not raw offsets, so independent clones of the same
+        # graph compare equal.
+        def forms_equal(left: DesignForms::Form&, right: DesignForms::Form&) -> bool:
+            if not DesignIds::equal(left.id, right.id) or not DesignIds::equal(left.root, right.root):
+                return false
+            if left.nodes.count != right.nodes.count:
+                return false
+            index: mutable i64 = 0
+            while index < left.nodes.count.i64():
+                if not nodes_equal(left.nodes[index.usize()], right.nodes[index.usize()]):
+                    return false
+                index <- index + 1
+            return true

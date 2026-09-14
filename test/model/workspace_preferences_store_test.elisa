@@ -1,0 +1,88 @@
+# Native POSIX preferences-path resolution and atomic pane-ratio persistence.
+
+include "../../src/workspace/workspace_preferences_store.elisa"
+include "test_support.elisa"
+
+@link_name("designer_setenv")
+extern store_test_setenv(name: cstr, value: cstr) -> i64
+@link_name("designer_workspace_preferences_load_ratios")
+extern store_test_load_ratios(left: mutable f64&, right: mutable f64&, bottom: mutable f64&) -> void can[Blocking.IO]
+@link_name("designer_workspace_preferences_save_ratios")
+extern store_test_save_ratios(left: f64, right: f64, bottom: f64) -> i64 can[Blocking.IO]
+
+module WorkspacePreferencesStoreTest:
+    private:
+        def cstr_path(path: mutable darray[u8]&) -> cstr:
+            return (&path[0]).cast[cstr] can Unsafe.PointerCast
+
+        def path_buffer(text: sview) -> darray[u8]:
+            path: mutable darray[u8] = DesignText::copy_of(text)
+            path.push(0)
+            return path
+
+        def write_bytes(path: mutable darray[u8]&, text: sview) -> bool:
+            source: i64 error[FileReplaceError] = PosixFile::atomic_write(cstr_path(path), text)
+            written: i64 = catch source:
+                value:
+                    value
+                FileReplaceError.CommittedButNotDurable:
+                    text.len
+                error e:
+                    -1
+            return written >= 0
+
+    public:
+        def run() -> i64:
+            explicit_path: darray[u8] = WorkspacePreferencesStore::resolve_config_path("/tmp/elisa-preferences-test.json", "/tmp/xdg", "/Users/tester")
+            xdg_path: darray[u8] = WorkspacePreferencesStore::resolve_config_path("", "/tmp/xdg-config", "/Users/tester")
+            home_path: darray[u8] = WorkspacePreferencesStore::resolve_config_path("", "relative/xdg", "/Users/tester")
+            missing_path: darray[u8] = WorkspacePreferencesStore::resolve_config_path("", "relative/xdg", "")
+            TestSupport::check("explicit file override has highest priority", DesignText::equal(WorkspacePreferencesStore::config_path_text(explicit_path), "/tmp/elisa-preferences-test.json"))
+            TestSupport::check("absolute XDG config home resolves under app directory", DesignText::equal(WorkspacePreferencesStore::config_path_text(xdg_path), "/tmp/xdg-config/elisa-ide/preferences.json"))
+            TestSupport::check("relative XDG value falls back to HOME config directory", DesignText::equal(WorkspacePreferencesStore::config_path_text(home_path), "/Users/tester/.config/elisa-ide/preferences.json"))
+            TestSupport::check("missing home leaves preferences disabled", missing_path.count == 0)
+
+            storage_path: mutable darray[u8] = path_buffer("build/workspace-preferences-store-test/deep/config/preferences.json")
+            storage_cstr: cstr = cstr_path(&storage_path)
+            _ = PosixFile::remove(storage_cstr)
+            _ = PosixFile::remove("build/workspace-preferences-store-test/deep/config/preferences.json.tmp")
+            TestSupport::check("first save creates missing config directories and atomically writes ratios", WorkspacePreferencesStore::save_ratios_at_path(&storage_path, 0.3125, 0.375, 0.28125))
+            loaded_sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
+            loaded: WorkspacePreferences::Preferences = WorkspacePreferencesStore::load_at_buffer(&storage_path, &loaded_sink)
+            TestSupport::check("persisted pane ratios reload exactly", loaded.left_pane_ratio == 0.3125 and loaded.right_pane_ratio == 0.375 and loaded.bottom_pane_ratio == 0.28125 and loaded_sink.error_count == 0)
+
+            seeded: mutable WorkspacePreferences::Preferences = WorkspacePreferences::empty()
+            seeded.theme <- WorkspacePreferences::Theme.Dark
+            _ = WorkspacePreferences::remember_file(&seeded, "/tmp/keep-this-recent-form.elisaform.json")
+            seed_sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
+            seeded_json: darray[u8] = WorkspacePreferences::encode(seeded, &seed_sink)
+            TestSupport::check("preferences seed encodes", seeded_json.count > 0 and seed_sink.error_count == 0)
+            TestSupport::check("test can seed other local preferences", write_bytes(&storage_path, DesignText::view_of(seeded_json)))
+            TestSupport::check("updating ratios succeeds", WorkspacePreferencesStore::save_ratios_at_path(&storage_path, 0.34375, 0.40625, 0.25))
+            preserved_sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
+            preserved: WorkspacePreferences::Preferences = WorkspacePreferencesStore::load_at_buffer(&storage_path, &preserved_sink)
+            TestSupport::check("ratio save preserves recognized theme and recent paths", preserved.theme == WorkspacePreferences::Theme.Dark and preserved.recent_files.count == 1 and DesignText::equal(WorkspacePreferences::recent_path(preserved, 0), "/tmp/keep-this-recent-form.elisaform.json") and preserved.left_pane_ratio == 0.34375 and preserved.right_pane_ratio == 0.40625 and preserved.bottom_pane_ratio == 0.25)
+
+            _ = store_test_setenv("ELISA_IDE_CONFIG", storage_cstr)
+            TestSupport::check("native shell storage accepts bounded ratios", store_test_save_ratios(0.25, 0.34375, 0.375) == 1)
+            native_left: mutable f64 = 0.0
+            native_right: mutable f64 = 0.0
+            native_bottom: mutable f64 = 0.0
+            store_test_load_ratios(&native_left, &native_right, &native_bottom)
+            TestSupport::check("native shell storage reloads all three ratios", native_left == 0.25 and native_right == 0.34375 and native_bottom == 0.375)
+            native_sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
+            native_round_trip: WorkspacePreferences::Preferences = WorkspacePreferencesStore::load_at_buffer(&storage_path, &native_sink)
+            TestSupport::check("native shell JSON remains compatible with WorkspacePreferences", native_round_trip.theme == WorkspacePreferences::Theme.Dark and native_round_trip.recent_files.count == 1 and native_round_trip.left_pane_ratio == 0.25 and native_round_trip.right_pane_ratio == 0.34375 and native_round_trip.bottom_pane_ratio == 0.375 and native_sink.error_count == 0)
+
+            TestSupport::check("corrupt preferences bytes can be staged", write_bytes(&storage_path, "{not-json"))
+            TestSupport::check("ratio save refuses to overwrite corrupt preferences", not WorkspacePreferencesStore::save_ratios_at_path(&storage_path, 0.2, 0.3, 0.4))
+            unchanged: mutable darray[u8] = []
+            amount: i64 = PosixFile::read_bytes_result(&unchanged, storage_cstr, 64)
+            TestSupport::check("refused save leaves corrupt source bytes untouched", amount == 9 and DesignText::equal(DesignText::view_of(unchanged), "{not-json"))
+            _ = PosixFile::remove(storage_cstr)
+            _ = PosixFile::remove("build/workspace-preferences-store-test/deep/config/preferences.json.tmp")
+
+            return TestSupport::report("workspace_preferences_store")
+
+def main() -> i64:
+    return WorkspacePreferencesStoreTest::run()

@@ -1,0 +1,179 @@
+# Headless coverage for the canonical lowering and Elisa source emitter.
+
+include "../../src/schema/design_json_decode.elisa"
+include "../../src/commands/design_ops.elisa"
+include "../../src/lowering/design_lower.elisa"
+include "../../src/codegen/elisa_emit.elisa"
+include "../../src/codegen/elisa_app_emit.elisa"
+include "../model/test_support.elisa"
+
+module DesignCodegenTest:
+    private:
+        def find_text(text: sview, needle: sview) -> i64:
+            return -1 if needle.len == 0 or text.len < needle.len
+            index: mutable i64 = 0
+            while index + needle.len <= text.len:
+                matched: mutable bool = true
+                offset: mutable i64 = 0
+                while offset < needle.len:
+                    if text[index + offset] != needle[offset]:
+                        matched <- false
+                        break
+                    offset <- offset + 1
+                return index if matched
+                index <- index + 1
+            return -1
+
+        def count_text(text: sview, needle: sview) -> i64:
+            return 0 if needle.len == 0 or text.len < needle.len
+            count: mutable i64 = 0
+            index: mutable i64 = 0
+            while index + needle.len <= text.len:
+                matched: mutable bool = true
+                offset: mutable i64 = 0
+                while offset < needle.len:
+                    if text[index + offset] != needle[offset]:
+                        matched <- false
+                        break
+                    offset <- offset + 1
+                if matched:
+                    count <- count + 1
+                    index <- index + needle.len
+                else:
+                    index <- index + 1
+            return count
+
+        def operation_index_for_symbol(form: DesignForms::Form&, lowered: DesignLower::LoweredForm, symbol: sview) -> i64:
+            index: mutable i64 = 0
+            while index < lowered.operations.count.i64():
+                source: i64 = lowered.operations[index.usize()].source_node
+                if DesignValues::equal_ref(form.strings, form.nodes[source.usize()].symbol, symbol):
+                    return index
+                index <- index + 1
+            return -1
+
+    public:
+        def run() -> i64:
+            registry: DesignRegistry::Registry = DesignRegistry::build_builtin()
+            fixture: darray[u8] = TestSupport::read_fixture("test/fixtures/settings-form.elisaform.json")
+            sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
+            form: mutable DesignForms::Form = DesignDecode::decode_form(TestSupport::view_of(fixture), registry, &sink)
+            lowered: DesignLower::LoweredForm = DesignLower::lower_form(form, registry, &sink)
+            TestSupport::check("settings fixture lowers", lowered.valid)
+            TestSupport::check("all settings nodes lower", lowered.operations.count == form.nodes.count)
+
+            root_operation: i64 = operation_index_for_symbol(form, lowered, "settings_layout")
+            button_operation: i64 = operation_index_for_symbol(form, lowered, "save_button")
+            TestSupport::check("root lowers first", root_operation == 0)
+            TestSupport::check("button lowers after its parent", button_operation > root_operation)
+
+            first: ElisaEmit::Emission = ElisaEmit::emit_view(form, registry, lowered, &sink)
+            second: ElisaEmit::Emission = ElisaEmit::emit_view(form, registry, lowered, &sink)
+            TestSupport::check("source emitted", first.valid and first.source.count > 0)
+            TestSupport::check("emission repeats byte-for-byte", DesignText::equal(TestSupport::view_of(first.source), TestSupport::view_of(second.source)))
+            golden: darray[u8] = TestSupport::read_fixture("test/codegen/golden/settings_view.elisa")
+            TestSupport::check("settings source matches the committed golden", DesignText::equal(TestSupport::view_of(first.source), TestSupport::view_of(golden)))
+            generated_source: sview = TestSupport::view_of(first.source)
+            source_map_validation: CodegenSourceMap::Validation = CodegenSourceMap::validate(first.source_map, generated_source)
+            save_text_offset: i64 = find_text(generated_source, "\"Save\"")
+            save_text_lookup: CodegenSourceMap::Lookup = CodegenSourceMap::lookup(first.source_map, generated_source, save_text_offset)
+            save_text_span: i64 = save_text_lookup.span_index
+            TestSupport::check("view source map is bound to the exact emitted bytes", source_map_validation.ok and first.source_map.generated_hash == Fingerprint::fnv1a64(generated_source) and first.source_map.generated_length == generated_source.len)
+            TestSupport::check("generated button text maps to its form, node, and text property", save_text_lookup.ok and save_text_lookup.found and CodegenSourceMap::kind_at(first.source_map, save_text_span) == CodegenSourceMap::OriginKind.Property and DesignText::equal(CodegenSourceMap::form_id_at(first.source_map, save_text_span), "form-settings") and DesignText::equal(CodegenSourceMap::node_id_at(first.source_map, save_text_span), "node-save") and DesignText::equal(CodegenSourceMap::member_at(first.source_map, save_text_span), "text"))
+            save_handler_offset: i64 = find_text(generated_source, "SettingsHandlers::save_clicked")
+            save_event_lookup: CodegenSourceMap::Lookup = CodegenSourceMap::lookup(first.source_map, generated_source, save_handler_offset)
+            save_event_span: i64 = save_event_lookup.span_index
+            TestSupport::check("generated save handler dispatch maps to its event connection", save_event_lookup.ok and save_event_lookup.found and CodegenSourceMap::kind_at(first.source_map, save_event_span) == CodegenSourceMap::OriginKind.Event and DesignText::equal(CodegenSourceMap::form_id_at(first.source_map, save_event_span), "form-settings") and DesignText::equal(CodegenSourceMap::node_id_at(first.source_map, save_event_span), "node-save") and DesignText::equal(CodegenSourceMap::member_at(first.source_map, save_event_span), "click"))
+            TestSupport::check("effective column constructor emitted", TestSupport::text_contains(TestSupport::view_of(first.source), "UiHandles::column(UiHandles::root_parent()"))
+            TestSupport::check("button constructor and styling emitted", TestSupport::text_contains(TestSupport::view_of(first.source), "UiHandles::set_text(widgets["))
+            TestSupport::check("event handler dispatch emitted", TestSupport::text_contains(TestSupport::view_of(first.source), "SettingsHandlers::save_clicked(widget, event)"))
+            TestSupport::check("valid handle checked", TestSupport::text_contains(TestSupport::view_of(first.source), "UiHandles::is_valid(widgets["))
+
+            app_config: ElisaAppEmit::AppConfig = ElisaAppEmit::AppConfig{
+                framework_include: "../framework/src/platform/sdl3/ui_sdl3_flat.elisa",
+                view_include: "generated_settings_view.elisa",
+                view_module: "settings_view",
+                handlers_include: "../test/codegen/fixtures/settings_handlers.elisa",
+                window_title: "Settings \"Editor\" ø",
+                window_width: 640,
+                window_height: 480,
+                max_frames: 1,
+                clear_color: DesignValues::ColorValue{r: 20, g: 22, b: 28, a: 255},
+            }
+            app_emission: ElisaAppEmit::Emission = ElisaAppEmit::emit_sdl3_application(first, app_config, &sink)
+            app_source: sview = TestSupport::view_of(app_emission.source)
+            TestSupport::check("SDL3 application contract emitted", app_emission.valid)
+            TestSupport::check("framework, emitted view, and handwritten handlers are explicit includes", TestSupport::text_contains(app_source, "include \"../framework/src/platform/sdl3/ui_sdl3_flat.elisa\"") and TestSupport::text_contains(app_source, "include \"generated_settings_view.elisa\"") and TestSupport::text_contains(app_source, "include \"../test/codegen/fixtures/settings_handlers.elisa\""))
+            TestSupport::check("application callback contract dispatches through typed view API", TestSupport::text_contains(app_source, "settings_view::dispatch_widget_event(widget, event)") and TestSupport::text_contains(app_source, "UiHandles::update_marked_text_utf8_characters(text, selected_start, selected_length)"))
+            TestSupport::check("callback exports and SDL entrypoint occur exactly once", count_text(app_source, "def app_init()") == 1 and count_text(app_source, "def app_widget_event(") == 1 and count_text(app_source, "def app_event(") == 1 and count_text(app_source, "def app_text_input(") == 1 and count_text(app_source, "def app_text_editing(") == 1 and count_text(app_source, "def app_frame()") == 1 and count_text(app_source, "def main()") == 1)
+            TestSupport::check("SDL title is escaped and target dimensions are deterministic", TestSupport::text_contains(app_source, "UiSdl3::run(\"Settings \\\"Editor\\\" ø\", 640, 480, 1)"))
+            wrong_view_config: mutable ElisaAppEmit::AppConfig = app_config
+            wrong_view_config.view_module <- "other_view"
+            wrong_view_sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
+            wrong_view: ElisaAppEmit::Emission = ElisaAppEmit::emit_sdl3_application(first, wrong_view_config, &wrong_view_sink)
+            TestSupport::check("application contract rejects a view-module mismatch", not wrong_view.valid and wrong_view_sink.error_count > 0)
+            app_write_result: i64 = catch write_entire_file("build/generated_settings_app.elisa", app_source):
+                value:
+                    value
+                error e:
+                    -1
+            TestSupport::check("application compile fixture source written", app_write_result > 0)
+
+            write_result: i64 = catch write_entire_file("build/generated_settings_view.elisa", TestSupport::view_of(first.source)):
+                value:
+                    value
+                error e:
+                    -1
+            TestSupport::check("integration fixture source written", write_result > 0)
+
+            # A caption with syntax-sensitive bytes stays one safe source literal.
+            button_index: i64 = DesignForms::find_node(form, DesignIds::from_text("node-save"))
+            if button_index >= 0:
+                caption: DesignValues::StringRef = DesignValues::append(&form.strings.bytes, "Save \"later\" ø\n")
+                _ = DesignNodes::set_property(&form.nodes[button_index.usize()], &form.strings, DesignValues::append(&form.strings.bytes, "text"), DesignValues::text(caption))
+                edited_lowering: DesignLower::LoweredForm = DesignLower::lower_form(form, registry, &sink)
+                edited: ElisaEmit::Emission = ElisaEmit::emit_view(form, registry, edited_lowering, &sink)
+                TestSupport::check("quotes and newline escaped while Unicode stays UTF-8", TestSupport::text_contains(TestSupport::view_of(edited.source), "Save \\\"later\\\" ø\\n"))
+
+            bad_bytes: darray[u8] = TestSupport::read_fixture("test/fixtures/unknown-component-form.elisaform.json")
+            bad_sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
+            bad_form: DesignForms::Form = DesignDecode::decode_form(TestSupport::view_of(bad_bytes), registry, &bad_sink)
+            TestSupport::check("unknown fixture decodes one node", bad_form.nodes.count == 1)
+            TestSupport::check("unknown fixture decodes without errors", bad_sink.error_count == 0)
+            bad_lowering: DesignLower::LoweredForm = DesignLower::lower_form(bad_form, registry, &bad_sink)
+            TestSupport::check("unknown component cannot be generated", not bad_lowering.valid)
+            TestSupport::check("unknown lowering explains rejection", bad_sink.items.count > 0)
+            TestSupport::check("unsupported target diagnostic provided", TestSupport::has_error_code(bad_sink, DesignDiagnostics::Code.UnsupportedTarget))
+
+            malformed_bytes: darray[u8] = TestSupport::read_fixture("test/fixtures/settings-form.elisaform.json")
+            malformed_sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
+            malformed_form: mutable DesignForms::Form = DesignDecode::decode_form(TestSupport::view_of(malformed_bytes), registry, &malformed_sink)
+            save_index: i64 = DesignForms::find_node(malformed_form, DesignIds::from_text("node-save"))
+            if save_index >= 0 and malformed_form.nodes[save_index.usize()].events.count > 0:
+                malformed_form.nodes[save_index.usize()].events[0.usize()].handler <- DesignValues::append(&malformed_form.strings.bytes, "bad\nInjected::source")
+            malformed_lowering: DesignLower::LoweredForm = DesignLower::lower_form(malformed_form, registry, &malformed_sink)
+            TestSupport::check("unsafe handler path is rejected before emission", not malformed_lowering.valid)
+            TestSupport::check("unsafe handler has target diagnostic", TestSupport::has_error_code(malformed_sink, DesignDiagnostics::Code.UnsupportedTarget))
+
+            large_form: mutable DesignForms::Form = DesignForms::empty_form()
+            large_form.id <- DesignIds::from_text("form-large")
+            large_form.name <- DesignValues::append(&large_form.strings.bytes, "Large")
+            large_form.module_symbol <- DesignValues::append(&large_form.strings.bytes, "large_view")
+            large_allocator: mutable DesignIds::Allocator = DesignIds::allocator(110)
+            large_sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
+            large_root: mutable DesignIds::DesignId = DesignIds::empty()
+            _ = DesignOps::insert_node_into(&large_form, registry, DesignIds::empty(), -1, "elisa.ui.column", &large_allocator, &large_root, &large_sink)
+            child_index: mutable i64 = 0
+            while child_index < 256:
+                child_id: mutable DesignIds::DesignId = DesignIds::empty()
+                _ = DesignOps::insert_node_into(&large_form, registry, large_root, -1, "elisa.ui.label", &large_allocator, &child_id, &large_sink)
+                child_index <- child_index + 1
+            large_lowering: DesignLower::LoweredForm = DesignLower::lower_form(large_form, registry, &large_sink)
+            TestSupport::check("over-capacity documents stay intact", large_form.nodes.count == 257)
+            TestSupport::check("selected runtime capacity is enforced", not large_lowering.valid)
+            TestSupport::check("capacity diagnostic is actionable", TestSupport::has_error_code(large_sink, DesignDiagnostics::Code.UnsupportedTarget))
+
+            return TestSupport::report("design_codegen")
+
+def main() -> i64:
+    return DesignCodegenTest::run()

@@ -1,0 +1,571 @@
+# Project and form document decoding.
+#
+# The runtime standard library's JSON parser runs in this core unit only
+# (ADR-001). This layer adds the plan's document rules: bounded sizes, duplicate
+# object keys rejected, duplicate IDs rejected by the model, typed values from
+# the registry, unknown component data preserved, and every string copied into
+# the document's own pool so nothing borrows a parser buffer.
+
+include "../model/design_limits.elisa"
+include "../model/design_text.elisa"
+include "../model/design_ids.elisa"
+include "../model/design_values.elisa"
+include "../model/design_node.elisa"
+include "../model/design_form.elisa"
+include "../model/design_project.elisa"
+include "../model/design_store.elisa"
+include "../registry/design_registry.elisa"
+include "../validation/design_diagnostics.elisa"
+include "design_migrate.elisa"
+
+include "../../compiler/elisacore_std/elisacore_runtime.elisa"
+include "../../compiler/elisacore_std/collections.elisa"
+include "../../compiler/elisacore_std/elisacore_json.elisa"
+
+module DesignDecode:
+    private:
+        # Project manifest arrays outlive the decode call. Keep their backing
+        # allocations in a process-lifetime arena, like the other model pools.
+        global mutable project_array_arena: Arena = Arena{begin: null, end: null, end_index: 0, strategy: 0}
+
+        def empty_arena() -> Arena:
+            return Arena{begin: null, end: null, end_index: 0, strategy: 0}
+
+        def bounded_capacity(count: i64, limit: usize) -> usize:
+            return 0 if count <= 0
+            return limit if count > limit.i64()
+            return count.usize()
+
+        def reserve_project_forms(target: mutable darray[DesignProjects::FormRef]&, capacity: usize) -> void:
+            _ = arena_da_reserve(&project_array_arena, target, capacity)
+
+        def reserve_project_roots(target: mutable darray[DesignValues::StringRef]&, capacity: usize) -> void:
+            _ = arena_da_reserve(&project_array_arena, target, capacity)
+
+        def reserve_project_targets(target: mutable darray[DesignProjects::TargetRef]&, capacity: usize) -> void:
+            _ = arena_da_reserve(&project_array_arena, target, capacity)
+
+        # The arena is owned by the public decode entry point so the returned
+        # DOM (and everything copied from it) outlives this call.
+        def parsed_or_null(arena: mutable Arena&, text: sview, sink: mutable DesignDiagnostics::Sink&) -> JsonValue:
+            if text.len.usize() > DesignLimits::MAX_INPUT_BYTES:
+                _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.InputTooLarge, "", "document exceeds the input byte limit")
+                return JsonValue.Null
+            parsed: JsonParseResult = json_parse_checked(arena, text)
+            if parsed.code != JsonErrorCode.OK:
+                _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.MalformedJson, "", "document is not valid JSON")
+                return JsonValue.Null
+            if duplicate_keys_present(parsed.value):
+                _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.DuplicateKey, "", "document contains duplicate object keys")
+                return JsonValue.Null
+            return parsed.value
+
+        def duplicate_keys_present(value: JsonValue) -> bool:
+            match json_kind(value):
+                JsonKind.OBJECT:
+                    count: mutable i64 = json_object_len(value)
+                    index: mutable i64 = 0
+                    while index < count:
+                        key: sview = member_key(value, index)
+                        earlier: mutable i64 = 0
+                        while earlier < index:
+                            if DesignText::equal(member_key(value, earlier), key):
+                                return true
+                            earlier <- earlier + 1
+                        if duplicate_keys_present(member_value(value, index)):
+                            return true
+                        index <- index + 1
+                JsonKind.ARRAY:
+                    count: mutable i64 = json_array_len(value)
+                    index: mutable i64 = 0
+                    while index < count:
+                        if duplicate_keys_present(array_value(value, index)):
+                            return true
+                        index <- index + 1
+                _:
+                    return false
+            return false
+
+        def member_key(value: JsonValue, index: i64) -> sview:
+            key: sview = catch json_key_at(value, index):
+                value:
+                    value
+                error e:
+                    ""
+            return key
+
+        def member_value(value: JsonValue, index: i64) -> JsonValue:
+            member: JsonValue = catch json_value_at(value, index):
+                value:
+                    value
+                error e:
+                    JsonValue.Null
+            return member
+
+        def array_value(value: JsonValue, index: i64) -> JsonValue:
+            item: JsonValue = catch json_at(value, index):
+                value:
+                    value
+                error e:
+                    JsonValue.Null
+            return item
+
+        def member_index(value: JsonValue, key: sview) -> i64:
+            return json_index_of(value, key)
+
+        def member_at(value: JsonValue, key: sview) -> JsonValue:
+            found: JsonValue = catch json_get(value, key):
+                value:
+                    value
+                error e:
+                    JsonValue.Null
+            return found
+
+        def string_at(value: JsonValue, key: sview) -> sview:
+            text: sview = catch json_as_string(member_at(value, key)):
+                value:
+                    value
+                error e:
+                    ""
+            return text
+
+        def number_at(value: JsonValue, key: sview) -> f64:
+            number: f64 = catch json_as_number(member_at(value, key)):
+                value:
+                    value
+                error e:
+                    0.0
+            return number
+
+        def int_at(value: JsonValue, key: sview, fallback: i64) -> i64:
+            member: JsonValue = member_at(value, key)
+            return fallback if not json_is_number(member)
+            return number_at(value, key).i64()
+
+        def bool_at(value: JsonValue, key: sview, fallback: bool) -> bool:
+            member: JsonValue = member_at(value, key)
+            return fallback if not json_is_bool(member)
+            flag: bool = catch json_as_bool(member):
+                value:
+                    value
+                error e:
+                    fallback
+            return flag
+
+        def id_at(value: JsonValue, key: sview) -> DesignIds::DesignId:
+            return DesignIds::from_text(string_at(value, key))
+
+        def raw_json(arena: mutable Arena&, value: JsonValue) -> darray[u8]:
+            return json_write(arena, value)
+
+        # ---- color ---------------------------------------------------------------
+
+        def hex_digit(byte: u8) -> i32:
+            if byte >= 48 and byte <= 57:
+                return (byte - 48).i32()
+            if byte >= 97 and byte <= 102:
+                return (byte - 97 + 10).i32()
+            if byte >= 65 and byte <= 70:
+                return (byte - 65 + 10).i32()
+            return -1
+
+        # Parse `#rrggbb` or `#rrggbbaa` properly: each channel is two hex
+        # digits, so the byte is (high << 4) | low.
+        def parse_color(text: sview, fallback: DesignValues::ColorValue, valid: mutable bool&) -> DesignValues::ColorValue:
+            valid <- false
+            if text.len != 7 and text.len != 9:
+                return fallback
+            if text[0] != 35:
+                return fallback
+            high: mutable i32 = hex_digit(text[1])
+            low: mutable i32 = hex_digit(text[2])
+            if high < 0 or low < 0:
+                return fallback
+            r: u8 = (high * 16 + low).u8()
+            high <- hex_digit(text[3])
+            low <- hex_digit(text[4])
+            if high < 0 or low < 0:
+                return fallback
+            g: u8 = (high * 16 + low).u8()
+            high <- hex_digit(text[5])
+            low <- hex_digit(text[6])
+            if high < 0 or low < 0:
+                return fallback
+            b: u8 = (high * 16 + low).u8()
+            a: mutable u8 = 255
+            if text.len == 9:
+                high <- hex_digit(text[7])
+                low <- hex_digit(text[8])
+                if high < 0 or low < 0:
+                    return fallback
+                a <- (high * 16 + low).u8()
+            valid <- true
+            return DesignValues::ColorValue{r: r, g: g, b: b, a: a}
+
+        # ---- typed values --------------------------------------------------------
+
+        def decode_value(arena: mutable Arena&, pool: mutable DesignValues::StringPool&, tag: DesignValues::ValueTag, has_descriptor: bool, raw: JsonValue, sink: mutable DesignDiagnostics::Sink&, path: sview) -> DesignValues::DesignValue:
+            if has_descriptor:
+                if not kind_matches(tag, raw):
+                    _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.InvalidPropertyType, path, "property value does not match its declared type")
+                    return DesignValues::unsupported(DesignValues::append(&pool.bytes, DesignText::view_of(raw_json(arena, raw))))
+                match tag:
+                    DesignValues::ValueTag.Bool:
+                        flag: bool = catch json_as_bool(raw):
+                            value:
+                                value
+                            error e:
+                                false
+                        return DesignValues::boolean(flag)
+                    DesignValues::ValueTag.Integer:
+                        number: f64 = number_of(raw)
+                        if not exact_i64(number):
+                            _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.InvalidPropertyType, path, "integer property must be an exact signed 64-bit integer")
+                            return DesignValues::unsupported(DesignValues::append(&pool.bytes, DesignText::view_of(raw_json(arena, raw))))
+                        return DesignValues::integer(number.i64())
+                    DesignValues::ValueTag.Scalar:
+                        return DesignValues::scalar(number_of(raw))
+                    DesignValues::ValueTag.Length:
+                        return DesignValues::length(number_of(raw))
+                    DesignValues::ValueTag.Text:
+                        return DesignValues::text(DesignValues::append(pool.bytes, string_of(raw)))
+                    DesignValues::ValueTag.EnumKey:
+                        return DesignValues::enum_key(DesignValues::append(pool.bytes, string_of(raw)))
+                    DesignValues::ValueTag.Color:
+                        color_valid: mutable bool = false
+                        parsed_color: DesignValues::ColorValue = parse_color(string_of(raw), DesignValues::ColorValue{r: 0, g: 0, b: 0, a: 255}, &color_valid)
+                        if not color_valid:
+                            _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.InvalidPropertyType, path, "color must use #rrggbb or #rrggbbaa hexadecimal notation")
+                            return DesignValues::unsupported(DesignValues::append(&pool.bytes, DesignText::view_of(raw_json(arena, raw))))
+                        return DesignValues::color_value(parsed_color)
+                    DesignValues::ValueTag.NodeRef:
+                        return DesignValues::node_ref(DesignValues::append(pool.bytes, string_of(raw)))
+                    _:
+                        return DesignValues::unsupported(DesignValues::append(pool.bytes, DesignText::view_of(raw_json(arena, raw))))
+            match json_kind(raw):
+                JsonKind.BOOL:
+                    flag: bool = catch json_as_bool(raw):
+                        value:
+                            value
+                        error e:
+                            false
+                    return DesignValues::boolean(flag)
+                JsonKind.NUMBER:
+                    number: f64 = number_of(raw)
+                    if number == number.i64().f64():
+                        return DesignValues::integer(number.i64())
+                    return DesignValues::scalar(number)
+                JsonKind.STRING:
+                    return DesignValues::text(DesignValues::append(pool.bytes, string_of(raw)))
+                _:
+                    return DesignValues::unsupported(DesignValues::append(pool.bytes, DesignText::view_of(raw_json(arena, raw))))
+
+        def exact_i64(number: f64) -> bool:
+            # The JSON DOM stores numbers as f64. Keep only integers that are
+            # exactly representable there; larger lexical integers could have
+            # been rounded before this function sees them.
+            return false if number < -9007199254740991.0 or number > 9007199254740991.0
+            return number.i64().f64() == number
+
+        # True when the JSON shape can supply the descriptor's tag. Scalar and
+        # length accept numbers; integer accepts numbers; text-like tags accept
+        # strings; bool accepts booleans; color accepts strings.
+        def kind_matches(tag: DesignValues::ValueTag, raw: JsonValue) -> bool:
+            kind: JsonKind = json_kind(raw)
+            match tag:
+                DesignValues::ValueTag.Bool:
+                    return kind == JsonKind.BOOL
+                DesignValues::ValueTag.Integer:
+                    return kind == JsonKind.NUMBER
+                DesignValues::ValueTag.Scalar:
+                    return kind == JsonKind.NUMBER
+                DesignValues::ValueTag.Length:
+                    return kind == JsonKind.NUMBER
+                DesignValues::ValueTag.Text:
+                    return kind == JsonKind.STRING
+                DesignValues::ValueTag.EnumKey:
+                    return kind == JsonKind.STRING
+                DesignValues::ValueTag.Color:
+                    return kind == JsonKind.STRING
+                DesignValues::ValueTag.NodeRef:
+                    return kind == JsonKind.STRING
+                _:
+                    return true
+
+        def number_of(raw: JsonValue) -> f64:
+            number: f64 = catch json_as_number(raw):
+                value:
+                    value
+                error e:
+                    0.0
+            return number
+
+        def string_of(raw: JsonValue) -> sview:
+            text: sview = catch json_as_string(raw):
+                value:
+                    value
+                error e:
+                    ""
+            return text
+
+        # ---- nodes and forms -----------------------------------------------------
+
+        def decode_node_into(node: mutable DesignNodes::Node&, arena: mutable Arena&, pool: mutable DesignValues::StringPool&, registry: DesignRegistry::Registry&, raw: JsonValue, node_index: i64, sink: mutable DesignDiagnostics::Sink&) -> void:
+            parsed_id: DesignIds::DesignId = id_at(raw, "id")
+            DesignIds::copy_into(&node.id, &parsed_id)
+            node.type_key <- DesignValues::append(pool.bytes, string_at(raw, "type"))
+            node.name <- DesignValues::append(pool.bytes, string_at(raw, "name"))
+            node.symbol <- DesignValues::append(pool.bytes, string_at(raw, "symbol"))
+            node.runtime_hidden <- bool_at(raw, "runtimeHidden", false)
+            node.editor_locked <- bool_at(raw, "editorLocked", false)
+            node.editor_hidden <- bool_at(raw, "editorHidden", false)
+
+            type_text: sview = DesignValues::text_of(pool, node.type_key)
+            component_index: i64 = DesignRegistry::find_component(registry, type_text)
+            node.unsupported <- component_index < 0
+
+            count: mutable i64 = 0
+            index: mutable i64 = 0
+            properties: JsonValue = member_at(raw, "properties")
+            if json_kind(properties) == JsonKind.OBJECT:
+                count <- json_object_len(properties)
+                if count > DesignLimits::MAX_PROPERTIES_PER_NODE.i64():
+                    _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.TooManyNodes, DesignText::view_of(DesignText::indexed_path("nodes", node_index, ".properties")), "node exceeds the supported property limit")
+                DesignNodes::ensure_properties(&node.properties, bounded_capacity(count, DesignLimits::MAX_PROPERTIES_PER_NODE))
+                index <- 0
+                while index < count and node.properties.count < DesignLimits::MAX_PROPERTIES_PER_NODE:
+                    key: sview = member_key(properties, index)
+                    value: JsonValue = member_value(properties, index)
+                    key_ref: DesignValues::StringRef = DesignValues::append(pool.bytes, key)
+                    descriptor_index: i64 = DesignRegistry::find_property(registry, component_index, key)
+                    property_path: darray[u8] = DesignText::indexed_path("nodes", node_index, ".properties")
+                    if descriptor_index >= 0:
+                        descriptor: DesignRegistry::PropertyDescriptor = registry.components[component_index.usize()].properties[descriptor_index.usize()]
+                        node.properties.push(DesignNodes::Property{key: key_ref, value: decode_value(arena, pool, descriptor.tag, true, value, sink, DesignText::view_of(property_path))})
+                    else:
+                        node.properties.push(DesignNodes::Property{key: key_ref, value: decode_value(arena, pool, DesignValues::ValueTag.Unsupported, false, value, sink, DesignText::view_of(property_path))})
+                    index <- index + 1
+
+            children: JsonValue = member_at(raw, "children")
+            if json_kind(children) == JsonKind.ARRAY:
+                count <- json_array_len(children)
+                if count > DesignLimits::MAX_CHILDREN_PER_NODE.i64():
+                    _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.TooManyNodes, DesignText::view_of(DesignText::indexed_path("nodes", node_index, ".children")), "node exceeds the supported child limit")
+                DesignStore::ensure_ids(&node.children, bounded_capacity(count, DesignLimits::MAX_CHILDREN_PER_NODE))
+                index <- 0
+                while index < count and node.children.count < DesignLimits::MAX_CHILDREN_PER_NODE:
+                    child_id: DesignIds::DesignId = DesignIds::from_text(string_of(array_value(children, index)))
+                    DesignIds::append_copy(&node.children, &child_id)
+                    index <- index + 1
+
+            events: JsonValue = member_at(raw, "events")
+            if json_kind(events) == JsonKind.OBJECT:
+                count <- json_object_len(events)
+                if count > DesignLimits::MAX_EVENTS_PER_NODE.i64():
+                    _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.TooManyNodes, DesignText::view_of(DesignText::indexed_path("nodes", node_index, ".events")), "node exceeds the supported event limit")
+                DesignNodes::ensure_events(&node.events, bounded_capacity(count, DesignLimits::MAX_EVENTS_PER_NODE))
+                index <- 0
+                while index < count and node.events.count < DesignLimits::MAX_EVENTS_PER_NODE:
+                    event_key: sview = member_key(events, index)
+                    event_value: JsonValue = member_value(events, index)
+                    handler: sview = string_at(event_value, "handler")
+                    node.events.push(DesignNodes::EventConnection{
+                        event_key: DesignValues::append(pool.bytes, event_key),
+                        handler: DesignValues::append(pool.bytes, handler),
+                    })
+                    index <- index + 1
+
+            # Unknown node-level fields are preserved as a raw object.
+            node.extension_json.resize(0)
+            DesignStore::ensure_bytes(&node.extension_json, 2)
+            node.extension_json.push(123)
+            count <- json_object_len(raw)
+            index <- 0
+            while index < count:
+                key: sview = member_key(raw, index)
+                if not known_node_field(key):
+                    append_raw_member(arena, &node.extension_json, key, raw_json(arena, member_value(raw, index)))
+                index <- index + 1
+            node.extension_json.push(125)
+            return
+
+        def known_node_field(key: sview) -> bool:
+            return DesignText::equal(key, "id") or DesignText::equal(key, "type") or DesignText::equal(key, "name") or DesignText::equal(key, "symbol") or DesignText::equal(key, "properties") or DesignText::equal(key, "children") or DesignText::equal(key, "events") or DesignText::equal(key, "runtimeHidden") or DesignText::equal(key, "editorLocked") or DesignText::equal(key, "editorHidden")
+
+        def append_raw_member(arena: mutable Arena&, buffer: mutable darray[u8]&, key: sview, value_json: darray[u8]) -> void:
+            # The buffer is a raw JSON object body; the opening brace is byte 0.
+            encoded_key: darray[u8] = json_write(arena, json_string(arena, key))
+            comma_bytes: usize = 1 if buffer.count > 1 else 0
+            # Reserve the closing brace too, so the finished extension object
+            # remains backed by the process-lifetime store arena.
+            DesignStore::ensure_bytes(buffer, buffer.count + comma_bytes + encoded_key.count + 1 + value_json.count + 1)
+            if buffer.count > 1:
+                buffer.push(44)
+            DesignText::push_view(buffer, DesignText::view_of(encoded_key))
+            buffer.push(58)
+            DesignText::push_view(buffer, DesignText::view_of(value_json))
+
+        # After nodes are decoded, parent links are derived from the children
+        # arrays, which are the authored source of truth.
+        def link_parents(form: mutable DesignForms::Form&) -> void:
+            index: mutable i64 = 0
+            while index < form.nodes.count.i64():
+                child_index: mutable i64 = 0
+                while child_index < form.nodes[index.usize()].children.count.i64():
+                    target: i64 = DesignForms::find_node(form, form.nodes[index.usize()].children[child_index.usize()])
+                    if target >= 0:
+                        DesignIds::copy_into(&form.nodes[target.usize()].parent, &form.nodes[index.usize()].id)
+                    child_index <- child_index + 1
+                index <- index + 1
+
+    public:
+        def decode_form_into(form: mutable DesignForms::Form&, text: sview, registry: DesignRegistry::Registry&, sink: mutable DesignDiagnostics::Sink&) -> void:
+            arena: mutable Arena = empty_arena()
+            root: mutable JsonValue = parsed_or_null(arena, text, sink)
+            if json_kind(root) != JsonKind.OBJECT:
+                return
+            root <- DesignMigrate::migrate_form(arena, root, sink)
+            if json_kind(root) != JsonKind.OBJECT:
+                return
+            form.schema_version <- int_at(root, "schemaVersion", DesignLimits::SCHEMA_VERSION)
+            form_id: DesignIds::DesignId = id_at(root, "id")
+            DesignIds::copy_into(&form.id, &form_id)
+            form.name <- DesignValues::append(&form.strings.bytes, string_at(root, "name"))
+            form.module_symbol <- DesignValues::append(&form.strings.bytes, string_at(root, "moduleSymbol"))
+            viewport: JsonValue = member_at(root, "viewport")
+            if json_kind(viewport) == JsonKind.OBJECT:
+                form.viewport_width <- number_at(viewport, "width")
+                form.viewport_height <- number_at(viewport, "height")
+            form_root: DesignIds::DesignId = id_at(root, "root")
+            DesignIds::copy_into(&form.root, &form_root)
+
+            count: mutable i64 = 0
+            index: mutable i64 = 0
+            nodes: JsonValue = member_at(root, "nodes")
+            if json_kind(nodes) == JsonKind.ARRAY:
+                count <- json_array_len(nodes)
+                index <- 0
+                while index < count and form.nodes.count < DesignLimits::MAX_NODES:
+                    decoded: mutable DesignNodes::Node = DesignNodes::empty_node()
+                    decode_node_into(&decoded, &arena, &form.strings, registry, array_value(nodes, index), index, sink)
+                    # `form` is already a reference parameter. Passing it
+                    # directly avoids taking the address of the local
+                    # reference slot in stage1 lowering.
+                    if not DesignForms::add_node(form, &decoded):
+                        if DesignForms::find_node(form, decoded.id) >= 0:
+                            _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.DuplicateId, DesignText::view_of(DesignText::indexed_path("nodes", index, ".id")), "node id is not unique in this form")
+                        else:
+                            _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.TooManyNodes, "nodes", "form exceeds the node limit")
+                    index <- index + 1
+                if count > DesignLimits::MAX_NODES.i64():
+                    _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.TooManyNodes, "nodes", "form exceeds the node limit")
+            link_parents(form)
+
+            form.extensions.resize(0)
+            DesignStore::ensure_bytes(&form.extensions, 2)
+            form.extensions.push(123)
+            count <- json_object_len(root)
+            index <- 0
+            while index < count:
+                key: sview = member_key(root, index)
+                if not known_form_field(key):
+                    append_raw_member(&arena, &form.extensions, key, raw_json(&arena, member_value(root, index)))
+                index <- index + 1
+            form.extensions.push(125)
+            return
+
+        # Value-returning convenience for small model/tests. Long-lived host
+        # storage should call `decode_form_into` so ID-bearing form fields do
+        # not cross another large aggregate return boundary.
+        def decode_form(text: sview, registry: DesignRegistry::Registry&, sink: mutable DesignDiagnostics::Sink&) -> DesignForms::Form:
+            form: mutable DesignForms::Form = DesignForms::empty_form()
+            decode_form_into(&form, text, registry, sink)
+            return form
+
+        def known_form_field(key: sview) -> bool:
+            return DesignText::equal(key, "format") or DesignText::equal(key, "schemaVersion") or DesignText::equal(key, "id") or DesignText::equal(key, "name") or DesignText::equal(key, "moduleSymbol") or DesignText::equal(key, "viewport") or DesignText::equal(key, "root") or DesignText::equal(key, "nodes") or DesignText::equal(key, "extensions")
+
+        def decode_project(text: sview, sink: mutable DesignDiagnostics::Sink&) -> DesignProjects::Project:
+            project: mutable DesignProjects::Project = DesignProjects::empty_project()
+            arena: mutable Arena = empty_arena()
+            root: mutable JsonValue = parsed_or_null(arena, text, sink)
+            if json_kind(root) != JsonKind.OBJECT:
+                return project
+            root <- DesignMigrate::migrate_project(arena, root, sink)
+            if json_kind(root) != JsonKind.OBJECT:
+                return project
+            project.schema_version <- int_at(root, "schemaVersion", DesignLimits::SCHEMA_VERSION)
+            project_id: DesignIds::DesignId = id_at(root, "projectId")
+            DesignIds::copy_into(&project.id, &project_id)
+            project.name <- DesignValues::append(&project.strings.bytes, string_at(root, "name"))
+            project.application_id <- DesignValues::append(&project.strings.bytes, string_at(root, "applicationId"))
+            entry_form: DesignIds::DesignId = id_at(root, "entryForm")
+            DesignIds::copy_into(&project.entry_form, &entry_form)
+
+            count: mutable i64 = 0
+            index: mutable i64 = 0
+            forms: JsonValue = member_at(root, "forms")
+            if json_kind(forms) == JsonKind.ARRAY:
+                count <- json_array_len(forms)
+                if count > DesignLimits::MAX_FORMS_PER_PROJECT.i64():
+                    _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.TooManyNodes, "forms", "project exceeds the supported form limit")
+                reserve_project_forms(&project.forms, bounded_capacity(count, DesignLimits::MAX_FORMS_PER_PROJECT))
+                index <- 0
+                while index < count and project.forms.count < DesignLimits::MAX_FORMS_PER_PROJECT:
+                    entry: JsonValue = array_value(forms, index)
+                    form_ref_id: DesignIds::DesignId = id_at(entry, "id")
+                    form_path: DesignValues::StringRef = DesignValues::append(&project.strings.bytes, string_at(entry, "path"))
+                    project.forms.push(DesignProjects::FormRef{id: DesignIds::empty(), path: form_path})
+                    DesignIds::copy_into(&project.forms[project.forms.count - 1.usize()].id, &form_ref_id)
+                    index <- index + 1
+
+            source: JsonValue = member_at(root, "source")
+            if json_kind(source) == JsonKind.OBJECT:
+                roots: JsonValue = member_at(source, "roots")
+                if json_kind(roots) == JsonKind.ARRAY:
+                    count <- json_array_len(roots)
+                    if count > DesignLimits::MAX_SOURCE_ROOTS.i64():
+                        _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.TooManyNodes, "source.roots", "project exceeds the supported source root limit")
+                    reserve_project_roots(&project.source_roots, bounded_capacity(count, DesignLimits::MAX_SOURCE_ROOTS))
+                    index <- 0
+                    while index < count and project.source_roots.count < DesignLimits::MAX_SOURCE_ROOTS:
+                        project.source_roots.push(DesignValues::append(&project.strings.bytes, string_of(array_value(roots, index))))
+                        index <- index + 1
+
+            generation: JsonValue = member_at(root, "generation")
+            if json_kind(generation) == JsonKind.OBJECT:
+                project.generation_namespace <- DesignValues::append(&project.strings.bytes, string_at(generation, "namespace"))
+                project.generation_output_root <- DesignValues::append(&project.strings.bytes, string_at(generation, "outputRoot"))
+
+            targets: JsonValue = member_at(root, "targets")
+            if json_kind(targets) == JsonKind.ARRAY:
+                count <- json_array_len(targets)
+                if count > DesignLimits::MAX_TARGETS.i64():
+                    _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.TooManyNodes, "targets", "project exceeds the supported target limit")
+                reserve_project_targets(&project.targets, bounded_capacity(count, DesignLimits::MAX_TARGETS))
+                index <- 0
+                while index < count and project.targets.count < DesignLimits::MAX_TARGETS:
+                    entry: JsonValue = array_value(targets, index)
+                    target_id: DesignIds::DesignId = id_at(entry, "id")
+                    backend: DesignValues::StringRef = DesignValues::append(&project.strings.bytes, string_at(entry, "backend"))
+                    renderer: DesignValues::StringRef = DesignValues::append(&project.strings.bytes, string_at(entry, "renderer"))
+                    project.targets.push(DesignProjects::TargetRef{id: DesignIds::empty(), backend: backend, renderer: renderer})
+                    DesignIds::copy_into(&project.targets[project.targets.count - 1.usize()].id, &target_id)
+                    index <- index + 1
+
+            extensions: mutable darray[u8] = []
+            DesignStore::ensure_bytes(&extensions, 2)
+            extensions.push(123)
+            count <- json_object_len(root)
+            index <- 0
+            while index < count:
+                key: sview = member_key(root, index)
+                if not known_project_field(key):
+                    append_raw_member(&arena, &extensions, key, raw_json(&arena, member_value(root, index)))
+                index <- index + 1
+            extensions.push(125)
+            project.extensions <- extensions
+            return project
+
+        def known_project_field(key: sview) -> bool:
+            return DesignText::equal(key, "format") or DesignText::equal(key, "schemaVersion") or DesignText::equal(key, "projectId") or DesignText::equal(key, "name") or DesignText::equal(key, "applicationId") or DesignText::equal(key, "framework") or DesignText::equal(key, "forms") or DesignText::equal(key, "entryForm") or DesignText::equal(key, "source") or DesignText::equal(key, "generation") or DesignText::equal(key, "targets") or DesignText::equal(key, "extensions")

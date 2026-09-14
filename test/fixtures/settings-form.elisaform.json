@@ -1,0 +1,127 @@
+{
+  "format": "elisa-ide-form",
+  "schemaVersion": 1,
+  "id": "form-settings",
+  "name": "Settings",
+  "moduleSymbol": "settings_view",
+  "viewport": {
+    "width": 640,
+    "height": 480
+  },
+  "root": "node-root",
+  "nodes": [
+    {
+      "id": "node-root",
+      "type": "elisa.ui.column",
+      "name": "Settings layout",
+      "symbol": "settings_layout",
+      "properties": {
+        "padding": 16,
+        "spacing": 8,
+        "background": "#181b22ff"
+      },
+      "children": ["node-heading", "node-profile", "node-actions"],
+      "events": {}
+    },
+    {
+      "id": "node-heading",
+      "type": "elisa.ui.label",
+      "name": "Heading",
+      "symbol": "heading_label",
+      "properties": {
+        "text": "Application settings",
+        "size": 22,
+        "color": "#f4f6fcff"
+      },
+      "children": [],
+      "events": {}
+    },
+    {
+      "id": "node-profile",
+      "type": "elisa.ui.row",
+      "name": "Profile row",
+      "symbol": "profile_row",
+      "properties": {
+        "padding": 4,
+        "spacing": 8
+      },
+      "children": ["node-name-label", "node-name-input"],
+      "events": {}
+    },
+    {
+      "id": "node-name-label",
+      "type": "elisa.ui.label",
+      "name": "Name label",
+      "symbol": "name_label",
+      "properties": {
+        "text": "Name",
+        "size": 15
+      },
+      "children": [],
+      "events": {}
+    },
+    {
+      "id": "node-name-input",
+      "type": "elisa.ui.text_field",
+      "name": "Name input",
+      "symbol": "name_input",
+      "properties": {
+        "label": "Name",
+        "placeholder": "Your name",
+        "initial": "Ada",
+        "minimumWidth": 220,
+        "grow": 1
+      },
+      "children": [],
+      "events": {
+        "change": {
+          "handler": "SettingsHandlers::name_changed"
+        }
+      }
+    },
+    {
+      "id": "node-actions",
+      "type": "elisa.ui.row",
+      "name": "Actions",
+      "symbol": "actions_row",
+      "properties": {
+        "spacing": 8,
+        "mainAlignment": "end"
+      },
+      "children": ["node-reset", "node-save"],
+      "events": {}
+    },
+    {
+      "id": "node-reset",
+      "type": "elisa.ui.button",
+      "name": "Reset",
+      "symbol": "reset_button",
+      "properties": {
+        "text": "Reset",
+        "minimumWidth": 96
+      },
+      "children": [],
+      "events": {
+        "click": {
+          "handler": "SettingsHandlers::reset_clicked"
+        }
+      }
+    },
+    {
+      "id": "node-save",
+      "type": "elisa.ui.button",
+      "name": "Save",
+      "symbol": "save_button",
+      "properties": {
+        "text": "Save",
+        "minimumWidth": 96
+      },
+      "children": [],
+      "events": {
+        "click": {
+          "handler": "SettingsHandlers::save_clicked"
+        }
+      }
+    }
+  ]
+}

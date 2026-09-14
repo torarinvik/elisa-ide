@@ -1,0 +1,186 @@
+# Document validation: structural invariants, reference resolution, and
+# property applicability. Validation reads model values plus an immutable
+# registry snapshot and never mutates the document.
+
+include "../model/design_limits.elisa"
+include "../model/design_text.elisa"
+include "../model/design_ids.elisa"
+include "../model/design_values.elisa"
+include "../model/design_node.elisa"
+include "../model/design_form.elisa"
+include "../model/design_project.elisa"
+include "../registry/design_registry.elisa"
+include "./design_diagnostics.elisa"
+
+module DesignValidate:
+    public:
+        def validate_form(form: DesignForms::Form&, registry: DesignRegistry::Registry&, sink: mutable DesignDiagnostics::Sink&) -> void:
+            # Identity and size.
+            if DesignIds::is_empty(form.id):
+                _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.InvalidId, "id", "form id is empty")
+            if form.nodes.count > DesignLimits::MAX_NODES:
+                _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.TooManyNodes, "nodes", "form exceeds the node limit")
+            if not DesignIds::valid_symbol(DesignValues::text_of(form.strings, form.module_symbol)):
+                _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.InvalidSymbol, "moduleSymbol", "module symbol must be a lowercase Elisa identifier")
+
+            # Duplicate node identities, reported before any lookup table is
+            # built.
+            index: mutable i64 = 0
+            while index < form.nodes.count.i64():
+                id: DesignIds::DesignId = form.nodes[index.usize()].id
+                if DesignIds::is_empty(id):
+                    _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.InvalidId, DesignText::view_of(DesignText::indexed_path("nodes", index, ".id")), "node id is empty")
+                earlier: mutable i64 = 0
+                while earlier < index:
+                    if DesignIds::equal(form.nodes[earlier.usize()].id, id):
+                        _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.DuplicateId, DesignText::view_of(DesignText::indexed_path("nodes", index, ".id")), "node id is not unique in this form")
+                        break
+                    earlier <- earlier + 1
+                index <- index + 1
+
+            # Root rules: exactly one node without a parent, and it is the
+            # declared root.
+            root_index: i64 = DesignForms::find_node(form, form.root)
+            if DesignIds::is_empty(form.root) or root_index < 0:
+                _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.MissingRoot, "root", "form root does not resolve to a node")
+            else:
+                if not DesignIds::is_empty(form.nodes[root_index.usize()].parent):
+                    _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.ParentMismatch, "root", "the declared root has a parent")
+            roots: mutable i64 = 0
+            index <- 0
+            while index < form.nodes.count.i64():
+                if DesignIds::is_empty(form.nodes[index.usize()].parent):
+                    roots <- roots + 1
+                index <- index + 1
+            if roots > 1:
+                _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.MultipleRoots, "nodes", "more than one node has no parent")
+
+            # Parent/child agreement, leaf legality, duplicate children.
+            index <- 0
+            while index < form.nodes.count.i64():
+                node: DesignNodes::Node = form.nodes[index.usize()]
+                component_index: i64 = DesignRegistry::find_component(registry, DesignValues::text_of(form.strings, node.type_key))
+                if component_index < 0:
+                    _ = DesignDiagnostics::report_warning(sink, DesignDiagnostics::Code.UnknownComponent, DesignText::view_of(DesignText::indexed_path("nodes", index, ".type")), "unknown component type; the node is preserved as a placeholder")
+                elif node.children.count > 0 and not registry.components[component_index.usize()].can_have_children:
+                    _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.LeafParent, DesignText::view_of(DesignText::indexed_path("nodes", index, ".children")), "this component cannot contain children")
+                if not DesignIds::valid_symbol(DesignValues::text_of(form.strings, node.symbol)):
+                    _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.InvalidSymbol, DesignText::view_of(DesignText::indexed_path("nodes", index, ".symbol")), "node symbol must be a lowercase Elisa identifier")
+
+                child_index: mutable i64 = 0
+                while child_index < node.children.count.i64():
+                    child: DesignIds::DesignId = node.children[child_index.usize()]
+                    child_node_index: i64 = DesignForms::find_node(form, child)
+                    if child_node_index < 0:
+                        _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.MissingParent, DesignText::view_of(DesignText::indexed_path("nodes", index, ".children")), "child does not resolve to a node")
+                    else:
+                        if not DesignIds::equal(form.nodes[child_node_index.usize()].parent, node.id):
+                            _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.ParentMismatch, DesignText::view_of(DesignText::indexed_path("nodes", index, ".children")), "child does not point back to this parent")
+                        seen: mutable i64 = 0
+                        while seen < child_index:
+                            if DesignIds::equal(node.children[seen.usize()], child):
+                                _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.DuplicateChild, DesignText::view_of(DesignText::indexed_path("nodes", index, ".children")), "the same child appears more than once")
+                                break
+                            seen <- seen + 1
+                    child_index <- child_index + 1
+
+                # Properties: known key, matching tag, in-range numeric value.
+                property_index: mutable i64 = 0
+                while property_index < node.properties.count.i64():
+                    property: DesignNodes::Property = node.properties[property_index.usize()]
+                    key: sview = DesignValues::text_of(form.strings, property.key)
+                    descriptor_index: i64 = DesignRegistry::find_property(registry, component_index, key)
+                    if descriptor_index < 0:
+                        _ = DesignDiagnostics::report_warning(sink, DesignDiagnostics::Code.UnknownProperty, DesignText::view_of(DesignText::indexed_path("nodes", index, ".properties")), "unknown property; the value is preserved")
+                    else:
+                        descriptor: DesignRegistry::PropertyDescriptor = registry.components[component_index.usize()].properties[descriptor_index.usize()]
+                        if not tag_compatible(descriptor.tag, property.value.tag):
+                            _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.InvalidPropertyType, DesignText::view_of(DesignText::indexed_path("nodes", index, ".properties")), "property value has the wrong type")
+                        else:
+                            if property.value.tag == DesignValues::ValueTag.NodeRef:
+                                reference_text: sview = DesignValues::text_of(form.strings, property.value.text_ref)
+                                reference_id: DesignIds::DesignId = DesignIds::from_text(reference_text)
+                                if DesignIds::is_empty(reference_id) or DesignForms::find_node(form, reference_id) < 0:
+                                    _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.InvalidReference, DesignText::view_of(DesignText::indexed_path("nodes", index, ".properties")), "node reference does not resolve within this form")
+                            if is_numeric(descriptor.tag) and is_numeric(property.value.tag):
+                                value: f64 = numeric_of(property.value)
+                                if value != value or value < -1.7976931348623157e308 or value > 1.7976931348623157e308 or value < descriptor.min_value or value > descriptor.max_value:
+                                    _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.PropertyOutOfRange, DesignText::view_of(DesignText::indexed_path("nodes", index, ".properties")), "property value is outside the supported range")
+                    property_index <- property_index + 1
+
+                # Events: known event key and a non-empty handler symbol.
+                event_index: mutable i64 = 0
+                while event_index < node.events.count.i64():
+                    connection: DesignNodes::EventConnection = node.events[event_index.usize()]
+                    event_key: sview = DesignValues::text_of(form.strings, connection.event_key)
+                    if DesignRegistry::find_event(registry, component_index, event_key) < 0:
+                        _ = DesignDiagnostics::report_warning(sink, DesignDiagnostics::Code.UnknownEvent, DesignText::view_of(DesignText::indexed_path("nodes", index, ".events")), "unknown event key; the connection is preserved")
+                    if DesignValues::text_of(form.strings, connection.handler).len == 0:
+                        _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.MissingHandler, DesignText::view_of(DesignText::indexed_path("nodes", index, ".events")), "event connection has no handler")
+                    event_index <- event_index + 1
+
+                index <- index + 1
+
+            # Cycles: every ancestor chain must terminate at a parentless node
+            # within the node budget.
+            index <- 0
+            while index < form.nodes.count.i64():
+                cursor: mutable DesignIds::DesignId = form.nodes[index.usize()].parent
+                steps: mutable i64 = 0
+                while not DesignIds::is_empty(cursor) and steps <= form.nodes.count.i64():
+                    cursor_index: i64 = DesignForms::find_node(form, cursor)
+                    if cursor_index < 0:
+                        _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.MissingParent, DesignText::view_of(DesignText::indexed_path("nodes", index, ".parent")), "parent does not resolve to a node")
+                        cursor <- DesignIds::empty()
+                        break
+                    cursor <- form.nodes[cursor_index.usize()].parent
+                    steps <- steps + 1
+                if steps > form.nodes.count.i64():
+                    _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.Cycle, DesignText::view_of(DesignText::indexed_path("nodes", index, ".parent")), "node ancestry contains a cycle")
+                index <- index + 1
+
+        def validate_project(project: DesignProjects::Project&, sink: mutable DesignDiagnostics::Sink&) -> void:
+            if DesignIds::is_empty(project.id):
+                _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.InvalidId, "projectId", "project id is empty")
+            if DesignValues::text_of(project.strings, project.name).len == 0:
+                _ = DesignDiagnostics::report_warning(sink, DesignDiagnostics::Code.InvalidId, "name", "project has no display name")
+            if project.forms.count > DesignLimits::MAX_FORMS_PER_PROJECT:
+                _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.TooManyNodes, "forms", "project exceeds the form limit")
+
+            index: mutable i64 = 0
+            while index < project.forms.count.i64():
+                entry: DesignProjects::FormRef = project.forms[index.usize()]
+                if DesignValues::text_of(project.strings, entry.path).len == 0:
+                    _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.MissingFormPath, DesignText::view_of(DesignText::indexed_path("forms", index, ".path")), "form reference has no path")
+                earlier: mutable i64 = 0
+                while earlier < index:
+                    if DesignIds::equal(project.forms[earlier.usize()].id, entry.id):
+                        _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.DuplicateForm, DesignText::view_of(DesignText::indexed_path("forms", index, ".id")), "form id is not unique in this project")
+                        break
+                    earlier <- earlier + 1
+                index <- index + 1
+
+            if DesignIds::is_empty(project.entry_form):
+                _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.MissingEntryForm, "entryForm", "project has no entry form")
+            elif DesignProjects::form_ref_index(project, project.entry_form) < 0:
+                _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.MissingEntryForm, "entryForm", "entry form is not listed in forms")
+
+    private:
+        def is_numeric(tag: DesignValues::ValueTag) -> bool:
+            return tag == DesignValues::ValueTag.Integer or tag == DesignValues::ValueTag.Scalar or tag == DesignValues::ValueTag.Length
+
+        # Scalar and length properties accept integer literals; every other tag
+        # must match exactly.
+        def tag_compatible(descriptor: DesignValues::ValueTag, actual: DesignValues::ValueTag) -> bool:
+            if descriptor == actual:
+                return true
+            if descriptor == DesignValues::ValueTag.Scalar and actual == DesignValues::ValueTag.Integer:
+                return true
+            if descriptor == DesignValues::ValueTag.Length and (actual == DesignValues::ValueTag.Integer or actual == DesignValues::ValueTag.Scalar):
+                return true
+            return false
+
+        def numeric_of(value: DesignValues::DesignValue&) -> f64:
+            if value.tag == DesignValues::ValueTag.Integer:
+                return value.int_value.f64()
+            return value.scalar_value

@@ -1,0 +1,121 @@
+# The preview protocol decoder rejects malformed frames before exposing data.
+
+include "../../src/preview/preview_protocol.elisa"
+include "../model/test_support.elisa"
+
+module PreviewProtocolTest:
+    private:
+        def sample_frame() -> PreviewProtocol::FrameData:
+            return PreviewProtocol::FrameData{
+                version: PreviewProtocol::VERSION,
+                kind: PreviewProtocol::MessageKind.RenderRequest,
+                flags: 0,
+                session_nonce: 0x1122334455667788,
+                worker_generation: 7,
+                request_id: 19,
+                response_to: 12,
+                document_revision: 0x0102030405060708,
+                content_hash: 0xfedcba9876543210,
+                payload: "load-form payload",
+            }
+
+        def new_encoded_bytes() -> darray[u8]:
+            frame: PreviewProtocol::FrameData = sample_frame()
+            encoded: PreviewProtocol::EncodeResult = PreviewProtocol::encode_frame(frame)
+            return encoded.bytes
+
+        def wire_view(bytes: darray[u8]) -> sview:
+            # `sview(pointer, ...)` scans for NUL and truncates binary frames.
+            return bytes_view(bytes)
+
+        def set_u64(bytes: mutable darray[u8]&, start: i64, value: u64) -> void:
+            for shift in 0..<8:
+                bytes[(start + shift).usize()] <- ((value >> (shift * 8)) & 255).u8()
+
+    public:
+        def run() -> i64:
+            frame: PreviewProtocol::FrameData = sample_frame()
+            encoded: PreviewProtocol::EncodeResult = PreviewProtocol::encode_frame(frame)
+            view: sview = wire_view(encoded.bytes)
+            decoded: PreviewProtocol::DecodeResult = PreviewProtocol::decode_frame(view)
+            TestSupport::check("valid frame encodes and decodes", encoded.code == PreviewProtocol::Issue.None and decoded.code == PreviewProtocol::Issue.None)
+            TestSupport::check("wire header has the declared fixed size and magic", encoded.bytes.count == PreviewProtocol::FRAME_HEADER_BYTES + frame.payload.len and encoded.bytes[0] == 69 and encoded.bytes[1] == 76 and encoded.bytes[2] == 80 and encoded.bytes[3] == 86 and encoded.bytes[60] == frame.payload.len.u8() and encoded.bytes[61] == 0 and encoded.bytes[62] == 0 and encoded.bytes[63] == 0)
+            TestSupport::check("frame metadata round-trips little-endian full-width values", decoded.frame.version == frame.version and decoded.frame.kind == frame.kind and decoded.frame.flags == 0 and decoded.frame.session_nonce == frame.session_nonce and decoded.frame.worker_generation == frame.worker_generation and decoded.frame.request_id == frame.request_id and decoded.frame.response_to == frame.response_to and decoded.frame.document_revision == frame.document_revision and decoded.frame.content_hash == frame.content_hash)
+            TestSupport::check("decoded payload borrows the exact input payload", DesignText::equal(decoded.frame.payload, frame.payload))
+
+            truncated_header: PreviewProtocol::DecodeResult = PreviewProtocol::decode_frame("")
+            TestSupport::check("short header is rejected", truncated_header.code == PreviewProtocol::Issue.TruncatedHeader)
+
+            bad_magic: mutable darray[u8] = new_encoded_bytes()
+            bad_magic[0.usize()] <- 0
+            bad_magic_result: PreviewProtocol::DecodeResult = PreviewProtocol::decode_frame(wire_view(bad_magic))
+            TestSupport::check("invalid magic is rejected", bad_magic_result.code == PreviewProtocol::Issue.InvalidMagic)
+
+            bad_version: mutable darray[u8] = new_encoded_bytes()
+            bad_version[4.usize()] <- 2
+            bad_version_result: PreviewProtocol::DecodeResult = PreviewProtocol::decode_frame(wire_view(bad_version))
+            TestSupport::check("unsupported protocol version is rejected", bad_version_result.code == PreviewProtocol::Issue.InvalidVersion)
+
+            bad_kind: mutable darray[u8] = new_encoded_bytes()
+            bad_kind[6.usize()] <- 0
+            bad_kind[7.usize()] <- 0
+            bad_kind_result: PreviewProtocol::DecodeResult = PreviewProtocol::decode_frame(wire_view(bad_kind))
+            TestSupport::check("unknown message kind is rejected", bad_kind_result.code == PreviewProtocol::Issue.UnknownMessage)
+
+            bad_flags: mutable darray[u8] = new_encoded_bytes()
+            bad_flags[8.usize()] <- 1
+            bad_flags_result: PreviewProtocol::DecodeResult = PreviewProtocol::decode_frame(wire_view(bad_flags))
+            TestSupport::check("nonzero optional flags are rejected until defined", bad_flags_result.code == PreviewProtocol::Issue.ReservedBitsSet)
+
+            bad_reserved: mutable darray[u8] = new_encoded_bytes()
+            bad_reserved[10.usize()] <- 1
+            bad_reserved_result: PreviewProtocol::DecodeResult = PreviewProtocol::decode_frame(wire_view(bad_reserved))
+            TestSupport::check("nonzero reserved header word is rejected", bad_reserved_result.code == PreviewProtocol::Issue.ReservedBitsSet)
+
+            short_payload: mutable darray[u8] = new_encoded_bytes()
+            short_payload_result: PreviewProtocol::DecodeResult = PreviewProtocol::decode_frame(string_view_prefix(wire_view(short_payload), short_payload.count.i64() - 1))
+            TestSupport::check("truncated payload is rejected", short_payload_result.code == PreviewProtocol::Issue.TruncatedPayload)
+
+            trailing_bytes: mutable darray[u8] = new_encoded_bytes()
+            trailing_bytes.push(0)
+            trailing_result: PreviewProtocol::DecodeResult = PreviewProtocol::decode_frame(wire_view(trailing_bytes))
+            TestSupport::check("trailing bytes are rejected", trailing_result.code == PreviewProtocol::Issue.TrailingBytes)
+
+            oversized: mutable darray[u8] = new_encoded_bytes()
+            oversized[60.usize()] <- 255
+            oversized[61.usize()] <- 255
+            oversized[62.usize()] <- 255
+            oversized[63.usize()] <- 255
+            oversized_result: PreviewProtocol::DecodeResult = PreviewProtocol::decode_frame(wire_view(oversized))
+            TestSupport::check("oversized declared payload is rejected before allocation", oversized_result.code == PreviewProtocol::Issue.PayloadTooLarge)
+
+            zero_session: mutable darray[u8] = new_encoded_bytes()
+            set_u64(&zero_session, 12, 0)
+            zero_session_result: PreviewProtocol::DecodeResult = PreviewProtocol::decode_frame(wire_view(zero_session))
+            TestSupport::check("zero session nonce is rejected", zero_session_result.code == PreviewProtocol::Issue.InvalidSession)
+
+            zero_generation: mutable darray[u8] = new_encoded_bytes()
+            set_u64(&zero_generation, 20, 0)
+            zero_generation_result: PreviewProtocol::DecodeResult = PreviewProtocol::decode_frame(wire_view(zero_generation))
+            TestSupport::check("zero worker generation is rejected", zero_generation_result.code == PreviewProtocol::Issue.InvalidSession)
+
+            zero_request: mutable darray[u8] = new_encoded_bytes()
+            set_u64(&zero_request, 28, 0)
+            zero_request_result: PreviewProtocol::DecodeResult = PreviewProtocol::decode_frame(wire_view(zero_request))
+            TestSupport::check("zero request ID is rejected", zero_request_result.code == PreviewProtocol::Issue.InvalidRequestId)
+
+            invalid_encode: mutable PreviewProtocol::FrameData = frame
+            invalid_encode.flags <- 1
+            invalid_flags: PreviewProtocol::EncodeResult = PreviewProtocol::encode_frame(invalid_encode)
+            TestSupport::check("encoder rejects reserved flags", invalid_flags.code == PreviewProtocol::Issue.ReservedBitsSet and invalid_flags.bytes.count == 0)
+
+            oversized_payload_bytes: mutable u8[1] = zeroed
+            oversized_payload: mutable PreviewProtocol::FrameData = frame
+            oversized_payload.payload <- StringView{data: &oversized_payload_bytes[0], len: PreviewProtocol::MAX_FRAME_PAYLOAD_BYTES + 1}
+            invalid_payload: PreviewProtocol::EncodeResult = PreviewProtocol::encode_frame(oversized_payload)
+            TestSupport::check("encoder rejects payload over the transport limit before copying", invalid_payload.code == PreviewProtocol::Issue.PayloadTooLarge and invalid_payload.bytes.count == 0)
+
+            return TestSupport::report("preview_protocol")
+
+def main() -> i64:
+    return PreviewProtocolTest::run()

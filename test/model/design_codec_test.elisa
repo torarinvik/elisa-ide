@@ -1,0 +1,176 @@
+# Codec tests: parse, validate, serialize, reopen, and byte-stability for the
+# minimal form, the nested settings fixture, the project manifest, and the
+# unknown-component preservation fixture.
+
+include "../../src/schema/design_json_decode.elisa"
+include "../../src/schema/design_json_encode.elisa"
+include "../../src/validation/design_validate.elisa"
+include "test_support.elisa"
+
+module DesignCodecTest:
+    private:
+        const MINIMAL_FORM: cstr = "{\"format\":\"elisa-ide-form\",\"schemaVersion\":1,\"id\":\"form-main\",\"name\":\"Main\",\"moduleSymbol\":\"main_view\",\"viewport\":{\"width\":800,\"height\":600},\"root\":\"node-root\",\"nodes\":[{\"id\":\"node-root\",\"type\":\"elisa.ui.column\",\"name\":\"Root\",\"symbol\":\"root_panel\",\"properties\":{\"padding\":16,\"spacing\":8},\"children\":[\"node-save\"],\"events\":{}},{\"id\":\"node-save\",\"type\":\"elisa.ui.button\",\"name\":\"Save\",\"symbol\":\"save_button\",\"properties\":{\"text\":\"Save\",\"minimumWidth\":96},\"children\":[],\"events\":{\"click\":{\"handler\":\"MainHandlers::save_clicked\"}}}]}"
+
+        const INVALID_COLOR_FORM: cstr = "{\"format\":\"elisa-ide-form\",\"schemaVersion\":1,\"id\":\"form-color\",\"name\":\"Color\",\"moduleSymbol\":\"color_view\",\"root\":\"node-root\",\"nodes\":[{\"id\":\"node-root\",\"type\":\"elisa.ui.button\",\"name\":\"Button\",\"symbol\":\"button\",\"properties\":{\"color\":\"#GG1122\"},\"children\":[],\"events\":{}}]}"
+
+        def decode_inline(registry: DesignRegistry::Registry&, text: sview, sink: mutable DesignDiagnostics::Sink&) -> DesignForms::Form:
+            return DesignDecode::decode_form(text, registry, sink)
+
+        def registry_with_integer_probe() -> DesignRegistry::Registry:
+            registry: mutable DesignRegistry::Registry = DesignRegistry::build_builtin()
+            registry.components[3.usize()].properties.push(DesignRegistry::PropertyDescriptor{
+                key: DesignValues::append(&registry.strings.bytes, "integerProbe"),
+                label: DesignValues::append(&registry.strings.bytes, "Integer probe"),
+                category: DesignRegistry::Category.Display.i32(),
+                tag: DesignValues::ValueTag.Integer,
+                default_value: DesignValues::integer(0),
+                min_value: 0.0,
+                max_value: 100.0,
+                enum_keys: DesignValues::no_text(),
+                affects_layout: false,
+                affects_paint: false,
+                affects_semantics: false,
+                affects_behavior: false,
+                setter: DesignValues::append(&registry.strings.bytes, "integerProbe"),
+            })
+            return registry
+
+    public:
+        def run() -> i64:
+            registry: DesignRegistry::Registry = DesignRegistry::build_builtin()
+
+            # --- minimal form round trip -------------------------------------
+            sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
+            form: DesignForms::Form = decode_inline(registry, sview(MINIMAL_FORM, 0, -1), &sink)
+            TestSupport::check("minimal form decodes without errors", not DesignDiagnostics::has_errors(sink))
+            TestSupport::check("minimal form has two nodes", form.nodes.count == 2)
+            TestSupport::check("minimal form root resolves", DesignForms::find_node(form, form.root) >= 0)
+
+            DesignValidate::validate_form(form, registry, &sink)
+            TestSupport::check("minimal form validates", not DesignDiagnostics::has_errors(sink))
+
+            first_bytes: darray[u8] = DesignEncode::encode_form(form)
+            TestSupport::check("minimal form encodes", first_bytes.count > 0)
+            second_bytes: darray[u8] = DesignEncode::encode_form(form)
+            TestSupport::check("encoding is byte-stable", DesignText::equal(TestSupport::view_of(first_bytes), TestSupport::view_of(second_bytes)))
+
+            reopened: DesignForms::Form = DesignDecode::decode_form(TestSupport::view_of(first_bytes), registry, &sink)
+            TestSupport::check("reopen has no errors", not DesignDiagnostics::has_errors(sink))
+            TestSupport::check("reopen keeps node count", reopened.nodes.count == form.nodes.count)
+            TestSupport::check("reopen keeps root", DesignIds::equal(reopened.root, form.root))
+            TestSupport::check("reopen keeps event handler", DesignText::equal(DesignValues::text_of(reopened.strings, reopened.nodes[1.usize()].events[0.usize()].handler), "MainHandlers::save_clicked"))
+
+            # --- nested settings fixture -------------------------------------
+            settings_bytes: darray[u8] = TestSupport::read_fixture("test/fixtures/settings-form.elisaform.json")
+            TestSupport::check("settings fixture read", settings_bytes.count > 0)
+            settings_sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
+            settings: DesignForms::Form = DesignDecode::decode_form(TestSupport::view_of(settings_bytes), registry, &settings_sink)
+            TestSupport::check("settings fixture decodes without errors", not DesignDiagnostics::has_errors(settings_sink))
+            TestSupport::check("settings fixture has eight nodes", settings.nodes.count == 8)
+            DesignValidate::validate_form(settings, registry, &settings_sink)
+            TestSupport::check("settings fixture validates", not DesignDiagnostics::has_errors(settings_sink))
+
+            settings_encoded: darray[u8] = DesignEncode::encode_form(settings)
+            TestSupport::check("settings encoding keeps handler text", TestSupport::text_contains(TestSupport::view_of(settings_encoded), "SettingsHandlers::save_clicked"))
+            TestSupport::check("settings encoding keeps nesting", TestSupport::text_contains(TestSupport::view_of(settings_encoded), "\"children\":[\"node-heading\",\"node-profile\",\"node-actions\"]"))
+            settings_reopened: DesignForms::Form = DesignDecode::decode_form(TestSupport::view_of(settings_encoded), registry, &settings_sink)
+            TestSupport::check("settings reopen keeps eight nodes", settings_reopened.nodes.count == 8)
+            TestSupport::check("settings reopen keeps parent links", DesignIds::equal(settings_reopened.nodes[3.usize()].parent, DesignIds::from_text("node-profile")))
+
+            # --- project manifest --------------------------------------------
+            project_bytes: darray[u8] = TestSupport::read_fixture("test/fixtures/settings-project.elisaproject.json")
+            TestSupport::check("project fixture read", project_bytes.count > 0)
+            project_sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
+            project: DesignProjects::Project = DesignDecode::decode_project(TestSupport::view_of(project_bytes), &project_sink)
+            TestSupport::check("project decodes without errors", not DesignDiagnostics::has_errors(project_sink))
+            DesignValidate::validate_project(project, &project_sink)
+            TestSupport::check("project validates", not DesignDiagnostics::has_errors(project_sink))
+            TestSupport::check("project entry form resolves", DesignProjects::form_ref_index(project, project.entry_form) == 0)
+            TestSupport::check_text("project form path", DesignProjects::form_path(project, project.entry_form), "forms/settings.elisaform.json")
+            project_encoded: darray[u8] = DesignEncode::encode_project(project)
+            TestSupport::check("project encoding is non-empty", project_encoded.count > 0)
+            project_reopened: DesignProjects::Project = DesignDecode::decode_project(TestSupport::view_of(project_encoded), &project_sink)
+            TestSupport::check("project reopen keeps forms", project_reopened.forms.count == 1)
+            TestSupport::check("project reopen keeps application id", DesignText::equal(DesignValues::text_of(project_reopened.strings, project_reopened.application_id), "org.example.settings"))
+
+            # --- unknown data preservation -----------------------------------
+            unknown_bytes: darray[u8] = TestSupport::read_fixture("test/fixtures/unknown-component-form.elisaform.json")
+            unknown_sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
+            unknown: DesignForms::Form = DesignDecode::decode_form(TestSupport::view_of(unknown_bytes), registry, &unknown_sink)
+            TestSupport::check("unknown fixture has no errors", not DesignDiagnostics::has_errors(unknown_sink))
+            DesignValidate::validate_form(unknown, registry, &unknown_sink)
+            TestSupport::check("unknown component is a warning", TestSupport::has_warning_code(unknown_sink, DesignDiagnostics::Code.UnknownComponent))
+            TestSupport::check("unknown property is a warning", TestSupport::has_warning_code(unknown_sink, DesignDiagnostics::Code.UnknownProperty))
+            TestSupport::check("unknown event is a warning", TestSupport::has_warning_code(unknown_sink, DesignDiagnostics::Code.UnknownEvent))
+            TestSupport::check("unknown node is flagged unsupported", unknown.nodes[0.usize()].unsupported)
+
+            unknown_encoded: darray[u8] = DesignEncode::encode_form(unknown)
+            TestSupport::check("unknown top-level field preserved", TestSupport::text_contains(TestSupport::view_of(unknown_encoded), "futureTopLevelField"))
+            TestSupport::check("unknown property preserved", TestSupport::text_contains(TestSupport::view_of(unknown_encoded), "customThing"))
+            TestSupport::check("unknown node field preserved", TestSupport::text_contains(TestSupport::view_of(unknown_encoded), "futureNodeField"))
+            TestSupport::check("known property survives unknown component", TestSupport::text_contains(TestSupport::view_of(unknown_encoded), "still text"))
+
+            escaped_bytes: darray[u8] = TestSupport::read_fixture("test/fixtures/escaped-extension-keys.elisaform.json")
+            escaped_sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
+            escaped_form: DesignForms::Form = DesignDecode::decode_form(TestSupport::view_of(escaped_bytes), registry, &escaped_sink)
+            TestSupport::check("quoted extension keys decode", not DesignDiagnostics::has_errors(escaped_sink))
+            escaped_encoded: darray[u8] = DesignEncode::encode_form(escaped_form)
+            TestSupport::check("top-level extension value survives", TestSupport::text_contains(TestSupport::view_of(escaped_encoded), "top-escape-marker"))
+            TestSupport::check("node extension value survives", TestSupport::text_contains(TestSupport::view_of(escaped_encoded), "node-escape-marker"))
+            escaped_reopen_sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
+            escaped_reopened: DesignForms::Form = DesignDecode::decode_form(TestSupport::view_of(escaped_encoded), registry, &escaped_reopen_sink)
+            TestSupport::check("quoted extension keys remain valid JSON", not DesignDiagnostics::has_errors(escaped_reopen_sink))
+
+            # --- malformed typed values are errors and remain recoverable ---
+            color_sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
+            bad_color: DesignForms::Form = DesignDecode::decode_form(sview(INVALID_COLOR_FORM, 0, -1), registry, &color_sink)
+            TestSupport::check("malformed color is diagnosed", TestSupport::has_error_code(color_sink, DesignDiagnostics::Code.InvalidPropertyType))
+            TestSupport::check("malformed color text is preserved", TestSupport::text_contains(TestSupport::view_of(DesignEncode::encode_form(bad_color)), "#GG1122"))
+
+            integer_registry: DesignRegistry::Registry = registry_with_integer_probe()
+            invalid_integer_sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
+            invalid_integer: darray[u8] = DesignText::copy_of("{\"schemaVersion\":1,\"id\":\"form-int\",\"name\":\"Integer\",\"moduleSymbol\":\"integer_view\",\"root\":\"node-root\",\"nodes\":[{\"id\":\"node-root\",\"type\":\"elisa.ui.label\",\"name\":\"Label\",\"symbol\":\"label\",\"properties\":{\"integerProbe\":1.5},\"children\":[],\"events\":{}}]}")
+            decoded_integer: DesignForms::Form = DesignDecode::decode_form(DesignText::view_of(invalid_integer), integer_registry, &invalid_integer_sink)
+            TestSupport::check("fractional integer is diagnosed", TestSupport::has_error_code(invalid_integer_sink, DesignDiagnostics::Code.InvalidPropertyType))
+            TestSupport::check("fractional integer source is preserved", TestSupport::text_contains(TestSupport::view_of(DesignEncode::encode_form(decoded_integer)), "1.5"))
+
+            # --- every bounded decoded collection rejects overflow -----------
+            child_sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
+            child_input: darray[u8] = TestSupport::read_fixture("test/fixtures/over-limit-children.elisaform.json")
+            child_form: DesignForms::Form = DesignDecode::decode_form(DesignText::view_of(child_input), registry, &child_sink)
+            TestSupport::check("too many children are diagnosed", TestSupport::has_error_code(child_sink, DesignDiagnostics::Code.TooManyNodes))
+            TestSupport::check("children are bounded after the error", child_form.nodes[0.usize()].children.count == DesignLimits::MAX_CHILDREN_PER_NODE)
+
+            event_sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
+            event_input: darray[u8] = TestSupport::read_fixture("test/fixtures/over-limit-events.elisaform.json")
+            event_form: DesignForms::Form = DesignDecode::decode_form(DesignText::view_of(event_input), registry, &event_sink)
+            TestSupport::check("too many events are diagnosed", TestSupport::has_error_code(event_sink, DesignDiagnostics::Code.TooManyNodes))
+            TestSupport::check("events are bounded after the error", event_form.nodes[0.usize()].events.count == DesignLimits::MAX_EVENTS_PER_NODE)
+
+            property_sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
+            property_input: darray[u8] = TestSupport::read_fixture("test/fixtures/over-limit-properties.elisaform.json")
+            property_form: DesignForms::Form = DesignDecode::decode_form(DesignText::view_of(property_input), registry, &property_sink)
+            TestSupport::check("too many properties are diagnosed", TestSupport::has_error_code(property_sink, DesignDiagnostics::Code.TooManyNodes))
+            TestSupport::check("properties are bounded after the error", property_form.nodes[0.usize()].properties.count == DesignLimits::MAX_PROPERTIES_PER_NODE)
+
+            forms_sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
+            forms_input: darray[u8] = TestSupport::read_fixture("test/fixtures/over-limit-forms.elisaproject.json")
+            forms_project: DesignProjects::Project = DesignDecode::decode_project(DesignText::view_of(forms_input), &forms_sink)
+            TestSupport::check("too many forms are diagnosed", TestSupport::has_error_code(forms_sink, DesignDiagnostics::Code.TooManyNodes))
+            TestSupport::check("forms are bounded after the error", forms_project.forms.count == DesignLimits::MAX_FORMS_PER_PROJECT)
+
+            roots_sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
+            roots_input: darray[u8] = TestSupport::read_fixture("test/fixtures/over-limit-source-roots.elisaproject.json")
+            roots_project: DesignProjects::Project = DesignDecode::decode_project(DesignText::view_of(roots_input), &roots_sink)
+            TestSupport::check("too many source roots are diagnosed", TestSupport::has_error_code(roots_sink, DesignDiagnostics::Code.TooManyNodes))
+            TestSupport::check("source roots are bounded after the error", roots_project.source_roots.count == DesignLimits::MAX_SOURCE_ROOTS)
+
+            targets_sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
+            targets_input: darray[u8] = TestSupport::read_fixture("test/fixtures/over-limit-targets.elisaproject.json")
+            targets_project: DesignProjects::Project = DesignDecode::decode_project(DesignText::view_of(targets_input), &targets_sink)
+            TestSupport::check("too many targets are diagnosed", TestSupport::has_error_code(targets_sink, DesignDiagnostics::Code.TooManyNodes))
+            TestSupport::check("targets are bounded after the error", targets_project.targets.count == DesignLimits::MAX_TARGETS)
+            return TestSupport::report("design_codec")
+
+def main() -> i64:
+    return DesignCodecTest::run()

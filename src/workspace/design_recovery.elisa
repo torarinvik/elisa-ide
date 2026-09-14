@@ -1,0 +1,70 @@
+# Crash-recovery snapshots.
+#
+# Snapshots are ordinary form documents written atomically to an
+# application-controlled directory, keyed by form identity. They are working
+# copies, not saves: the original path is untouched and a recovery snapshot is
+# never written back automatically.
+
+include "../model/design_limits.elisa"
+include "../model/design_text.elisa"
+include "../model/design_ids.elisa"
+include "../model/design_store.elisa"
+include "../model/design_form.elisa"
+include "../schema/design_json_decode.elisa"
+include "../registry/design_registry.elisa"
+include "../validation/design_diagnostics.elisa"
+include "../schema/design_json_encode.elisa"
+include "../platform/posix/posix_file.elisa"
+
+module DesignRecovery:
+    private:
+        def snapshot_path(directory: cstr, form_id: DesignIds::DesignId) -> darray[u8]:
+            path: mutable darray[u8] = []
+            id_text_storage: mutable u8[24] = zeroed
+            DesignStore::ensure_bytes(&path, 512)
+            DesignText::push_cstr(&path, directory)
+            path.push(47)
+            DesignText::push_view(&path, DesignIds::text(&form_id, &id_text_storage))
+            DesignText::push_cstr(&path, ".recovery.json")
+            path.push(0)
+            return path
+
+        def as_cstr(buffer: mutable darray[u8]&) -> cstr:
+            return (&buffer[0]).cast[cstr] can Unsafe.PointerCast
+
+    public:
+        def write_snapshot(directory: cstr, form: DesignForms::Form&) -> bool:
+            can Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast:
+                _ = PosixFile::ensure_directory(directory)
+                encoded: darray[u8] = DesignEncode::encode_form(form)
+                return false if encoded.count == 0
+                path: darray[u8] = snapshot_path(directory, form.id)
+                path_c: cstr = as_cstr(&path)
+                payload: sview = DesignText::view_of(encoded)
+                source: i64 error[FileReplaceError] = PosixFile::atomic_write(path_c, payload)
+                written: i64 = catch source:
+                    value:
+                        value
+                    error e:
+                        -1
+                return written >= 0
+
+        def read_snapshot(directory: cstr, form_id: DesignIds::DesignId, registry: DesignRegistry::Registry&, sink: mutable DesignDiagnostics::Sink&) -> DesignForms::Form:
+            can Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast:
+                path: darray[u8] = snapshot_path(directory, form_id)
+                bytes: mutable darray[u8] = []
+                amount: usize = PosixFile::read_bytes(&bytes, as_cstr(&path), DesignLimits::MAX_INPUT_BYTES)
+                if amount == 0:
+                    return DesignForms::empty_form()
+                return DesignDecode::decode_form(DesignText::view_of(bytes), registry, sink)
+
+        def remove_snapshot(directory: cstr, form_id: DesignIds::DesignId) -> bool:
+            can Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast:
+                path: darray[u8] = snapshot_path(directory, form_id)
+                return PosixFile::remove(as_cstr(&path))
+
+        def has_snapshot(directory: cstr, form_id: DesignIds::DesignId) -> bool:
+            can Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast:
+                path: darray[u8] = snapshot_path(directory, form_id)
+                bytes: mutable darray[u8] = []
+                return PosixFile::read_bytes(&bytes, as_cstr(&path), 1) > 0

@@ -1,0 +1,570 @@
+# Document host: serves the editor shell over a binary request/reply protocol.
+#
+# The shell is a UI unit and the document core is a core unit; they cannot
+# share a compilation unit or link into one executable (ADR-001, ADR-013). The
+# host runs as its own process.
+#
+# Protocol (v1): every 32-bit integer is little-endian. A request is three
+# integers (opcode, arg0, arg1) followed, for text-bearing opcodes, by a 4-byte
+# length and that many UTF-8 bytes. A reply is the result integer, then a
+# 4-byte text length and that many bytes. This file is flat and file-scoped:
+# stage1 is sensitive to module/global compositions (stage1-notes.md).
+
+include "../../src/workspace/designer_session.elisa"
+
+@link_name("designer_stdin_read")
+extern host_stdin_read(out: mutable void&, capacity: usize) -> i64 can[Blocking.IO]
+struct HostText:
+    buf: mutable darray[u8]
+
+global mutable host_text: HostText = HostText{buf: []}
+
+@link_name("designer_stdout_write")
+extern host_stdout_write(bytes: void&, count: usize) -> i64 can[Blocking.IO]
+
+def host_read_byte() -> i64:
+    can Blocking.IO, Abort.Panic, Unsafe.PointerCast:
+        buffer: mutable u8[1] = zeroed
+        amount: i64 = host_stdin_read(&buffer[0], 1)
+        return -1 if amount <= 0
+        return buffer[0].i64()
+
+def host_read_i32() -> i64:
+    can Blocking.IO, Abort.Panic:
+        value: mutable i64 = 0
+        shift: mutable i64 = 0
+        while shift < 4:
+            part: i64 = host_read_byte()
+            if part < 0:
+                return -1
+            factor: mutable i64 = 1
+            step: mutable i64 = 0
+            while step < shift:
+                factor <- factor * 256
+                step <- step + 1
+            value <- value + part * factor
+            shift <- shift + 1
+        return value
+
+def host_write_i32(value: i64) -> void:
+    can Blocking.IO, Unsafe.PointerCast:
+        buffer: mutable u8[4] = zeroed
+        buffer[0] <- (value & 255).u8()
+        buffer[1] <- ((value >> 8) & 255).u8()
+        buffer[2] <- ((value >> 16) & 255).u8()
+        buffer[3] <- ((value >> 24) & 255).u8()
+        _ = host_stdout_write(&buffer[0], 4)
+
+def host_read_text(out: mutable darray[u8]&) -> bool:
+    can Blocking.IO, Memory.Allocate, Memory.Release:
+        length: i64 = host_read_i32()
+        if length < 0:
+            return false
+        out.resize(0)
+        DesignStore::ensure_bytes(out, length.usize() + 1)
+        index: mutable i64 = 0
+        while index < length:
+            value: i64 = host_read_byte()
+            if value < 0:
+                return false
+            out.push(value.u8())
+            index <- index + 1
+        return true
+
+def host_write_text(text: sview) -> void:
+    can Blocking.IO, Unsafe.PointerCast:
+        host_write_i32(text.len)
+        if text.len > 0:
+            _ = host_stdout_write(text.data.cast[void&], text.len.usize())
+
+def host_dispatch(opcode: i64, arg0: i64, arg1: i64, running: mutable bool&) -> i64:
+    can Memory.Allocate, Memory.Release:
+        running <- true
+        if opcode == 1:
+            return 1
+        if opcode == 2:
+            running <- false
+            return 1
+        if opcode == 10:
+            if DesignerSession::new_document("Demo", "Main"):
+                return 1
+            return 0
+        if opcode == 11:
+            if DesignerSession::open_document(DesignText::view_of(host_text.buf)):
+                return 1
+            return 0
+        if opcode == 12:
+            if DesignerSession::delete_selection():
+                return 1
+            return 0
+        if opcode == 13:
+            if DesignerSession::undo():
+                return 1
+            return 0
+        if opcode == 14:
+            if DesignerSession::redo():
+                return 1
+            return 0
+        if opcode == 15:
+            if DesignerSession::save():
+                return 1
+            return 0
+        if opcode == 16:
+            if DesignerSession::duplicate_selection():
+                return 1
+            return 0
+        if opcode == 17:
+            if DesignerSession::reorder_selection(arg0 != 0):
+                return 1
+            return 0
+        if opcode == 18:
+            if DesignerSession::save_as_form(DesignText::view_of(host_text.buf)):
+                return 1
+            return 0
+        if opcode == 20:
+            return DesignerSession::hierarchy_count()
+        if opcode == 21:
+            return DesignerSession::palette_count()
+        if opcode == 22:
+            return DesignerSession::inspector_count()
+        if opcode == 23:
+            return DesignerSession::node_count()
+        if opcode == 24:
+            return DesignerSession::selection_count()
+        if opcode == 25:
+            return DesignerSession::problems_count_value()
+        if opcode == 30:
+            return DesignerSession::insert_component(arg0)
+        if opcode == 31:
+            if DesignerSession::select_hierarchy_row(arg0):
+                return 1
+            return 0
+        if opcode == 32:
+            if DesignerSession::toggle_inspector(arg0):
+                return 1
+            return 0
+        if opcode == 33:
+            if DesignerSession::cycle_inspector(arg0):
+                return 1
+            return 0
+        if opcode == 40:
+            if DesignerSession::is_dirty():
+                return 1
+            return 0
+        if opcode == 41:
+            if DesignerSession::can_undo():
+                return 1
+            return 0
+        if opcode == 42:
+            if DesignerSession::can_redo():
+                return 1
+            return 0
+        if opcode == 43:
+            if DesignerSession::hierarchy_selected(arg0):
+                return 1
+            return 0
+        if opcode == 44:
+            if DesignerSession::can_save():
+                return 1
+            return 0
+        if opcode == 50:
+            return set_text(DesignerSession::hierarchy_label(arg0))
+        if opcode == 51:
+            return set_text(DesignerSession::hierarchy_type(arg0))
+        if opcode == 52:
+            return set_text(DesignerSession::inspector_label(arg0))
+        if opcode == 53:
+            return set_text(DesignerSession::inspector_value(arg0))
+        if opcode == 54:
+            return set_text(DesignerSession::selection_name())
+        if opcode == 55:
+            return set_text(DesignerSession::selection_type())
+        if opcode == 56:
+            return set_text(DesignerSession::status())
+        if opcode == 57:
+            return set_text(DesignerSession::title())
+        if opcode == 58:
+            return set_text(DesignerSession::form_title())
+        if opcode == 59:
+            return set_text(DesignerSession::palette_display(arg0))
+        if opcode == 60:
+            return set_text(DesignerSession::palette_key(arg0))
+        if opcode == 61:
+            return set_text(DesignerSession::undo_label())
+        if opcode == 62:
+            return DesignerSession::inspector_tag(arg0).i64()
+        if opcode == 70:
+            if DesignerSession::set_inspector_text(arg0, DesignText::view_of(host_text.buf)):
+                return 1
+            return 0
+        if opcode == 80:
+            snapshot: PreviewForm::Result = DesignerSession::preview_snapshot()
+            if snapshot.code == PreviewForm::Issue.None:
+                host_text.buf <- snapshot.bytes
+                return 1
+            host_text.buf.resize(0)
+            return -1
+        return -1
+
+def set_text(source: sview) -> i64:
+    host_text.buf <- snapshot(source)
+    return 1
+
+def snapshot(source: sview) -> darray[u8]:
+    copied: mutable darray[u8] = []
+    DesignStore::ensure_bytes(&copied, source.len.usize() + 1)
+    index: mutable i64 = 0
+    while index < source.len:
+        copied.push(source[index])
+        index <- index + 1
+    return copied
+
+
+# File mode: `document_host request.bin reply.bin`. One or more binary
+# requests produce one reply record each, then the host exits. The shell uses
+# long-lived signal mode for editing; file mode remains useful for one-shot
+# automation and protocol tests. Its binary records match stream mode.
+def run_file_mode(request_path: cstr, reply_path: cstr) -> i64:
+    can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+        DesignerSession::init()
+        host_text.buf.resize(0)
+        incoming: mutable darray[u8] = []
+        read_request_file(request_path, &incoming)
+        cursor: mutable i64 = 0
+        reply_bytes: mutable darray[u8] = []
+        while cursor + 12 <= incoming.count.i64():
+            opcode: i64 = i32_at(incoming, cursor)
+            arg0: i64 = i32_at(incoming, cursor + 4)
+            arg1: i64 = i32_at(incoming, cursor + 8)
+            cursor <- cursor + 12
+            host_text.buf.resize(0)
+            if opcode == 11 or opcode == 18 or opcode == 70:
+                text_start: i64 = cursor
+                text_length: i64 = i32_at(incoming, text_start)
+                cursor <- cursor + 4
+                copy_range(&incoming, cursor, text_length, &host_text.buf)
+                cursor <- cursor + text_length
+            running: mutable bool = true
+            result: i64 = host_dispatch(opcode, arg0, arg1, &running)
+            append_i32(&reply_bytes, result)
+            append_i32(&reply_bytes, host_text.buf.count.i64())
+            append_range(&reply_bytes, host_text.buf)
+            if not running:
+                break
+        write_bytes_file(reply_path, &reply_bytes)
+        return 0
+
+def i32_at(bytes: darray[u8]&, offset: i64) -> i64:
+    a: i64 = bytes[offset.usize()].i32().i64()
+    b: i64 = bytes[(offset + 1).usize()].i32().i64()
+    c: i64 = bytes[(offset + 2).usize()].i32().i64()
+    d: i64 = bytes[(offset + 3).usize()].i32().i64()
+    return a | (b << 8) | (c << 16) | (d << 24)
+
+def copy_range(source: darray[u8]&, start: i64, length: i64, target: mutable darray[u8]&) -> void:
+    DesignStore::ensure_bytes(target, length.usize() + 1)
+    index: mutable i64 = 0
+    while index < length:
+        target.push(source[(start + index).usize()])
+        index <- index + 1
+
+def append_i32(target: mutable darray[u8]&, value: i64) -> void:
+    DesignStore::ensure_bytes(target, target.count + 4)
+    target.push((value & 255).u8())
+    target.push(((value >> 8) & 255).u8())
+    target.push(((value >> 16) & 255).u8())
+    target.push(((value >> 24) & 255).u8())
+
+def append_range(target: mutable darray[u8]&, source: darray[u8]&) -> void:
+    DesignStore::ensure_bytes(target, target.count + source.count)
+    index: mutable i64 = 0
+    while index < source.count.i64():
+        target.push(source[index.usize()])
+        index <- index + 1
+
+@link_name("designer_file_read")
+extern host_file_read(path: cstr, out: mutable void&, capacity: usize) -> i64 can[Blocking.IO]
+@link_name("designer_file_unlink")
+extern host_file_unlink(path: cstr) -> i64 can[Blocking.IO]
+@link_name("designer_file_open_exclusive")
+extern host_file_open_exclusive(path: cstr) -> i64 can[Blocking.IO]
+@link_name("designer_file_write")
+extern host_file_write(descriptor: i64, bytes: void&, count: usize) -> i64 can[Blocking.IO]
+@link_name("designer_file_sync")
+extern host_file_sync(descriptor: i64) -> i64 can[Blocking.IO]
+@link_name("designer_file_close")
+extern host_file_close(descriptor: i64) -> i64 can[Blocking.IO]
+
+def read_request_file(path: cstr, out: mutable darray[u8]&) -> void:
+    can Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast:
+        out.resize(1048576)
+        amount: i64 = host_file_read(path, &out[0], 1048576)
+        if amount <= 0:
+            out.resize(0)
+            return
+        out.resize(amount.usize())
+
+def write_bytes_file(path: cstr, bytes: mutable darray[u8]&) -> void:
+    can Blocking.IO, Memory.Release, Unsafe.PointerCast:
+        _ = host_file_unlink(path)
+        descriptor: i64 = host_file_open_exclusive(path)
+        if descriptor < 0:
+            return
+        _ = host_file_write(descriptor, &bytes[0], bytes.count)
+        _ = host_file_sync(descriptor)
+        _ = host_file_close(descriptor)
+
+def run_stream() -> i64:
+    can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+        DesignerSession::init()
+        text: mutable darray[u8] = []
+        running: mutable bool = true
+        while running:
+            opcode: i64 = host_read_i32()
+            if opcode < 0:
+                break
+            arg0: i64 = host_read_i32()
+            arg1: i64 = host_read_i32()
+            if arg0 < 0 or arg1 < 0:
+                break
+            if opcode == 11 or opcode == 18 or opcode == 70:
+                if not host_read_text(&host_text.buf):
+                    break
+            else:
+                host_text.buf.resize(0)
+            result: i64 = host_dispatch(opcode, arg0, arg1, &running)
+            host_write_i32(result)
+            host_write_text(DesignText::view_of(host_text.buf))
+        return 0
+
+
+
+# Signal mode: a long-lived host for the shell. The shell writes
+# build/host_request.txt, then writes one byte to this process's stdin. The
+# request line has three decimal fields plus a strict hex-encoded UTF-8 fourth
+# field for text-bearing operations. The host executes the request against its
+# in-memory session and rewrites build/host_reply.bin. One process keeps the
+# document, history, and selection alive across shell actions; file-based
+# replies avoid the framework unit's unreliable pipe read (see stage1-notes.md).
+def run_signal_mode() -> i64:
+    can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+        DesignerSession::init()
+        request: mutable darray[u8] = []
+        reply: mutable darray[u8] = []
+        running: mutable bool = true
+        while running:
+            signal_byte: i64 = host_read_byte()
+            if signal_byte < 0:
+                break
+            request.resize(0)
+            read_request_file("build/host_request.txt", &request)
+            line: sview = DesignText::view_of(request)
+            opcode: mutable i64 = -1
+            arg0: mutable i64 = 0
+            arg1: mutable i64 = 0
+            payload: mutable darray[u8] = []
+            valid: bool = parse_text_request(line, &opcode, &arg0, &arg1, &payload)
+            host_text.buf.resize(0)
+            result: mutable i64 = -1
+            if valid:
+                host_text.buf <- payload
+                result <- host_dispatch(opcode, arg0, arg1, &running)
+            reply.resize(0)
+            append_i32(&reply, result)
+            append_i32(&reply, host_text.buf.count.i64())
+            append_range(&reply, host_text.buf)
+            write_bytes_file("build/host_reply.bin", &reply)
+        return 0
+
+# Text mode: `document_host --text request.txt reply.txt`. The request file
+# holds three decimal integer fields and, for text-bearing operations, a
+# fourth field containing the UTF-8 payload as strict hexadecimal bytes. The
+# reply remains the binary result/text record used by the other modes.
+def run_text_mode(request_path: cstr, reply_path: cstr) -> i64:
+    can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+        DesignerSession::init()
+        _ = DesignerSession::restore_from("build/host_state.json")
+        request: mutable darray[u8] = []
+        read_request_file(request_path, &request)
+        line: sview = DesignText::view_of(request)
+        opcode: mutable i64 = -1
+        arg0: mutable i64 = 0
+        arg1: mutable i64 = 0
+        payload: mutable darray[u8] = []
+        valid: bool = parse_text_request(line, &opcode, &arg0, &arg1, &payload)
+        running: mutable bool = true
+        host_text.buf.resize(0)
+        result: mutable i64 = -1
+        if valid:
+            host_text.buf <- payload
+            result <- host_dispatch(opcode, arg0, arg1, &running)
+        _ = DesignerSession::snapshot_to("build/host_state.json")
+        reply: mutable darray[u8] = []
+        append_i32(&reply, result)
+        append_i32(&reply, host_text.buf.count.i64())
+        append_range(&reply, host_text.buf)
+        write_bytes_file(reply_path, &reply)
+        return 0
+
+def parse_decimal_range(line: sview, start: i64, stop: i64) -> i64?:
+    if start >= stop:
+        return null
+    negative: mutable bool = false
+    index: mutable i64 = start
+    if line[index] == 45:
+        negative <- true
+        index <- index + 1
+    if index >= stop:
+        return null
+    limit: i64 = 2147483647 if not negative else 2147483648
+    value: mutable i64 = 0
+    while index < stop:
+        byte: u8 = line[index]
+        if byte < 48 or byte > 57:
+            return null
+        digit: i64 = (byte - 48).i64()
+        if value > limit / 10 or (value == limit / 10 and digit > limit % 10):
+            return null
+        value <- value * 10 + digit
+        index <- index + 1
+    return -value if negative else value
+
+def parse_text_request(line: sview, opcode: mutable i64&, arg0: mutable i64&, arg1: mutable i64&, payload: mutable darray[u8]&) -> bool:
+    end: mutable i64 = line.len
+    if end > 0 and line[end - 1] == 10:
+        end <- end - 1
+    if end <= 0:
+        return false
+    first_space: mutable i64 = -1
+    second_space: mutable i64 = -1
+    third_space: mutable i64 = -1
+    index: mutable i64 = 0
+    while index < end:
+        byte: u8 = line[index]
+        if byte == 32:
+            if first_space < 0:
+                first_space <- index
+            elif second_space < 0:
+                second_space <- index
+            elif third_space < 0:
+                third_space <- index
+            else:
+                return false
+        elif byte == 10 or byte == 13:
+            return false
+        index <- index + 1
+    if first_space <= 0 or second_space <= first_space + 1:
+        return false
+    parsed_opcode: i64? = parse_decimal_range(line, 0, first_space)
+    parsed_arg0: i64? = parse_decimal_range(line, first_space + 1, second_space)
+    if parsed_opcode is opcode_value:
+        opcode <- opcode_value
+    else:
+        return false
+    if parsed_arg0 is arg0_value:
+        arg0 <- arg0_value
+    else:
+        return false
+    carries_text: bool = opcode == 11 or opcode == 18 or opcode == 70
+    if carries_text:
+        if third_space <= second_space + 1:
+            return false
+        parsed_arg1: i64? = parse_decimal_range(line, second_space + 1, third_space)
+        if parsed_arg1 is arg1_value:
+            arg1 <- arg1_value
+        else:
+            return false
+        return decode_hex_payload(line, third_space + 1, end, payload)
+    if third_space >= 0:
+        return false
+    parsed_arg1: i64? = parse_decimal_range(line, second_space + 1, end)
+    if parsed_arg1 is arg1_value:
+        arg1 <- arg1_value
+    else:
+        return false
+    payload.resize(0)
+    return true
+
+def hex_value(byte: u8) -> i64:
+    return (byte - 48).i64() if byte >= 48 and byte <= 57
+    return (byte - 65).i64() + 10 if byte >= 65 and byte <= 70
+    return (byte - 97).i64() + 10 if byte >= 97 and byte <= 102
+    return -1
+
+def decode_hex_payload(line: sview, start: i64, stop: i64, out: mutable darray[u8]&) -> bool:
+    length: i64 = stop - start
+    if length < 0 or length % 2 != 0:
+        return false
+    if length / 2 > DesignLimits::MAX_INPUT_BYTES.i64():
+        return false
+    out.resize(0)
+    DesignStore::ensure_bytes(&out, (length / 2).usize() + 1)
+    index: mutable i64 = start
+    while index < stop:
+        high: i64 = hex_value(line[index])
+        low: i64 = hex_value(line[index + 1])
+        if high < 0 or low < 0:
+            out.resize(0)
+            return false
+        out.push((high * 16 + low).u8())
+        index <- index + 2
+    return is_strict_utf8(out)
+
+# Reject overlong encodings, surrogate code points, stray continuations,
+# incomplete byte sequences, and values above U+10FFFF.
+def is_strict_utf8(bytes: darray[u8]&) -> bool:
+    index: mutable i64 = 0
+    while index < bytes.count.i64():
+        first: i64 = bytes[index.usize()].i32().i64()
+        if first <= 127:
+            index <- index + 1
+        elif first >= 194 and first <= 223:
+            if index + 1 >= bytes.count.i64():
+                return false
+            second: i64 = bytes[(index + 1).usize()].i32().i64()
+            if second < 128 or second > 191:
+                return false
+            index <- index + 2
+        elif first >= 224 and first <= 239:
+            if index + 2 >= bytes.count.i64():
+                return false
+            second: i64 = bytes[(index + 1).usize()].i32().i64()
+            third: i64 = bytes[(index + 2).usize()].i32().i64()
+            if second < 128 or second > 191 or third < 128 or third > 191:
+                return false
+            if first == 224 and second < 160:
+                return false
+            if first == 237 and second > 159:
+                return false
+            index <- index + 3
+        elif first >= 240 and first <= 244:
+            if index + 3 >= bytes.count.i64():
+                return false
+            second: i64 = bytes[(index + 1).usize()].i32().i64()
+            third: i64 = bytes[(index + 2).usize()].i32().i64()
+            fourth: i64 = bytes[(index + 3).usize()].i32().i64()
+            if second < 128 or second > 191 or third < 128 or third > 191 or fourth < 128 or fourth > 191:
+                return false
+            if first == 240 and second < 144:
+                return false
+            if first == 244 and second > 143:
+                return false
+            index <- index + 4
+        else:
+            return false
+    return true
+
+def main(argc: i64, argv: mutable void&) -> i64:
+    can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+        if argc >= 2:
+            slots: mutable cstr&& = argv.cast[mutable cstr&&]
+            if DesignText::equal(sview(slots[1.usize()].cast[cstr], 0, -1), "--signal"):
+                return run_signal_mode()
+        if argc >= 3:
+            slots: mutable cstr&& = argv.cast[mutable cstr&&]
+            if DesignText::equal(sview(slots[1.usize()].cast[cstr], 0, -1), "--text"):
+                if argc >= 4:
+                    return run_text_mode(slots[2.usize()].cast[cstr], slots[3.usize()].cast[cstr])
+                return 2
+            return run_file_mode(slots[1.usize()].cast[cstr], slots[2.usize()].cast[cstr])
+        return run_stream()

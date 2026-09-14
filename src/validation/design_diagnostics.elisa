@@ -1,0 +1,149 @@
+# Common diagnostic records and a bounded sink.
+#
+# Every producer (schema, model, registry, layout, preview, generator,
+# compiler) reports through this shape so the Problems panel, CLI output, and
+# build logs agree on codes, severity, and location.
+
+include "../model/design_limits.elisa"
+include "../model/design_text.elisa"
+
+include "../../compiler/elisacore_std/elisacore_runtime.elisa"
+include "../../compiler/elisacore_std/collections.elisa"
+
+module DesignDiagnostics:
+    private:
+        global mutable diagnostic_arena: Arena = Arena{begin: null, end: null, end_index: 0, strategy: 0}
+
+    public:
+        const enum Code of i32:
+            OK = 0
+            InputTooLarge = 1
+            MalformedJson = 2
+            UnsupportedSchemaVersion = 3
+            DuplicateId = 4
+            MissingRoot = 5
+            MultipleRoots = 6
+            MissingParent = 7
+            ParentMismatch = 8
+            Cycle = 9
+            DuplicateChild = 10
+            LeafParent = 11
+            UnknownProperty = 12
+            InvalidPropertyType = 13
+            PropertyOutOfRange = 14
+            UnknownComponent = 15
+            DuplicateForm = 16
+            MissingEntryForm = 17
+            MissingFormPath = 18
+            InvalidId = 19
+            InvalidSymbol = 20
+            TooManyNodes = 21
+            TruncatedValue = 22
+            DuplicateKey = 23
+            MigrationApplied = 24
+            MissingRequiredProperty = 25
+            UnknownEvent = 26
+            MissingHandler = 27
+            UnsupportedTarget = 28
+            InvalidReference = 29
+
+        const enum Severity of i32:
+            Error = 1
+            Warning = 2
+
+        struct Diagnostic:
+            code: mutable Code
+            severity: mutable Severity
+            path: mutable darray[u8]
+            message: mutable darray[u8]
+
+        struct Sink:
+            items: mutable darray[Diagnostic]
+            error_count: mutable i64
+            warning_count: mutable i64
+
+        def empty_sink() -> Sink:
+            return Sink{items: [], error_count: 0, warning_count: 0}
+
+        def add(sink: mutable Sink&, code: Code, severity: Severity, path: sview, message: sview) -> bool:
+            return false if sink.items.count >= DesignLimits::MAX_DIAGNOSTICS
+            _ = arena_da_reserve(&diagnostic_arena, sink.items, sink.items.count + 1)
+            sink.items.push(Diagnostic{code: code, severity: severity, path: DesignText::copy_of(path), message: DesignText::copy_of(message)})
+            if severity == Severity.Error:
+                sink.error_count <- sink.error_count + 1
+            else:
+                sink.warning_count <- sink.warning_count + 1
+            return true
+
+        def report_error(sink: mutable Sink&, code: Code, path: sview, message: sview) -> bool:
+            return add(sink, code, Severity.Error, path, message)
+
+        def report_warning(sink: mutable Sink&, code: Code, path: sview, message: sview) -> bool:
+            return add(sink, code, Severity.Warning, path, message)
+
+        def has_errors(sink: Sink&) -> bool:
+            return sink.error_count > 0
+
+        def code_name(code: Code) -> sview:
+            match code:
+                Code.OK:
+                    return "OK"
+                Code.InputTooLarge:
+                    return "input-too-large"
+                Code.MalformedJson:
+                    return "malformed-json"
+                Code.UnsupportedSchemaVersion:
+                    return "unsupported-schema-version"
+                Code.DuplicateId:
+                    return "duplicate-id"
+                Code.MissingRoot:
+                    return "missing-root"
+                Code.MultipleRoots:
+                    return "multiple-roots"
+                Code.MissingParent:
+                    return "missing-parent"
+                Code.ParentMismatch:
+                    return "parent-mismatch"
+                Code.Cycle:
+                    return "cycle"
+                Code.DuplicateChild:
+                    return "duplicate-child"
+                Code.LeafParent:
+                    return "leaf-parent"
+                Code.UnknownProperty:
+                    return "unknown-property"
+                Code.InvalidPropertyType:
+                    return "invalid-property-type"
+                Code.PropertyOutOfRange:
+                    return "property-out-of-range"
+                Code.UnknownComponent:
+                    return "unknown-component"
+                Code.DuplicateForm:
+                    return "duplicate-form"
+                Code.MissingEntryForm:
+                    return "missing-entry-form"
+                Code.MissingFormPath:
+                    return "missing-form-path"
+                Code.InvalidId:
+                    return "invalid-id"
+                Code.InvalidSymbol:
+                    return "invalid-symbol"
+                Code.TooManyNodes:
+                    return "too-many-nodes"
+                Code.TruncatedValue:
+                    return "truncated-value"
+                Code.DuplicateKey:
+                    return "duplicate-key"
+                Code.MigrationApplied:
+                    return "migration-applied"
+                Code.MissingRequiredProperty:
+                    return "missing-required-property"
+                Code.UnknownEvent:
+                    return "unknown-event"
+                Code.MissingHandler:
+                    return "missing-handler"
+                Code.UnsupportedTarget:
+                    return "unsupported-target"
+                Code.InvalidReference:
+                    return "invalid-reference"
+            return "unknown"

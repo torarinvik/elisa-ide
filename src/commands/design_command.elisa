@@ -1,0 +1,157 @@
+# Transactional command layer.
+#
+# Every semantic change goes through prepare -> commit. Preparation is
+# read-only with respect to the live document: it clones the form, applies the
+# operation to the clone, and keeps the clone as the prepared result. Commit
+# checks the document revision, replaces the live state, and advances the
+# revision. A stale prepared command is rejected, so a failed multi-node edit
+# cannot partially apply.
+#
+# Snapshots are full deep copies. That is simple and correct at the document
+# sizes M02 targets; subtree-level inverses are a measured optimization for a
+# later milestone.
+
+include "../model/design_limits.elisa"
+include "../model/design_text.elisa"
+include "../model/design_ids.elisa"
+include "../model/design_values.elisa"
+include "../model/design_node.elisa"
+include "../model/design_form.elisa"
+include "../model/design_clone.elisa"
+include "../registry/design_registry.elisa"
+include "../validation/design_diagnostics.elisa"
+include "design_ops.elisa"
+include "../model/design_store.elisa"
+
+module DesignCommand:
+    public:
+        struct Prepared:
+            valid: mutable bool
+            description: mutable darray[u8]
+            base_revision: mutable i64
+            after: mutable DesignForms::Form
+            # Nodes created by this command, in insertion order; empty for
+            # operations that do not create nodes.
+            created: mutable darray[DesignIds::DesignId]
+
+        def empty_prepared() -> Prepared:
+            return Prepared{valid: false, description: [], base_revision: 0, after: DesignForms::empty_form(), created: []}
+
+        def describe(text: sview) -> darray[u8]:
+            return DesignText::copy_of(text)
+
+        def reset_prepared(prepared: mutable Prepared&, form: DesignForms::Form&) -> void:
+            prepared.valid <- false
+            prepared.description.resize(0)
+            prepared.base_revision <- form.revision
+            DesignClone::clone_form_into(&prepared.after, form)
+            prepared.created.resize(0)
+
+        def set_description(prepared: mutable Prepared&, value: sview) -> void:
+            prepared.description.resize(0)
+            DesignStore::ensure_bytes(&prepared.description, value.len.usize())
+            DesignText::push_view(&prepared.description, value)
+
+        def prepare_insert_into(prepared: mutable Prepared&, form: DesignForms::Form&, registry: DesignRegistry::Registry&, parent: DesignIds::DesignId, index: i64, type_key: sview, allocator: mutable DesignIds::Allocator&, sink: mutable DesignDiagnostics::Sink&) -> void:
+            reset_prepared(prepared, form)
+            DesignStore::ensure_ids(&prepared.created, 1)
+            prepared.created.push(DesignIds::empty())
+            inserted: bool = DesignOps::insert_node_into(&prepared.after, registry, parent, index, type_key, allocator, &prepared.created[0.usize()], sink)
+            if inserted and not DesignIds::is_empty(prepared.created[0.usize()]):
+                prepared.valid <- true
+                set_description(prepared, "Insert component")
+            else:
+                prepared.created.resize(0)
+
+        def prepare_insert(form: DesignForms::Form&, registry: DesignRegistry::Registry&, parent: DesignIds::DesignId, index: i64, type_key: sview, allocator: mutable DesignIds::Allocator&, sink: mutable DesignDiagnostics::Sink&) -> Prepared:
+            prepared: mutable Prepared = empty_prepared()
+            prepare_insert_into(&prepared, form, registry, parent, index, type_key, allocator, sink)
+            return prepared
+
+        def prepare_delete_into(prepared: mutable Prepared&, form: DesignForms::Form&, ids: darray[DesignIds::DesignId], sink: mutable DesignDiagnostics::Sink&) -> void:
+            reset_prepared(prepared, form)
+            removed: darray[DesignIds::DesignId] = DesignOps::delete_nodes(&prepared.after, ids, sink)
+            if removed.count > 0:
+                prepared.valid <- true
+                set_description(prepared, "Delete selection")
+
+        def prepare_delete(form: DesignForms::Form&, ids: darray[DesignIds::DesignId], sink: mutable DesignDiagnostics::Sink&) -> Prepared:
+            prepared: mutable Prepared = empty_prepared()
+            prepare_delete_into(&prepared, form, ids, sink)
+            return prepared
+
+        def prepare_set_property_into(prepared: mutable Prepared&, form: DesignForms::Form&, ids: darray[DesignIds::DesignId], key: sview, value: DesignValues::DesignValue, sink: mutable DesignDiagnostics::Sink&) -> void:
+            reset_prepared(prepared, form)
+            ok: bool = DesignOps::set_property(&prepared.after, ids, key, value, sink)
+            if ok:
+                prepared.valid <- true
+                set_description(prepared, "Set property")
+
+        def prepare_set_property(form: DesignForms::Form&, ids: darray[DesignIds::DesignId], key: sview, value: DesignValues::DesignValue, sink: mutable DesignDiagnostics::Sink&) -> Prepared:
+            prepared: mutable Prepared = empty_prepared()
+            prepare_set_property_into(&prepared, form, ids, key, value, sink)
+            return prepared
+
+        def prepare_reorder_into(prepared: mutable Prepared&, form: DesignForms::Form&, parent: DesignIds::DesignId, from_index: i64, to_index: i64, sink: mutable DesignDiagnostics::Sink&) -> void:
+            reset_prepared(prepared, form)
+            ok: bool = DesignOps::reorder_child(&prepared.after, parent, from_index, to_index, sink)
+            if ok:
+                prepared.valid <- true
+                set_description(prepared, "Reorder")
+
+        def prepare_reorder(form: DesignForms::Form&, parent: DesignIds::DesignId, from_index: i64, to_index: i64, sink: mutable DesignDiagnostics::Sink&) -> Prepared:
+            prepared: mutable Prepared = empty_prepared()
+            prepare_reorder_into(&prepared, form, parent, from_index, to_index, sink)
+            return prepared
+
+        def prepare_reparent_into(prepared: mutable Prepared&, form: DesignForms::Form&, registry: DesignRegistry::Registry&, ids: darray[DesignIds::DesignId], parent: DesignIds::DesignId, index: i64, sink: mutable DesignDiagnostics::Sink&) -> void:
+            reset_prepared(prepared, form)
+            ok: bool = DesignOps::reparent(&prepared.after, registry, ids, parent, index, sink)
+            if ok:
+                prepared.valid <- true
+                set_description(prepared, "Reparent")
+
+        def prepare_reparent(form: DesignForms::Form&, registry: DesignRegistry::Registry&, ids: darray[DesignIds::DesignId], parent: DesignIds::DesignId, index: i64, sink: mutable DesignDiagnostics::Sink&) -> Prepared:
+            prepared: mutable Prepared = empty_prepared()
+            prepare_reparent_into(&prepared, form, registry, ids, parent, index, sink)
+            return prepared
+
+        def prepare_duplicate_into(prepared: mutable Prepared&, form: DesignForms::Form&, ids: darray[DesignIds::DesignId], allocator: mutable DesignIds::Allocator&, sink: mutable DesignDiagnostics::Sink&) -> void:
+            reset_prepared(prepared, form)
+            created: darray[DesignIds::DesignId] = DesignOps::duplicate(&prepared.after, ids, allocator, sink)
+            if created.count > 0:
+                prepared.valid <- true
+                set_description(prepared, "Duplicate selection")
+                DesignClone::clone_ids_into(&prepared.created, created)
+
+        def prepare_duplicate(form: DesignForms::Form&, ids: darray[DesignIds::DesignId], allocator: mutable DesignIds::Allocator&, sink: mutable DesignDiagnostics::Sink&) -> Prepared:
+            prepared: mutable Prepared = empty_prepared()
+            prepare_duplicate_into(&prepared, form, ids, allocator, sink)
+            return prepared
+
+        def prepare_rename_symbol_into(prepared: mutable Prepared&, form: DesignForms::Form&, id: DesignIds::DesignId, symbol: sview, sink: mutable DesignDiagnostics::Sink&) -> void:
+            reset_prepared(prepared, form)
+            ok: bool = DesignOps::rename_symbol(&prepared.after, id, symbol, sink)
+            if ok:
+                prepared.valid <- true
+                set_description(prepared, "Rename symbol")
+
+        def prepare_rename_symbol(form: DesignForms::Form&, id: DesignIds::DesignId, symbol: sview, sink: mutable DesignDiagnostics::Sink&) -> Prepared:
+            prepared: mutable Prepared = empty_prepared()
+            prepare_rename_symbol_into(&prepared, form, id, symbol, sink)
+            return prepared
+
+        # Commit a prepared command. False when it is invalid or the document
+        # has moved past its base revision; the live form is untouched.
+        def commit(form: mutable DesignForms::Form&, prepared: Prepared&) -> bool:
+            if not prepared.valid:
+                return false
+            if form.revision != prepared.base_revision:
+                return false
+            DesignClone::clone_form_into(form, prepared.after)
+            form.revision <- prepared.base_revision + 1
+            return true
+
+        # True when `prepared` can still commit against this form.
+        def is_current(form: DesignForms::Form&, prepared: Prepared&) -> bool:
+            return prepared.valid and form.revision == prepared.base_revision

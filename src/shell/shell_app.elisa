@@ -1,0 +1,562 @@
+# Editor shell composition root.
+#
+# Builds the fixed panes with elisa-ui, starts the document host, routes
+# toolbar/command actions to host requests, and refreshes the panels after each
+# action. All shell state lives in the `Shell` record passed by reference.
+
+include "../../framework/src/platform/sdl3/ui_sdl3_flat.elisa"
+include "host_client.elisa"
+include "shell_state.elisa"
+include "shell_layout.elisa"
+include "shell_preview.elisa"
+include "shell_panels.elisa"
+include "../../framework/src/widgets/ui_shortcuts.elisa"
+
+@link_name("designer_workspace_preferences_load_ratios")
+extern designer_workspace_preferences_load_ratios(left: mutable f64&, right: mutable f64&, bottom: mutable f64&) -> void can[Blocking.IO]
+@link_name("designer_workspace_preferences_save_ratios")
+extern designer_workspace_preferences_save_ratios(left: f64, right: f64, bottom: f64) -> i64 can[Blocking.IO]
+
+const HOST_PATH: cstr = "build/document_host"
+const COMMAND_KEY_CAPACITY: usize = 512
+
+const enum ShellCommand of u32:
+    NewDocument = 1
+    OpenDocument = 2
+    SaveDocument = 3
+    SaveAs = 4
+    Undo = 5
+    Redo = 6
+    DeleteSelection = 7
+    DuplicateSelection = 8
+
+global mutable host_process: mutable PosixProcess::Process = PosixProcess::Process{handle: null}
+global mutable shell_command_key_latched: bool[512] = zeroed
+
+def toolbar_button(shell: mutable Shell&, parent: UiHandles::Handle, label: sview, width: f32) -> UiHandles::Handle:
+    button: UiHandles::Handle = UiHandles::button(parent, width, 24.0, shell_color(48, 54, 68) if shell.dark else shell_color(218, 223, 234), panel_hover_color(shell.dark), panel_press_color(shell.dark))
+    UiHandles::set_text(button, label, 12.0, shell_color(238, 242, 252))
+    UiHandles::set_grow(button, 0.0)
+    return button
+
+def start_host(shell: mutable Shell&) -> void:
+    if shell.host_running:
+        return
+    _ = PosixFile::remove("build/host_reply.bin")
+    host_process <- HostClient::start(HOST_PATH)
+    shell.host_running <- PosixProcess::valid(host_process)
+    if shell.host_running:
+        _ = HostClient::request(host_process, 10, 0, 0)
+
+def register_shortcuts() -> void:
+    UiShortcuts::reset()
+    for key_index in 0..<COMMAND_KEY_CAPACITY:
+        shell_command_key_latched[key_index] <- false
+    bind_primary_shortcuts(UiShortcuts::MOD_CONTROL)
+    bind_primary_shortcuts(UiShortcuts::MOD_SUPER)
+
+def bind_primary_shortcuts(primary: u32) -> void:
+    _ = UiShortcuts::bind_application(UiCore::Key.N.i32(), primary, ShellCommand.NewDocument.u32(), false)
+    _ = UiShortcuts::bind_application(UiCore::Key.O.i32(), primary, ShellCommand.OpenDocument.u32(), false)
+    _ = UiShortcuts::bind_application(UiCore::Key.S.i32(), primary, ShellCommand.SaveDocument.u32(), false)
+    _ = UiShortcuts::bind_application(UiCore::Key.S.i32(), primary | UiShortcuts::MOD_SHIFT, ShellCommand.SaveAs.u32(), false)
+    _ = UiShortcuts::bind_application(UiCore::Key.Z.i32(), primary, ShellCommand.Undo.u32(), false)
+    _ = UiShortcuts::bind_application(UiCore::Key.Z.i32(), primary | UiShortcuts::MOD_SHIFT, ShellCommand.Redo.u32(), false)
+    _ = UiShortcuts::bind_application(UiCore::Key.Y.i32(), primary, ShellCommand.Redo.u32(), false)
+    _ = UiShortcuts::bind_application(UiCore::Key.D.i32(), primary, ShellCommand.DuplicateSelection.u32(), false)
+    _ = UiShortcuts::bind_application(UiCore::Key.Delete.i32(), 0, ShellCommand.DeleteSelection.u32(), false)
+
+def apply_shell_layout(shell: mutable Shell&) -> void:
+    width: f32 = UiCore::viewport_width()
+    compact: bool = ShellLayout::is_compact(width)
+    shell.compact_mode <- compact
+    shell.active_split <- 0 if compact
+    rects: ShellLayout::PaneRects = ShellLayout::resolve(width, UiCore::viewport_height(), shell.left_ratio, shell.right_ratio, shell.bottom_ratio)
+    UiHandles::set_visible(shell.compact_navigation, compact)
+    UiHandles::set_visible(shell.compact_path_row, compact)
+    UiHandles::set_visible(shell.open_path_field, not compact)
+    UiHandles::set_visible(shell.open_button, not compact)
+    UiHandles::set_visible(shell.save_as_button, not compact)
+    UiHandles::set_visible(shell.delete_button, not compact)
+    UiHandles::set_visible(shell.duplicate_button, not compact)
+    if compact:
+        shell.compact_panel <- 0 if shell.compact_panel < 0 or shell.compact_panel > 2
+        UiHandles::set_visible(shell.left_pane, shell.compact_panel == 1)
+        UiHandles::set_visible(shell.left_splitter, false)
+        UiHandles::set_visible(shell.center_pane, shell.compact_panel == 0)
+        UiHandles::set_visible(shell.right_splitter, false)
+        UiHandles::set_visible(shell.right_pane, shell.compact_panel == 2)
+        UiHandles::set_grow(shell.left_pane, 1.0 if shell.compact_panel == 1 else 0.0)
+        UiHandles::set_grow(shell.center_pane, 1.0 if shell.compact_panel == 0 else 0.0)
+        UiHandles::set_grow(shell.right_pane, 1.0 if shell.compact_panel == 2 else 0.0)
+    else:
+        UiHandles::set_visible(shell.left_pane, true)
+        UiHandles::set_visible(shell.left_splitter, true)
+        UiHandles::set_visible(shell.center_pane, true)
+        UiHandles::set_visible(shell.right_splitter, true)
+        UiHandles::set_visible(shell.right_pane, true)
+        UiHandles::set_grow(shell.left_pane, 0.0)
+        UiHandles::set_grow(shell.left_splitter, 0.0)
+        UiHandles::set_grow(shell.center_pane, 1.0)
+        UiHandles::set_grow(shell.right_splitter, 0.0)
+        UiHandles::set_grow(shell.right_pane, 0.0)
+    UiHandles::set_min_size(shell.left_pane, rects.left_width, 0.0)
+    UiHandles::set_min_size(shell.left_splitter, 6.0, 0.0)
+    UiHandles::set_min_size(shell.center_pane, ShellLayout::MIN_CENTER, 0.0)
+    UiHandles::set_min_size(shell.right_splitter, 6.0, 0.0)
+    UiHandles::set_min_size(shell.right_pane, rects.right_width, 0.0)
+    UiHandles::set_min_size(shell.bottom_splitter, 0.0, 6.0)
+    UiHandles::set_min_size(shell.bottom_pane, 0.0, rects.bottom_height)
+
+def pointer_over_splitter(handle: UiHandles::Handle, at: UiCore::Vec2) -> bool:
+    UiHandles::ensure_layout()
+    if UiHandles::widget(handle) is widget:
+        return at.x >= widget.x - 5.0 and at.x <= widget.x + widget.width + 5.0 and at.y >= widget.y - 5.0 and at.y <= widget.y + widget.height + 5.0
+    return false
+
+def update_split_from_pointer(shell: mutable Shell&, at: UiCore::Vec2) -> void:
+    if shell.active_split == 1:
+        ratio: f32 = ShellLayout::left_ratio_at(at.x, UiCore::viewport_width())
+        shell.pane_preferences_dirty <- true if ratio != shell.left_ratio
+        shell.left_ratio <- ratio
+    elif shell.active_split == 2:
+        ratio: f32 = ShellLayout::right_ratio_at(at.x, UiCore::viewport_width())
+        shell.pane_preferences_dirty <- true if ratio != shell.right_ratio
+        shell.right_ratio <- ratio
+    elif shell.active_split == 3:
+        ratio: f32 = ShellLayout::bottom_ratio_at(at.y, UiCore::viewport_height())
+        shell.pane_preferences_dirty <- true if ratio != shell.bottom_ratio
+        shell.bottom_ratio <- ratio
+    apply_shell_layout(shell)
+    UiHandles::layout(UiCore::viewport_width(), UiCore::viewport_height())
+
+def load_pane_preferences(shell: mutable Shell&) -> void:
+    can Blocking.IO:
+        left: mutable f64 = shell.left_ratio.f64()
+        right: mutable f64 = shell.right_ratio.f64()
+        bottom: mutable f64 = shell.bottom_ratio.f64()
+        designer_workspace_preferences_load_ratios(&left, &right, &bottom)
+        # Reuse the shell geometry policy as the final authority after the
+        # preferences codec has supplied validated local values.
+        shell.left_ratio <- ShellLayout::clamp_ratio(left.f32())
+        shell.right_ratio <- ShellLayout::clamp_ratio(right.f32())
+        shell.bottom_ratio <- ShellLayout::clamp_ratio(bottom.f32())
+        shell.pane_preferences_dirty <- false
+
+def save_pane_preferences(shell: mutable Shell&) -> bool:
+    can Blocking.IO:
+        return true if not shell.pane_preferences_dirty
+        saved: bool = designer_workspace_preferences_save_ratios(shell.left_ratio.f64(), shell.right_ratio.f64(), shell.bottom_ratio.f64()) == 1
+        shell.pane_preferences_dirty <- false if saved
+        return saved
+
+def build_shell(shell: mutable Shell&) -> void:
+    UiHandles::reset()
+    shell.root <- UiHandles::column(UiHandles::root_parent(), 6.0, 4.0, shell_color(17, 20, 27))
+
+    shell.menu_bar <- UiHandles::row(shell.root, 2.0, 8.0, shell_color(24, 27, 33))
+    UiHandles::set_grow(shell.menu_bar, 0.0)
+    shell.title_label <- UiHandles::label(shell.menu_bar, "Elisa IDE", 15.0, shell_color(244, 246, 252))
+    UiHandles::set_grow(shell.title_label, 1.0)
+
+    shell.toolbar <- UiHandles::row(shell.root, 2.0, 6.0, shell_color(30, 33, 40))
+    UiHandles::set_grow(shell.toolbar, 0.0)
+    shell.new_button <- toolbar_button(shell, shell.toolbar, "New", 64.0)
+    shell.save_button <- toolbar_button(shell, shell.toolbar, "Save", 64.0)
+    shell.undo_button <- toolbar_button(shell, shell.toolbar, "Undo", 64.0)
+    shell.redo_button <- toolbar_button(shell, shell.toolbar, "Redo", 64.0)
+    shell.delete_button <- toolbar_button(shell, shell.toolbar, "Delete", 72.0)
+    shell.duplicate_button <- toolbar_button(shell, shell.toolbar, "Duplicate", 84.0)
+    shell.open_path_field <- UiHandles::text_field(shell.toolbar, "Document path", "Type a form/project path", "", 250.0, 24.0, 12.0, shell_color(232, 236, 246), shell_color(27, 32, 43))
+    UiHandles::set_help(shell.open_path_field, "Path to a .elisaform.json or .elisaproject.json file")
+    UiHandles::set_grow(shell.open_path_field, 1.0)
+    shell.open_button <- toolbar_button(shell, shell.toolbar, "Open", 58.0)
+    shell.save_as_button <- toolbar_button(shell, shell.toolbar, "Save As", 72.0)
+
+    shell.compact_navigation <- UiHandles::row(shell.root, 2.0, 6.0, shell_color(30, 33, 40))
+    UiHandles::set_grow(shell.compact_navigation, 0.0)
+    shell.compact_palette_button <- toolbar_button(shell, shell.compact_navigation, "Palette", 76.0)
+    UiHandles::set_help(shell.compact_palette_button, "Show the component palette and hierarchy")
+    shell.compact_canvas_button <- toolbar_button(shell, shell.compact_navigation, "Canvas", 76.0)
+    UiHandles::set_help(shell.compact_canvas_button, "Show the form design surface and Problems")
+    shell.compact_inspector_button <- toolbar_button(shell, shell.compact_navigation, "Properties", 88.0)
+    UiHandles::set_help(shell.compact_inspector_button, "Show the selected component's properties")
+
+    shell.compact_path_row <- UiHandles::row(shell.root, 2.0, 6.0, shell_color(30, 33, 40))
+    UiHandles::set_grow(shell.compact_path_row, 0.0)
+    shell.compact_open_path_field <- UiHandles::text_field(shell.compact_path_row, "Document path", "Type a form/project path", "", 120.0, 24.0, 12.0, shell_color(232, 236, 246), shell_color(27, 32, 43))
+    UiHandles::set_help(shell.compact_open_path_field, "Path to a .elisaform.json or .elisaproject.json file")
+    UiHandles::set_grow(shell.compact_open_path_field, 1.0)
+    shell.compact_open_button <- toolbar_button(shell, shell.compact_path_row, "Open", 58.0)
+    shell.compact_save_as_button <- toolbar_button(shell, shell.compact_path_row, "Save As", 72.0)
+
+    shell.body <- UiHandles::row(shell.root, 2.0, 4.0, shell_color(17, 20, 27))
+    UiHandles::set_grow(shell.body, 1.0)
+    shell.left_pane <- UiHandles::column(shell.body, 4.0, 2.0, shell_color(28, 31, 38))
+    UiHandles::set_grow(shell.left_pane, 0.0)
+    shell.left_splitter <- UiHandles::panel(shell.body, UiConst::Axis.Column, 0.0, 0.0, shell_color(68, 74, 88))
+    UiHandles::set_grow(shell.left_splitter, 0.0)
+    shell.center_pane <- UiHandles::column(shell.body, 6.0, 4.0, shell_color(22, 25, 31))
+    UiHandles::set_grow(shell.center_pane, 1.0)
+    shell.right_splitter <- UiHandles::panel(shell.body, UiConst::Axis.Column, 0.0, 0.0, shell_color(68, 74, 88))
+    UiHandles::set_grow(shell.right_splitter, 0.0)
+    shell.right_pane <- UiHandles::column(shell.body, 4.0, 2.0, shell_color(28, 31, 38))
+    UiHandles::set_grow(shell.right_pane, 0.0)
+
+    left_parent: UiHandles::Handle = shell.left_pane
+    build_palette(shell, left_parent)
+
+    shell.surface_pane <- UiHandles::column(shell.center_pane, 6.0, 4.0, shell_color(22, 25, 31))
+    UiHandles::set_grow(shell.surface_pane, 1.0)
+    _ = UiHandles::label(shell.surface_pane, "Design surface", 18.0, shell_color(230, 234, 242))
+    shell.preview_status <- UiHandles::label(shell.surface_pane, "Waiting for form preview", 11.0, shell_color(148, 158, 180))
+    UiHandles::set_grow(shell.preview_status, 0.0)
+    shell.preview_canvas <- UiHandles::panel(shell.surface_pane, UiConst::Axis.Column, 0.0, 0.0, shell_color(11, 14, 20))
+    UiHandles::set_grow(shell.preview_canvas, 1.0)
+    UiHandles::set_image_fit(shell.preview_canvas, UiCore::PictureFit.Contain)
+    shell.bottom_splitter <- UiHandles::panel(shell.center_pane, UiConst::Axis.Row, 0.0, 0.0, shell_color(68, 74, 88))
+    UiHandles::set_grow(shell.bottom_splitter, 0.0)
+    shell.bottom_pane <- UiHandles::column(shell.center_pane, 4.0, 2.0, shell_color(24, 27, 33))
+    UiHandles::set_grow(shell.bottom_pane, 0.0)
+    _ = UiHandles::label(shell.bottom_pane, "Problems", 13.0, shell_color(148, 158, 180))
+    bottom_parent: UiHandles::Handle = shell.bottom_pane
+    build_problems(shell, bottom_parent)
+
+    right_parent: UiHandles::Handle = shell.right_pane
+    build_inspector(shell, right_parent)
+
+    shell.status_line <- UiHandles::label(shell.root, "Starting document host...", 12.0, shell_color(148, 158, 180))
+    UiHandles::set_grow(shell.status_line, 0.0)
+
+    apply_shell_layout(shell)
+    UiHandles::layout(UiCore::viewport_width(), UiCore::viewport_height())
+
+def command(shell: mutable Shell&, opcode: i64, arg0: i64) -> void:
+    if not shell.host_running:
+        return
+    if not commit_pending_inspector_edits(shell, host_process):
+        set_status(shell, HostClient::request(host_process, 56, 0, 0).text)
+        return
+    # Pending inspector text is part of the current document even before the
+    # user presses Enter. Commit it before checking the replacement gate, then
+    # ask the host for fresh dirty state instead of relying on the last panel
+    # refresh. Otherwise New/Open could commit a value and immediately discard
+    # it while the shell still believes the document is clean.
+    if (opcode == 10 or opcode == 11) and HostClient::request(host_process, 40, 0, 0).result == 1:
+        set_status_view(shell, "Save this document before creating or opening another")
+        refresh_all(shell, host_process)
+        return
+    _ = HostClient::request(host_process, opcode, arg0, 0)
+    refresh_all(shell, host_process)
+
+def commit_pending_inspector_edits(shell: mutable Shell&, process: mutable PosixProcess::Process&) -> bool:
+    index: mutable i32 = 0
+    while index < MAX_INSPECTOR_ROWS:
+        tag: i32 = shell.inspector_tags[index.usize()]
+        editable: bool = tag == 1 or tag == 2 or tag == 3 or tag == 6
+        if index.i64() < shell.projection.inspector_count and editable and shell.inspector_edit_dirty[index.usize()]:
+            editor: UiHandles::Handle = shell.inspector_editors[index.usize()]
+            current: sview = UiHandles::text_value(editor)
+            committed: HostClient::HostReply = HostClient::request(process, 53, index.i64(), 0)
+            if not ShellBytes::equal(current, ShellBytes::view_of(&committed.text)):
+                applied: HostClient::HostReply = HostClient::request_text(process, 70, index.i64(), 0, current)
+                if applied.result != 1:
+                    return false
+            shell.inspector_edit_dirty[index.usize()] <- false
+        index <- index + 1
+    return true
+
+def open_document(shell: mutable Shell&) -> void:
+    return if not shell.host_running
+    if not commit_pending_inspector_edits(shell, host_process):
+        set_status(shell, HostClient::request(host_process, 56, 0, 0).text)
+        return
+    if HostClient::request(host_process, 40, 0, 0).result == 1:
+        set_status_view(shell, "Save this document before opening another")
+        refresh_all(shell, host_process)
+        return
+    path: sview = UiHandles::text_value(shell.compact_open_path_field) if shell.compact_mode else UiHandles::text_value(shell.open_path_field)
+    _ = HostClient::request_text(host_process, 11, 0, 0, path)
+    refresh_all(shell, host_process)
+
+def save_as_form(shell: mutable Shell&) -> void:
+    return if not shell.host_running
+    if not commit_pending_inspector_edits(shell, host_process):
+        set_status(shell, HostClient::request(host_process, 56, 0, 0).text)
+        return
+    path: sview = UiHandles::text_value(shell.compact_open_path_field) if shell.compact_mode else UiHandles::text_value(shell.open_path_field)
+    _ = HostClient::request_text(host_process, 18, 0, 0, path)
+    refresh_all(shell, host_process)
+
+def run_shell_command(shell: mutable Shell&, command_id: u32) -> void:
+    if command_id == ShellCommand.NewDocument.u32():
+        command(shell, 10, 0)
+    elif command_id == ShellCommand.OpenDocument.u32():
+        open_document(shell)
+    elif command_id == ShellCommand.SaveDocument.u32():
+        command(shell, 15, 0)
+    elif command_id == ShellCommand.SaveAs.u32():
+        save_as_form(shell)
+    elif command_id == ShellCommand.Undo.u32():
+        command(shell, 13, 0)
+    elif command_id == ShellCommand.Redo.u32():
+        command(shell, 14, 0)
+    elif command_id == ShellCommand.DeleteSelection.u32():
+        command(shell, 12, 0)
+    elif command_id == ShellCommand.DuplicateSelection.u32():
+        command(shell, 16, 0)
+
+def shell_text_focus(shell: Shell&) -> bool:
+    return true if UiFlat::accepts_text()
+    return true if UiHandles::is_focused(shell.open_path_field)
+    return true if UiHandles::is_focused(shell.compact_open_path_field)
+    index: mutable i32 = 0
+    while index < shell.inspector_count:
+        return true if UiHandles::is_focused(shell.inspector_editors[index.usize()])
+        index <- index + 1
+    return false
+
+def clear_command_key_latch(code: i32) -> void:
+    return if code < 0 or code.i64() >= COMMAND_KEY_CAPACITY.i64()
+    shell_command_key_latched[code.usize()] <- false
+
+def handle_shell_event(shell: mutable Shell&, incoming: UiCore::Event) -> void:
+    match incoming:
+        UiCore::Event.Resize(size):
+            UiHandles::handle(incoming)
+            apply_shell_layout(shell)
+            UiHandles::layout(UiCore::viewport_width(), UiCore::viewport_height())
+            return
+        UiCore::PointerEvent.Down(at, button):
+            if not shell.compact_mode and button == UiCore::PointerButton.Primary.i32():
+                if pointer_over_splitter(shell.left_splitter, at):
+                    shell.active_split <- 1
+                    return
+                if pointer_over_splitter(shell.right_splitter, at):
+                    shell.active_split <- 2
+                    return
+                if pointer_over_splitter(shell.bottom_splitter, at):
+                    shell.active_split <- 3
+                    return
+            UiHandles::handle(incoming)
+        UiCore::PointerEvent.Move(at):
+            if shell.active_split > 0:
+                update_split_from_pointer(shell, at)
+                return
+            UiHandles::handle(incoming)
+        UiCore::PointerEvent.Up(at, button):
+            if shell.active_split > 0 and button == UiCore::PointerButton.Primary.i32():
+                shell.active_split <- 0
+                _ = save_pane_preferences(shell)
+                return
+            UiHandles::handle(incoming)
+        UiCore::PointerEvent.Leave:
+            shell.active_split <- 0
+            _ = save_pane_preferences(shell)
+            UiHandles::handle(incoming)
+        UiCore::Event.FocusLost:
+            shell.active_split <- 0
+            _ = save_pane_preferences(shell)
+            UiHandles::handle(incoming)
+        UiCore::KeyEvent.Up(code):
+            clear_command_key_latch(code.i32())
+            UiHandles::handle(incoming)
+            return
+        UiCore::KeyEvent.Down(code):
+            raw_key: i32 = code.i32()
+            if raw_key >= 0 and raw_key.i64() < COMMAND_KEY_CAPACITY.i64():
+                if shell_command_key_latched[raw_key.usize()]:
+                    return
+                held: UiFlat::Modifiers = UiHandles::modifiers()
+                modifiers: mutable u32 = 0
+                modifiers <- modifiers | UiShortcuts::MOD_SHIFT if held.shift
+                modifiers <- modifiers | UiShortcuts::MOD_CONTROL if held.control
+                modifiers <- modifiers | UiShortcuts::MOD_ALT if held.alt
+                modifiers <- modifiers | UiShortcuts::MOD_SUPER if held.super
+                decision: UiShortcuts::Decision = UiShortcuts::resolve(raw_key, modifiers, shell_text_focus(shell), false)
+                if decision.layer == UiShortcuts::Layer.ApplicationCommand:
+                    shell_command_key_latched[raw_key.usize()] <- true
+                    run_shell_command(shell, decision.command)
+                    return
+            UiHandles::handle(incoming)
+        _:
+            UiHandles::handle(incoming)
+
+def widget_event(shell: mutable Shell&, widget: usize, event: i32) -> void:
+    if UiHandles::event_is(event, UiConst::WidgetEvent.Change) and UiHandles::callback_matches(widget, shell.palette_search):
+        if shell.host_running:
+            refresh_palette(shell, host_process)
+            UiHandles::layout(UiCore::viewport_width(), UiCore::viewport_height())
+        return
+    if UiHandles::event_is(event, UiConst::WidgetEvent.Change) and not shell.refreshing_inspector:
+        index: mutable i32 = 0
+        while index < MAX_INSPECTOR_ROWS:
+            if UiHandles::callback_matches(widget, shell.inspector_editors[index.usize()]):
+                shell.inspector_edit_dirty[index.usize()] <- true
+                return
+            index <- index + 1
+    if UiHandles::event_is(event, UiConst::WidgetEvent.Submit):
+        if widget_event_inspector(shell, widget, event):
+            return
+        if UiHandles::callback_matches(widget, shell.open_path_field) or UiHandles::callback_matches(widget, shell.compact_open_path_field):
+            run_shell_command(shell, ShellCommand.OpenDocument.u32())
+            return
+    if not UiHandles::event_is(event, UiConst::WidgetEvent.Click):
+        return
+    undo_handle: UiHandles::Handle = shell.undo_button
+    redo_handle: UiHandles::Handle = shell.redo_button
+    delete_handle: UiHandles::Handle = shell.delete_button
+    duplicate_handle: UiHandles::Handle = shell.duplicate_button
+    save_handle: UiHandles::Handle = shell.save_button
+    new_handle: UiHandles::Handle = shell.new_button
+    open_handle: UiHandles::Handle = shell.open_button
+    save_as_handle: UiHandles::Handle = shell.save_as_button
+    compact_open_handle: UiHandles::Handle = shell.compact_open_button
+    compact_save_as_handle: UiHandles::Handle = shell.compact_save_as_button
+    if UiHandles::callback_matches(widget, undo_handle):
+        run_shell_command(shell, ShellCommand.Undo.u32())
+        return
+    if UiHandles::callback_matches(widget, redo_handle):
+        run_shell_command(shell, ShellCommand.Redo.u32())
+        return
+    if UiHandles::callback_matches(widget, delete_handle):
+        run_shell_command(shell, ShellCommand.DeleteSelection.u32())
+        return
+    if UiHandles::callback_matches(widget, duplicate_handle):
+        run_shell_command(shell, ShellCommand.DuplicateSelection.u32())
+        return
+    if UiHandles::callback_matches(widget, save_handle):
+        run_shell_command(shell, ShellCommand.SaveDocument.u32())
+        return
+    if UiHandles::callback_matches(widget, new_handle):
+        run_shell_command(shell, ShellCommand.NewDocument.u32())
+        return
+    if UiHandles::callback_matches(widget, open_handle):
+        run_shell_command(shell, ShellCommand.OpenDocument.u32())
+        return
+    if UiHandles::callback_matches(widget, save_as_handle):
+        run_shell_command(shell, ShellCommand.SaveAs.u32())
+        return
+    if UiHandles::callback_matches(widget, compact_open_handle):
+        run_shell_command(shell, ShellCommand.OpenDocument.u32())
+        return
+    if UiHandles::callback_matches(widget, compact_save_as_handle):
+        run_shell_command(shell, ShellCommand.SaveAs.u32())
+        return
+    if UiHandles::callback_matches(widget, shell.compact_palette_button):
+        shell.compact_panel <- 1
+        apply_shell_layout(shell)
+        UiHandles::layout(UiCore::viewport_width(), UiCore::viewport_height())
+        return
+    if UiHandles::callback_matches(widget, shell.compact_canvas_button):
+        shell.compact_panel <- 0
+        apply_shell_layout(shell)
+        UiHandles::layout(UiCore::viewport_width(), UiCore::viewport_height())
+        return
+    if UiHandles::callback_matches(widget, shell.compact_inspector_button):
+        shell.compact_panel <- 2
+        apply_shell_layout(shell)
+        UiHandles::layout(UiCore::viewport_width(), UiCore::viewport_height())
+        return
+    if UiHandles::callback_matches(widget, shell.compact_palette_button):
+        shell.compact_panel <- 1
+        apply_shell_layout(shell)
+        UiHandles::layout(UiCore::viewport_width(), UiCore::viewport_height())
+        return
+    if UiHandles::callback_matches(widget, shell.compact_canvas_button):
+        shell.compact_panel <- 0
+        apply_shell_layout(shell)
+        UiHandles::layout(UiCore::viewport_width(), UiCore::viewport_height())
+        return
+    if UiHandles::callback_matches(widget, shell.compact_inspector_button):
+        shell.compact_panel <- 2
+        apply_shell_layout(shell)
+        UiHandles::layout(UiCore::viewport_width(), UiCore::viewport_height())
+        return
+    if UiHandles::callback_matches(widget, shell.hierarchy_previous_button):
+        shell.hierarchy_page <- shell.hierarchy_page - 1 if shell.hierarchy_page > 0
+        refresh_hierarchy(shell, host_process)
+        UiHandles::layout(UiCore::viewport_width(), UiCore::viewport_height())
+        return
+    if UiHandles::callback_matches(widget, shell.hierarchy_next_button):
+        shell.hierarchy_page <- shell.hierarchy_page + 1
+        refresh_hierarchy(shell, host_process)
+        UiHandles::layout(UiCore::viewport_width(), UiCore::viewport_height())
+        return
+    if UiHandles::callback_matches(widget, shell.problem_previous_button):
+        shell.problem_page <- shell.problem_page - 1 if shell.problem_page > 0
+        refresh_problems(shell, host_process)
+        UiHandles::layout(UiCore::viewport_width(), UiCore::viewport_height())
+        return
+    if UiHandles::callback_matches(widget, shell.problem_next_button):
+        shell.problem_page <- shell.problem_page + 1
+        refresh_problems(shell, host_process)
+        UiHandles::layout(UiCore::viewport_width(), UiCore::viewport_height())
+        return
+    if widget_event_inspector(shell, widget, event):
+        return
+    _ = widget_event_rows(shell, widget)
+
+def widget_event_inspector(shell: mutable Shell&, widget: usize, event: i32) -> bool:
+    index: mutable i32 = 0
+    while index < shell.inspector_count:
+        editor: UiHandles::Handle = shell.inspector_editors[index.usize()]
+        action: UiHandles::Handle = shell.inspector_action_buttons[index.usize()]
+        if UiHandles::event_is(event, UiConst::WidgetEvent.Submit) and UiHandles::callback_matches(widget, editor):
+            if shell.host_running:
+                if commit_pending_inspector_edits(shell, host_process):
+                    refresh_all(shell, host_process)
+                else:
+                    set_status(shell, HostClient::request(host_process, 56, 0, 0).text)
+            return true
+        if UiHandles::event_is(event, UiConst::WidgetEvent.Click) and UiHandles::callback_matches(widget, action):
+            if shell.host_running:
+                if commit_pending_inspector_edits(shell, host_process):
+                    opcode: i64 = 32 if shell.inspector_tags[index.usize()] == 0 else 33
+                    _ = HostClient::request(host_process, opcode, index.i64(), 0)
+                    refresh_all(shell, host_process)
+                else:
+                    set_status(shell, HostClient::request(host_process, 56, 0, 0).text)
+            return true
+        index <- index + 1
+    return false
+
+def widget_event_rows(shell: mutable Shell&, widget: usize) -> bool:
+    palette_total: i32 = shell.palette_count
+    index: mutable i32 = 0
+    while index < palette_total:
+        candidate: UiHandles::Handle = shell.palette_rows[index.usize()]
+        if UiHandles::callback_matches(widget, candidate):
+            command(shell, 30, shell.palette_source_indices[index.usize()].i64())
+            return true
+        index <- index + 1
+    hierarchy_total: i32 = shell.hierarchy_count
+    index <- 0
+    while index < hierarchy_total:
+        candidate: UiHandles::Handle = shell.hierarchy_rows[index.usize()]
+        if UiHandles::callback_matches(widget, candidate):
+            command(shell, 31, shell.hierarchy_page.i64() * MAX_HIERARCHY_ROWS.i64() + index.i64())
+            return true
+        index <- index + 1
+    return false
+
+def init(shell: mutable Shell&) -> void:
+    register_shortcuts()
+    load_pane_preferences(shell)
+    build_shell(shell)
+    ShellPreview::initialize(shell)
+    start_host(shell)
+    if shell.host_running:
+        refresh_all(shell, host_process)
+
+def frame(shell: mutable Shell&) -> void:
+    ShellPreview::poll_and_bind(shell)
+    UiCore::clear(shell_color(12, 14, 20))
+    UiHandles::paint()
+    update_status(shell)
+
+def update_status(shell: mutable Shell&) -> void:
+    if shell.status_length > 0:
+        UiHandles::set_text(shell.status_line, sview(&shell.status_storage[0], 0, shell.status_length), 12.0, shell_color(148, 158, 180))
+    if shell.form_title_length > 0:
+        UiHandles::set_text(shell.title_label, sview(&shell.form_title_storage[0], 0, shell.form_title_length), 15.0, shell_color(244, 246, 252))

@@ -1,0 +1,34 @@
+# Document limits: every bound the model and schema enforce lives here, with a
+# diagnostic code attached, rather than as scattered magic numbers.
+#
+# Document size is deliberately independent of the retained-widget capacity
+# (ADR-008): a design can describe more nodes than one frame can realize, and
+# realization failure is reported rather than silently truncating the document.
+
+module DesignLimits:
+    public:
+        const MAX_NODES: usize = 4096
+        # Current built-in Elisa-ui Handles target profile. This is deliberately
+        # lower than the persisted-document node limit: a form may be retained
+        # on disk even when a selected runtime target cannot realize it.
+        const MAX_REALIZED_WIDGETS: usize = 256
+        const MAX_CHILDREN_PER_NODE: usize = 512
+        const MAX_PROPERTIES_PER_NODE: usize = 64
+        const MAX_EVENTS_PER_NODE: usize = 16
+        const MAX_FORMS_PER_PROJECT: usize = 128
+        const MAX_SOURCE_ROOTS: usize = 16
+        const MAX_TARGETS: usize = 16
+        const MAX_STRING_BYTES: usize = 65536
+        const MAX_TEXT_VALUE_BYTES: usize = 4096
+        const MAX_DIAGNOSTICS: usize = 128
+        const MAX_INPUT_BYTES: usize = 8 * 1024 * 1024
+        const MAX_JSON_DEPTH: i64 = 64
+        const MAX_ID_BYTES: usize = 24
+        const MAX_SYMBOL_BYTES: usize = 64
+        const MAX_ENUM_KEY_BYTES: usize = 48
+        const MAX_EXTENSION_BYTES: usize = 16384
+
+        # Schema versions this build can read. Version 0 exists only to
+        # exercise the migration infrastructure with a synthetic rename.
+        const SCHEMA_VERSION: i64 = 1
+        const OLDEST_READABLE_VERSION: i64 = 0

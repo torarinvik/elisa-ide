@@ -1,0 +1,317 @@
+# Editor shell panels: palette, hierarchy, inspector, and problems.
+#
+# Each panel is a bounded column of retained label/button rows rebuilt from
+# host projections. All state is in the `Shell` record passed by reference.
+
+include "../../framework/src/platform/sdl3/ui_sdl3_flat.elisa"
+include "host_client.elisa"
+include "shell_state.elisa"
+include "shell_window.elisa"
+
+def panel_row_color(selected: bool, dark: bool) -> UiCore::Color:
+    if selected:
+        return shell_color(58, 78, 130) if dark else shell_color(206, 220, 245)
+    return shell_color(31, 36, 48) if dark else shell_color(252, 253, 255)
+
+def panel_press_color(dark: bool) -> UiCore::Color:
+    return shell_color(24, 28, 38) if dark else shell_color(190, 198, 214)
+
+def panel_hover_color(dark: bool) -> UiCore::Color:
+    return shell_color(42, 48, 62) if dark else shell_color(205, 212, 226)
+
+def append_nonnegative(out: mutable darray[u8]&, value: i64) -> void:
+    digits: mutable u8[24] = zeroed
+    count: mutable i64 = 0
+    remaining: mutable i64 = value
+    if remaining == 0:
+        out.push(48)
+        return
+    while remaining > 0:
+        digits[count.usize()] <- (48 + (remaining % 10)).u8()
+        remaining <- remaining / 10
+        count <- count + 1
+    index: mutable i64 = count - 1
+    while index >= 0:
+        out.push(digits[index.usize()])
+        index <- index - 1
+
+def append_panel_text(out: mutable darray[u8]&, value: sview) -> void:
+    index: mutable i64 = 0
+    while index < value.len:
+        out.push(value[index])
+        index <- index + 1
+
+def page_summary(window: ShellWindow::Window) -> darray[u8]:
+    out: mutable darray[u8] = []
+    if window.total == 0:
+        append_panel_text(&out, "0 of 0")
+        return out
+    append_nonnegative(&out, window.first + 1)
+    out.push(45)
+    append_nonnegative(&out, window.finish)
+    append_panel_text(&out, " of ")
+    append_nonnegative(&out, window.total)
+    return out
+
+def nav_button(parent: UiHandles::Handle, dark: bool, label: sview, help: sview) -> UiHandles::Handle:
+    result: UiHandles::Handle = UiHandles::button(parent, 48.0, 22.0, shell_color(42, 47, 58), panel_hover_color(dark), panel_press_color(dark))
+    UiHandles::set_text(result, label, 11.0, shell_color(220, 226, 240))
+    UiHandles::set_help(result, help)
+    UiHandles::set_grow(result, 0.0)
+    return result
+
+def palette_byte_fold(value: u8) -> u8:
+    return value + 32 if value >= 65 and value <= 90
+    return value
+
+def contains_ascii_fold(haystack: sview, needle: sview) -> bool:
+    return true if needle.len == 0
+    return false if haystack.len < needle.len
+    start: mutable i64 = 0
+    while start + needle.len <= haystack.len:
+        matched: mutable bool = true
+        offset: mutable i64 = 0
+        while offset < needle.len:
+            if palette_byte_fold(haystack[start + offset]) != palette_byte_fold(needle[offset]):
+                matched <- false
+                break
+            offset <- offset + 1
+        if matched:
+            return true
+        start <- start + 1
+    return false
+
+def build_palette(shell: mutable Shell&, parent: UiHandles::Handle) -> void:
+    _ = UiHandles::label(parent, "Components", 13.0, shell_color(148, 158, 180))
+    shell.palette_search <- UiHandles::text_field(parent, "Search components", "Filter by name", "", 150.0, 24.0, 12.0, shell_color(232, 236, 246), shell_color(27, 32, 43))
+    UiHandles::set_help(shell.palette_search, "Filter the component palette by its visible name")
+    UiHandles::set_grow(shell.palette_search, 0.0)
+    shell.palette_list <- UiHandles::scroll(parent, UiConst::Axis.Column, 0.0, 110.0, shell_color(28, 31, 38))
+    UiHandles::set_grow(shell.palette_list, 0.7)
+    shell.palette_count <- 0
+    index: mutable i32 = 0
+    while index < MAX_PALETTE_ROWS:
+        row: UiHandles::Handle = UiHandles::button(shell.palette_list, 150.0, 22.0, shell_color(42, 47, 58), shell_color(52, 58, 72), shell_color(34, 38, 47))
+        UiHandles::set_grow(row, 0.0)
+        shell.palette_rows[index.usize()] <- row
+        shell.palette_count <- shell.palette_count + 1
+        index <- index + 1
+    _ = UiHandles::label(parent, "Hierarchy", 13.0, shell_color(148, 158, 180))
+    shell.hierarchy_list <- UiHandles::scroll(parent, UiConst::Axis.Column, 0.0, 150.0, shell_color(28, 31, 38))
+    UiHandles::set_grow(shell.hierarchy_list, 1.3)
+    shell.hierarchy_count <- 0
+    index <- 0
+    while index < MAX_HIERARCHY_ROWS:
+        row: UiHandles::Handle = UiHandles::button(shell.hierarchy_list, 150.0, 20.0, shell_color(31, 36, 48), panel_hover_color(shell.dark), panel_press_color(shell.dark))
+        UiHandles::set_grow(row, 0.0)
+        shell.hierarchy_rows[index.usize()] <- row
+        shell.hierarchy_count <- shell.hierarchy_count + 1
+        index <- index + 1
+    navigation: UiHandles::Handle = UiHandles::row(parent, 0.0, 3.0, shell_color(28, 31, 38))
+    UiHandles::set_grow(navigation, 0.0)
+    shell.hierarchy_previous_button <- nav_button(navigation, shell.dark, "Prev", "Show the previous hierarchy page")
+    shell.hierarchy_page_label <- UiHandles::label(navigation, "0 of 0", 11.0, shell_color(148, 158, 180))
+    UiHandles::set_grow(shell.hierarchy_page_label, 1.0)
+    shell.hierarchy_next_button <- nav_button(navigation, shell.dark, "Next", "Show the next hierarchy page")
+
+def build_inspector(shell: mutable Shell&, parent: UiHandles::Handle) -> void:
+    _ = UiHandles::label(parent, "Properties", 13.0, shell_color(148, 158, 180))
+    shell.inspector_list <- UiHandles::scroll(parent, UiConst::Axis.Column, 0.0, 0.0, shell_color(28, 31, 38))
+    UiHandles::set_grow(shell.inspector_list, 1.0)
+    shell.inspector_count <- 0
+    index: mutable i32 = 0
+    while index < MAX_INSPECTOR_ROWS:
+        row: UiHandles::Handle = UiHandles::row(shell.inspector_list, 2.0, 4.0, shell_color(28, 31, 38))
+        UiHandles::set_grow(row, 0.0)
+        name: UiHandles::Handle = UiHandles::label(row, "", 12.0, shell_color(166, 175, 196))
+        UiHandles::set_grow(name, 1.0)
+        editor: UiHandles::Handle = UiHandles::text_field(row, "", "Type a value, then press Enter", "", 110.0, 24.0, 12.0, shell_color(232, 236, 246), shell_color(27, 32, 43))
+        UiHandles::set_help(editor, "Edit this property, then press Enter or choose another editor action to apply it")
+        UiHandles::set_grow(editor, 2.0)
+        action: UiHandles::Handle = UiHandles::button(row, 110.0, 24.0, shell_color(42, 47, 58), panel_hover_color(shell.dark), panel_press_color(shell.dark))
+        UiHandles::set_grow(action, 2.0)
+        UiHandles::set_visible(action, false)
+        readonly: UiHandles::Handle = UiHandles::label(row, "", 12.0, shell_color(148, 158, 180))
+        UiHandles::set_grow(readonly, 2.0)
+        UiHandles::set_visible(readonly, false)
+        shell.inspector_rows[index.usize()] <- name
+        shell.inspector_editors[index.usize()] <- editor
+        shell.inspector_action_buttons[index.usize()] <- action
+        shell.inspector_readonly_values[index.usize()] <- readonly
+        shell.inspector_tags[index.usize()] <- -1
+        shell.inspector_count <- shell.inspector_count + 1
+        index <- index + 1
+
+def build_problems(shell: mutable Shell&, parent: UiHandles::Handle) -> void:
+    shell.problem_list <- UiHandles::scroll(parent, UiConst::Axis.Column, 0.0, 72.0, shell_color(24, 27, 33))
+    UiHandles::set_grow(shell.problem_list, 1.0)
+    shell.problem_count <- 0
+    index: mutable i32 = 0
+    while index < MAX_PROBLEM_ROWS:
+        row: UiHandles::Handle = UiHandles::label(shell.problem_list, "", 12.0, shell_color(200, 140, 120))
+        shell.problem_rows[index.usize()] <- row
+        shell.problem_count <- shell.problem_count + 1
+        index <- index + 1
+    navigation: UiHandles::Handle = UiHandles::row(parent, 0.0, 3.0, shell_color(24, 27, 33))
+    UiHandles::set_grow(navigation, 0.0)
+    shell.problem_previous_button <- nav_button(navigation, shell.dark, "Prev", "Show the previous page of problems")
+    shell.problem_page_label <- UiHandles::label(navigation, "0 of 0", 11.0, shell_color(148, 158, 180))
+    UiHandles::set_grow(shell.problem_page_label, 1.0)
+    shell.problem_next_button <- nav_button(navigation, shell.dark, "Next", "Show the next page of problems")
+
+def set_status(shell: mutable Shell&, text: darray[u8]) -> void:
+    shell.status_length <- 0
+    index: mutable i64 = 0
+    while index < text.count.i64() and index < STATUS_CAPACITY.i64():
+        shell.status_storage[index.usize()] <- text[index.usize()]
+        index <- index + 1
+    shell.status_length <- index
+
+def set_status_view(shell: mutable Shell&, text: sview) -> void:
+    shell.status_length <- 0
+    index: mutable i64 = 0
+    while index < text.len and index < STATUS_CAPACITY.i64():
+        shell.status_storage[index.usize()] <- text[index]
+        index <- index + 1
+    shell.status_length <- index
+
+def set_form_title(shell: mutable Shell&, text: darray[u8], dirty: bool) -> void:
+    shell.form_title_length <- 0
+    index: mutable i64 = 0
+    while index < text.count.i64() and index < STATUS_CAPACITY.i64():
+        shell.form_title_storage[index.usize()] <- text[index.usize()]
+        index <- index + 1
+    if dirty and index + 2 < STATUS_CAPACITY.i64():
+        shell.form_title_storage[index.usize()] <- 32
+        shell.form_title_storage[(index + 1).usize()] <- 42
+        index <- index + 2
+    shell.form_title_length <- index
+
+def refresh_palette(shell: mutable Shell&, process: mutable PosixProcess::Process&) -> void:
+    filter: sview = UiHandles::text_value(shell.palette_search)
+    visible: mutable i32 = 0
+    source: mutable i32 = 0
+    while source < MAX_PALETTE_ROWS and source.i64() < shell.projection.palette_count:
+        display: HostClient::HostReply = HostClient::request(process, 59, source.i64(), 0)
+        value: sview = ShellBytes::view_of(&display.text)
+        if contains_ascii_fold(value, filter):
+            row: UiHandles::Handle = shell.palette_rows[visible.usize()]
+            UiHandles::set_text(row, value, 13.0, shell_color(220, 226, 240))
+            UiHandles::set_visible(row, true)
+            shell.palette_source_indices[visible.usize()] <- source
+            visible <- visible + 1
+        source <- source + 1
+    result_count: i32 = visible
+    while visible < MAX_PALETTE_ROWS:
+        UiHandles::set_visible(shell.palette_rows[visible.usize()], false)
+        shell.palette_source_indices[visible.usize()] <- -1
+        visible <- visible + 1
+    shell.palette_count <- result_count
+
+def refresh_hierarchy(shell: mutable Shell&, process: mutable PosixProcess::Process&) -> void:
+    window: ShellWindow::Window = ShellWindow::resolve(shell.projection.hierarchy_count, shell.hierarchy_page.i64(), MAX_HIERARCHY_ROWS.i64())
+    shell.hierarchy_page <- window.page.i32()
+    index: mutable i32 = 0
+    while index < MAX_HIERARCHY_ROWS:
+        row: UiHandles::Handle = shell.hierarchy_rows[index.usize()]
+        logical_row: i64 = ShellWindow::logical_index(window, index.i64())
+        if logical_row >= 0:
+            label: HostClient::HostReply = HostClient::request(process, 50, logical_row, 0)
+            selected: i64 = HostClient::request(process, 43, logical_row, 0).result
+            UiHandles::set_text(row, ShellBytes::view_of(&label.text), 13.0, shell_color(220, 226, 240))
+            UiHandles::set_colors(row, panel_row_color(selected == 1, shell.dark), panel_row_color(selected == 1, shell.dark), panel_press_color(shell.dark))
+            UiHandles::set_visible(row, true)
+        else:
+            UiHandles::set_visible(row, false)
+        index <- index + 1
+    summary: darray[u8] = page_summary(window)
+    UiHandles::set_text(shell.hierarchy_page_label, ShellBytes::view_of(&summary), 11.0, shell_color(148, 158, 180))
+    UiHandles::set_enabled(shell.hierarchy_previous_button, ShellWindow::has_previous(window))
+    UiHandles::set_enabled(shell.hierarchy_next_button, ShellWindow::has_next(window))
+
+def refresh_inspector(shell: mutable Shell&, process: mutable PosixProcess::Process&) -> void:
+    shell.refreshing_inspector <- true
+    index: mutable i32 = 0
+    while index < MAX_INSPECTOR_ROWS:
+        name: UiHandles::Handle = shell.inspector_rows[index.usize()]
+        editor: UiHandles::Handle = shell.inspector_editors[index.usize()]
+        action: UiHandles::Handle = shell.inspector_action_buttons[index.usize()]
+        readonly: UiHandles::Handle = shell.inspector_readonly_values[index.usize()]
+        if index.i64() < shell.projection.inspector_count:
+            label: HostClient::HostReply = HostClient::request(process, 52, index.i64(), 0)
+            value: HostClient::HostReply = HostClient::request(process, 53, index.i64(), 0)
+            tag: HostClient::HostReply = HostClient::request(process, 62, index.i64(), 0)
+            shell.inspector_tags[index.usize()] <- tag.result.i32()
+            shell.inspector_edit_dirty[index.usize()] <- false
+            UiHandles::set_text(name, ShellBytes::view_of(&label.text), 12.0, shell_color(166, 175, 196))
+            UiHandles::set_text(editor, ShellBytes::view_of(&value.text), 12.0, shell_color(232, 236, 246))
+            # set_text changes a widget's painted caption, while text_value
+            # reads the retained input buffer. Keep both projections in sync
+            # or the next toolbar/palette action mistakes every inspector
+            # field for a user edit and may commit an empty/invalid value.
+            UiHandles::replace_text(editor, ShellBytes::view_of(&value.text))
+            UiHandles::set_text(readonly, ShellBytes::view_of(&value.text), 12.0, shell_color(148, 158, 180))
+            UiHandles::set_text(action, ShellBytes::view_of(&value.text), 12.0, shell_color(238, 242, 252))
+            is_boolean: bool = tag.result == 0
+            is_enum: bool = tag.result == 4
+            editable_text: bool = tag.result == 1 or tag.result == 2 or tag.result == 3 or tag.result == 6
+            is_readonly: bool = not is_boolean and not is_enum and not editable_text
+            UiHandles::set_visible(editor, editable_text)
+            UiHandles::set_enabled(editor, editable_text)
+            UiHandles::set_visible(action, is_boolean or is_enum)
+            UiHandles::set_visible(readonly, is_readonly)
+            UiHandles::set_visible(name, true)
+        else:
+            UiHandles::set_visible(name, false)
+            UiHandles::set_visible(editor, false)
+            UiHandles::set_visible(action, false)
+            UiHandles::set_visible(readonly, false)
+            shell.inspector_tags[index.usize()] <- -1
+            shell.inspector_edit_dirty[index.usize()] <- false
+        index <- index + 1
+    shell.refreshing_inspector <- false
+
+def refresh_problems(shell: mutable Shell&, process: mutable PosixProcess::Process&) -> void:
+    window: ShellWindow::Window = ShellWindow::resolve(shell.projection.problem_count, shell.problem_page.i64(), MAX_PROBLEM_ROWS.i64())
+    shell.problem_page <- window.page.i32()
+    index: mutable i32 = 0
+    while index < MAX_PROBLEM_ROWS:
+        row: UiHandles::Handle = shell.problem_rows[index.usize()]
+        logical_row: i64 = ShellWindow::logical_index(window, index.i64())
+        if logical_row >= 0:
+            label: HostClient::HostReply = HostClient::request(process, 63, logical_row, 0)
+            UiHandles::set_text(row, ShellBytes::view_of(&label.text), 12.0, shell_color(220, 160, 140))
+            UiHandles::set_visible(row, true)
+        else:
+            UiHandles::set_visible(row, false)
+        index <- index + 1
+    summary: darray[u8] = page_summary(window)
+    UiHandles::set_text(shell.problem_page_label, ShellBytes::view_of(&summary), 11.0, shell_color(148, 158, 180))
+    UiHandles::set_enabled(shell.problem_previous_button, ShellWindow::has_previous(window))
+    UiHandles::set_enabled(shell.problem_next_button, ShellWindow::has_next(window))
+
+# Refresh every panel from the host.
+def refresh_all(shell: mutable Shell&, process: mutable PosixProcess::Process&) -> void:
+    shell.projection.hierarchy_count <- HostClient::request(process, 20, 0, 0).result
+    shell.projection.palette_count <- HostClient::request(process, 21, 0, 0).result
+    shell.projection.inspector_count <- HostClient::request(process, 22, 0, 0).result
+    shell.projection.problem_count <- HostClient::request(process, 25, 0, 0).result
+    shell.projection.node_count <- HostClient::request(process, 23, 0, 0).result
+    shell.projection.selection_count <- HostClient::request(process, 24, 0, 0).result
+    shell.projection.dirty <- HostClient::request(process, 40, 0, 0).result == 1
+    can_save: bool = HostClient::request(process, 44, 0, 0).result == 1
+    UiHandles::set_enabled(shell.save_button, shell.projection.dirty and can_save)
+    UiHandles::set_enabled(shell.new_button, not shell.projection.dirty)
+    UiHandles::set_enabled(shell.open_button, not shell.projection.dirty)
+    UiHandles::set_enabled(shell.undo_button, HostClient::request(process, 41, 0, 0).result == 1)
+    UiHandles::set_enabled(shell.redo_button, HostClient::request(process, 42, 0, 0).result == 1)
+    UiHandles::set_enabled(shell.delete_button, shell.projection.selection_count > 0)
+    UiHandles::set_enabled(shell.duplicate_button, shell.projection.selection_count > 0)
+    refresh_palette(shell, process)
+    refresh_hierarchy(shell, process)
+    refresh_inspector(shell, process)
+    refresh_problems(shell, process)
+    set_status(shell, HostClient::request(process, 56, 0, 0).text)
+    set_form_title(shell, HostClient::request(process, 58, 0, 0).text, shell.projection.dirty)
+    ShellPreview::refresh(shell, process)
+    UiHandles::layout(UiCore::viewport_width(), UiCore::viewport_height())

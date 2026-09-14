@@ -1,0 +1,44 @@
+# Native entry: SDL3 backend + the model-backed designer shell.
+# ELISA_UI_SMOKE_FRAMES (with SDL_VIDEODRIVER=dummy) bounds the loop for headless checks.
+
+include "../../framework/src/platform/sdl3/ui_sdl3_flat.elisa"
+include "../shell/shell_app.elisa"
+
+def smoke_frames() -> i64:
+    value_opt: cstr? = getenv("ELISA_UI_SMOKE_FRAMES")
+    if value_opt is value:
+        return 30
+    return 0
+
+def main() -> i64:
+    result: i64 = UiSdl3::run("Elisa IDE", 1180, 760, smoke_frames())
+    # If the application exits during an active drag, persist its latest
+    # clamped ratios as part of a clean native shutdown.
+    if result == 0:
+        _ = save_pane_preferences(shell)
+    if shell.host_running:
+        HostClient::stop(&host_process)
+        stopped: bool = PosixProcess::poll(&host_process, 1000)
+        if not stopped:
+            _ = PosixProcess::cancel(&host_process)
+        PosixProcess::dispose(&host_process)
+        shell.host_running <- false
+    return result
+
+def app_init() -> void:
+    init(shell)
+
+def app_widget_event(widget: usize, event: i32) -> void:
+    widget_event(shell, widget, event)
+
+def app_event(event: UiCore::Event) -> void:
+    handle_shell_event(shell, event)
+
+def app_text_input(text: sview) -> void:
+    UiHandles::insert_text(text)
+
+def app_text_editing(text: sview, selected_start: i32, selected_length: i32) -> void:
+    UiHandles::update_marked_text_utf8_characters(text, selected_start, selected_length)
+
+def app_frame() -> void:
+    frame(shell)

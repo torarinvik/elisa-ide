@@ -1,0 +1,103 @@
+# Designer shell: the minimal M00 window built entirely with elisa-ui.
+#
+# This is the seed of the real editor shell. It owns only view state; geometry,
+# layout, hit testing, focus, text editing, and painting stay in UiHandles.
+
+module DesignerApp:
+    private:
+        global mutable root_panel: UiHandles::Handle = UiHandles::Handle{widget_id: UiFlat::NONE.u32(), tree_id: 0}
+        global mutable project_field: UiHandles::Handle = UiHandles::Handle{widget_id: UiFlat::NONE.u32(), tree_id: 0}
+        global mutable new_button: UiHandles::Handle = UiHandles::Handle{widget_id: UiFlat::NONE.u32(), tree_id: 0}
+        global mutable status_label: UiHandles::Handle = UiHandles::Handle{widget_id: UiFlat::NONE.u32(), tree_id: 0}
+        global mutable action_count: i32 = 0
+        # Owned copy of the last status message. Labels do not expose their
+        # text through the text-field accessor, and tests plus a future status
+        # bar need a stable view of it. Fixed and bounded by design.
+        const STATUS_CAPACITY: usize = 256
+        global mutable status_storage: u8[STATUS_CAPACITY] = zeroed
+        global mutable status_length: i64 = 0
+
+        def color(r: u8, g: u8, b: u8) -> UiCore::Color:
+            return UiCore::rgb(r, g, b)
+
+        def refresh_status(message: sview) -> void:
+            UiHandles::set_text(status_label, message, 14.0, color(148, 158, 180))
+            status_length <- 0
+            index: mutable i64 = 0
+            while index < message.len and index < STATUS_CAPACITY.i64():
+                status_storage[index.usize()] <- message[index]
+                index <- index + 1
+            status_length <- index
+
+    public:
+        # Read-only accessors for headless tests and future inspector panels.
+        def button_handle() -> UiHandles::Handle:
+            return new_button
+
+        def field_handle() -> UiHandles::Handle:
+            return project_field
+
+        def status_handle() -> UiHandles::Handle:
+            return status_label
+
+        def status_text() -> sview:
+            return "" if status_length == 0
+            return sview(&status_storage[0], 0, status_length)
+
+        def action_count_value() -> i32:
+            return action_count
+
+        def init() -> void:
+            UiHandles::reset()
+            action_count <- 0
+            root_panel <- UiHandles::column(UiHandles::root_parent(), 28.0, 14.0, color(17, 20, 27))
+
+            _ = UiHandles::label(root_panel, "Elisa IDE", 28.0, color(244, 246, 252))
+            _ = UiHandles::label(root_panel, "Design, connect, generate, and run Elisa applications.", 15.0, color(148, 158, 180))
+
+            project_field <- UiHandles::text_field(root_panel, "Project name", "Name this project", "Untitled", 320.0, 40.0, 15.0, color(232, 236, 246), color(27, 32, 43))
+            UiHandles::set_help(project_field, "The display name of the project being designed")
+            UiHandles::set_grow(project_field, 0.0)
+
+            new_button <- UiHandles::button(root_panel, 168.0, 40.0, color(64, 112, 224), color(84, 136, 244), color(48, 90, 190))
+            UiHandles::set_text(new_button, "Create project", 15.0, color(255, 255, 255))
+            UiHandles::set_help(new_button, "Record a project name edit through the widget event path")
+            UiHandles::set_grow(new_button, 0.0)
+
+            status_label <- UiHandles::label(root_panel, "Ready. M00 foundation shell.", 14.0, color(148, 158, 180))
+            UiHandles::set_grow(status_label, 1.0)
+            refresh_status("Ready. M00 foundation shell.")
+
+            UiHandles::layout(UiCore::viewport_width(), UiCore::viewport_height())
+
+        def widget_event(widget: usize, event: i32) -> void:
+            if UiHandles::event_is(event, UiConst::WidgetEvent.Click) and UiHandles::callback_matches(widget, new_button):
+                action_count <- action_count + 1
+                refresh_status("Project action routed through the command-ready event path.")
+                return
+
+        def event(incoming: UiCore::Event) -> void:
+            UiHandles::handle(incoming)
+
+        def frame() -> void:
+            UiCore::clear(color(12, 14, 20))
+            UiHandles::paint()
+
+# The application half of the elisa-ui contract. Top-level by name; one call each.
+def app_init() -> void:
+    DesignerApp::init()
+
+def app_widget_event(widget: usize, event: i32) -> void:
+    DesignerApp::widget_event(widget, event)
+
+def app_event(event: UiCore::Event) -> void:
+    DesignerApp::event(event)
+
+def app_text_input(text: sview) -> void:
+    UiHandles::insert_text(text)
+
+def app_text_editing(text: sview, selected_start: i32, selected_length: i32) -> void:
+    UiHandles::update_marked_text_utf8_characters(text, selected_start, selected_length)
+
+def app_frame() -> void:
+    DesignerApp::frame()

@@ -1,0 +1,93 @@
+# Headless interaction test for the M00 designer shell.
+#
+# Uses the framework's UiHarness so physical pointer input, committed text,
+# resize, frame rendering, and lifecycle shutdown are exercised without a
+# window. Exit codes identify the failed step.
+
+include "../../framework/src/platform/sdl3/ui_sdl3_flat.elisa"
+include "../../framework/src/test/ui_harness.elisa"
+include "../../src/app/designer_app.elisa"
+
+@link_name("designer_report_text")
+extern designer_report_text(text: cstr) -> void
+
+module DesignerShellTest:
+    private:
+        def same(left: sview, right: sview) -> bool:
+            return false if left.len != right.len
+            for index in 0..<left.len |left, right|:
+                return false if left[index] != right[index]
+            return true
+
+        def has_text(haystack: sview, needle: sview) -> bool:
+            return false if needle.len == 0 or haystack.len < needle.len
+            start: mutable i64 = 0
+            while start + needle.len <= haystack.len:
+                matched: mutable bool = true
+                for offset in 0..<needle.len |haystack, needle, matched, start|:
+                    if haystack[start + offset] != needle[offset]:
+                        matched <- false
+                        break
+                if matched:
+                    return true
+                start <- start + 1
+            return false
+
+        # The retained text slot is rewritten in place by set_text, so a
+        # "before" view would silently become the "after" bytes. Copy first.
+        def copy_of(text: sview) -> darray[u8]:
+            copied: mutable darray[u8] = []
+            for index in 0..<text.len |copied, text|:
+                copied.push(text[index])
+            return copied
+
+        def view_of(bytes: darray[u8]) -> sview:
+            return sview(&bytes[0], 0, bytes.count.i64())
+
+        def click(handle: UiHandles::Handle) -> void:
+            if UiHandles::widget(handle) is widget:
+                x: f32 = widget.x + widget.width * 0.5
+                y: f32 = widget.y + widget.height * 0.5
+                UiHarness::dispatch(UiCore::PointerEvent.Down(at: UiCore::Vec2(x, y), button: UiCore::PointerButton.Primary.i32()))
+                UiHarness::dispatch(UiCore::PointerEvent.Up(at: UiCore::Vec2(x, y), button: UiCore::PointerButton.Primary.i32()))
+
+    public:
+        def run() -> i64:
+            UiHarness::start(1180.0, 760.0)
+            # A real host reports focus before delivering physical input; the
+            # harness makes that transition explicit.
+            UiHarness::focus_gained()
+            if UiCore::viewport_width() != 1180.0 or UiCore::viewport_height() != 760.0:
+                return 10
+
+            # Pointer click on the real button reaches app_widget_event and
+            # updates the status line.
+            before: darray[u8] = copy_of(DesignerApp::status_text())
+            click(DesignerApp::button_handle())
+            UiHarness::frame()
+            after: sview = DesignerApp::status_text()
+            return 11 if same(view_of(before), after)
+            return 15 if DesignerApp::action_count_value() != 1
+
+            # Committed UTF-8 text enters the focused field through the same
+            # callback a real IME/host uses.
+            click(DesignerApp::field_handle())
+            app_text_input(sview("hello", 0, -1))
+            field_text: sview = UiHandles::text_value(DesignerApp::field_handle())
+            return 12 if not has_text(field_text, "hello")
+
+            # Resize reflows without invalidating the retained handles.
+            UiHarness::resize(900.0, 600.0)
+            UiHarness::frame()
+            return 13 if UiCore::viewport_width() != 900.0
+            return 14 if not UiHandles::is_valid(DesignerApp::button_handle())
+
+            # Lifecycle shutdown makes later frames no-ops rather than faults.
+            UiHarness::stop()
+            UiHarness::frame()
+
+            designer_report_text("test designer_shell: ok")
+            return 0
+
+def main() -> i64:
+    return DesignerShellTest::run()

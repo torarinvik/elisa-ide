@@ -1,0 +1,1 @@
+{"format":"elisa-ide-form","schemaVersion":1,"id":"form-escaped","name":"Escaped extensions","moduleSymbol":"escaped_view","root":"node-root","nodes":[{"id":"node-root","type":"elisa.ui.column","name":"Root","symbol":"root_node","properties":{},"children":[],"events":{},"future\"Node":"node-escape-marker"}],"future\"Top":"top-escape-marker"}

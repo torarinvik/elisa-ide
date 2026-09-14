@@ -1,0 +1,46 @@
+# Document storage arena.
+#
+# Elisa containers built with `push` are allocated in the current function's
+# region, so a container created in a callee and stored in a longer-lived place
+# dangles. The designer therefore allocates every long-lived document array in
+# one explicit arena: a small reservation in that arena before the pushes,
+# after which growth stays within the reserved capacity.
+#
+# The generic `ensure[T]` wrapper declines on stage1, so each element type has
+# its own thin function calling `arena_da_reserve` directly.
+#
+# The arena is process-lifetime for M02. Closing a project can reset it once
+# every live document has been released; that policy arrives with the workspace
+# session (M03) and is audited by long-session soak tests (M08).
+
+include "./design_limits.elisa"
+include "./design_ids.elisa"
+include "./design_values.elisa"
+
+include "../../compiler/elisacore_std/elisacore_runtime.elisa"
+include "../../compiler/elisacore_std/collections.elisa"
+
+module DesignStore:
+    private:
+        global mutable arena: Arena = Arena{begin: null, end: null, end_index: 0, strategy: 0}
+        global mutable reservations: usize = 0
+
+    public:
+        def ensure_bytes(target: mutable darray[u8]&, capacity: usize) -> void:
+            _ = arena_da_reserve(&arena, target, capacity)
+            reservations <- reservations + 1
+
+        def ensure_ids(target: mutable darray[DesignIds::DesignId]&, capacity: usize) -> void:
+            _ = arena_da_reserve(&arena, target, capacity)
+            reservations <- reservations + 1
+
+        def ensure_string_refs(target: mutable darray[DesignValues::StringRef]&, capacity: usize) -> void:
+            _ = arena_da_reserve(&arena, target, capacity)
+            reservations <- reservations + 1
+
+        def ensure_i32(target: mutable darray[i32]&, capacity: usize) -> void:
+            _ = arena_da_reserve(&arena, target, capacity)
+            reservations <- reservations + 1
+
+        def reservation_count() -> usize:
+            return reservations

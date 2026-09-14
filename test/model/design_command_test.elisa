@@ -1,0 +1,272 @@
+# Command, history, and selection tests.
+#
+# Covers the M02 acceptance: a long mixed edit sequence undoes to the original
+# graph and redoes to the edited graph; invalid moves change nothing; stale
+# prepared commands are rejected; duplicate remaps internal references; and
+# selection prunes deterministically.
+
+include "../../src/schema/design_json_decode.elisa"
+include "../../src/commands/design_command.elisa"
+include "../../src/commands/design_history.elisa"
+include "../../src/commands/design_selection.elisa"
+include "test_support.elisa"
+
+module DesignCommandTest:
+    private:
+        def one_of(id: DesignIds::DesignId) -> darray[DesignIds::DesignId]:
+            ids: mutable darray[DesignIds::DesignId] = []
+            ids.push(id)
+            return ids
+
+        def text_value(form: DesignForms::Form&, text: sview) -> DesignValues::DesignValue:
+            return DesignValues::text(DesignValues::append(&form.strings.bytes, text))
+
+        def find_property_text(form: DesignForms::Form&, node: DesignIds::DesignId, key: sview) -> sview:
+            index: i64 = DesignForms::find_node(form, node)
+            return "" if index < 0
+            property_index: i64 = DesignNodes::property_index(form.nodes[index.usize()], form.strings, key)
+            return "" if property_index < 0
+            return DesignValues::text_of(form.strings, form.nodes[index.usize()].properties[property_index.usize()].value.text_ref)
+
+        def find_symbol(form: DesignForms::Form&, node: DesignIds::DesignId) -> sview:
+            index: i64 = DesignForms::find_node(form, node)
+            return "" if index < 0
+            return DesignValues::text_of(form.strings, form.nodes[index.usize()].symbol)
+
+        def find_id_with_symbol_text(form: DesignForms::Form&, needle: sview) -> DesignIds::DesignId:
+            index: mutable i64 = 0
+            while index < form.nodes.count.i64():
+                if DesignText::has_text(DesignValues::text_of(form.strings, form.nodes[index.usize()].symbol), needle):
+                    return form.nodes[index.usize()].id
+                index <- index + 1
+            return DesignIds::empty()
+
+    public:
+        def run() -> i64:
+            registry: DesignRegistry::Registry = DesignRegistry::build_builtin()
+            sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
+            form: mutable DesignForms::Form = DesignForms::empty_form()
+            settings_bytes: darray[u8] = TestSupport::read_fixture("test/fixtures/settings-form.elisaform.json")
+            TestSupport::check("settings fixture read", settings_bytes.count > 0)
+            DesignDecode::decode_form_into(&form, TestSupport::view_of(settings_bytes), registry, &sink)
+            id_text_storage: mutable u8[24] = zeroed
+            TestSupport::check("settings form loads", form.nodes.count == 8)
+            return TestSupport::report("design_command") if form.nodes.count != 8
+
+            original: DesignForms::Form = DesignClone::clone_form(form)
+            allocator: mutable DesignIds::Allocator = DesignIds::allocator(110)
+            history: mutable DesignHistory::History = DesignHistory::empty_history(64 * 1024 * 1024)
+            DesignHistory::mark_saved(form, &history)
+            actions: DesignIds::DesignId = DesignIds::from_text("node-actions")
+            target: mutable DesignIds::DesignId = DesignIds::empty()
+
+            # --- 100 mixed edits ---------------------------------------------
+            step: mutable i64 = 0
+            while step < 100:
+                if step % 4 == 0:
+                    prepared: DesignCommand::Prepared = DesignCommand::prepare_insert(form, registry, actions, -1, "elisa.ui.label", &allocator, &sink)
+                    if DesignHistory::apply(&history, &form, &prepared):
+                        target <- prepared.created[0.usize()]
+                elif step % 4 == 1:
+                    key_ref: sview = "text"
+                    prepared: DesignCommand::Prepared = DesignCommand::prepare_set_property(form, one_of(target), key_ref, text_value(form, "Item"), &sink)
+                    _ = DesignHistory::apply(&history, &form, &prepared)
+                elif step % 4 == 2:
+                    actions_index: i64 = DesignForms::find_node(form, actions)
+                    count: i64 = form.nodes[actions_index.usize()].children.count.i64()
+                    prepared: DesignCommand::Prepared = DesignCommand::prepare_reorder(form, actions, 0, count - 1, &sink)
+                    _ = DesignHistory::apply(&history, &form, &prepared)
+                else:
+                    symbol_buffer: mutable darray[u8] = []
+                    DesignText::push_cstr(&symbol_buffer, "item_")
+                    DesignText::push_i64(&symbol_buffer, step)
+                    prepared: DesignCommand::Prepared = DesignCommand::prepare_rename_symbol(form, target, DesignText::view_of(symbol_buffer), &sink)
+                    _ = DesignHistory::apply(&history, &form, &prepared)
+                step <- step + 1
+            TestSupport::check("100 edits applied", history.position == 100)
+            edited: DesignForms::Form = DesignClone::clone_form(form)
+
+            # --- undo all, then redo all -------------------------------------
+            undone: mutable i64 = 0
+            while DesignHistory::can_undo(history):
+                _ = DesignHistory::undo(&history, &form)
+                undone <- undone + 1
+            TestSupport::check("all edits undone", undone == 100)
+            TestSupport::check("undo restores the original graph", DesignClone::forms_equal(form, original))
+            TestSupport::check("undo to the saved content clears dirty", not DesignHistory::is_dirty(form, history))
+
+            redone: mutable i64 = 0
+            while DesignHistory::can_redo(history):
+                _ = DesignHistory::redo(&history, &form)
+                redone <- redone + 1
+            TestSupport::check("all edits redone", redone == 100)
+            TestSupport::check("redo restores the edited graph", DesignClone::forms_equal(form, edited))
+            TestSupport::check("redo away from the saved content is dirty", DesignHistory::is_dirty(form, history))
+
+            # --- invalid operations change nothing ---------------------------
+            revision_before: i64 = form.revision
+            ids: mutable darray[DesignIds::DesignId] = []
+            ids.push(DesignIds::from_text("node-profile"))
+            leaf: DesignCommand::Prepared = DesignCommand::prepare_reparent(form, registry, ids, DesignIds::from_text("node-name-input"), 0, &sink)
+            TestSupport::check("reparent into a leaf is rejected", not leaf.valid)
+            TestSupport::check("rejected reparent changes no revision", form.revision == revision_before)
+
+            into_self: DesignCommand::Prepared = DesignCommand::prepare_reparent(form, registry, ids, DesignIds::from_text("node-name-label"), 0, &sink)
+            TestSupport::check("reparent into own subtree is rejected", not into_self.valid)
+
+            missing_selection: mutable darray[DesignIds::DesignId] = []
+            missing_selection.push(DesignIds::from_text("node-does-not-exist"))
+            missing_reparent: DesignCommand::Prepared = DesignCommand::prepare_reparent(form, registry, missing_selection, actions, 0, &sink)
+            TestSupport::check("reparent rejects a missing selected id", not missing_reparent.valid)
+
+            full_parent_form: mutable DesignForms::Form = DesignClone::clone_form(form)
+            full_parent_index: i64 = DesignForms::find_node(full_parent_form, actions)
+            full_parent_form.nodes[full_parent_index.usize()].children.resize(DesignLimits::MAX_CHILDREN_PER_NODE)
+            full_parent_snapshot: DesignForms::Form = DesignClone::clone_form(full_parent_form)
+            capacity_ids: mutable darray[DesignIds::DesignId] = []
+            capacity_ids.push(DesignIds::from_text("node-heading"))
+            capacity_reparent: DesignCommand::Prepared = DesignCommand::prepare_reparent(full_parent_form, registry, capacity_ids, actions, -1, &sink)
+            TestSupport::check("reparent rejects a full target", not capacity_reparent.valid)
+            TestSupport::check("rejected capacity move leaves prepared graph unchanged", DesignClone::forms_equal(full_parent_snapshot, capacity_reparent.after))
+
+            full_duplicate_parent_form: mutable DesignForms::Form = DesignClone::clone_form(form)
+            root_parent_index: i64 = DesignForms::find_node(full_duplicate_parent_form, full_duplicate_parent_form.root)
+            full_duplicate_parent_form.nodes[root_parent_index.usize()].children.resize(DesignLimits::MAX_CHILDREN_PER_NODE)
+            full_duplicate_parent_snapshot: DesignForms::Form = DesignClone::clone_form(full_duplicate_parent_form)
+            duplicate_capacity_ids: mutable darray[DesignIds::DesignId] = []
+            duplicate_capacity_ids.push(DesignIds::from_text("node-profile"))
+            duplicate_capacity_ids.push(actions)
+            allocator_before_capacity_duplicate: u64 = allocator.next
+            capacity_duplicate: DesignCommand::Prepared = DesignCommand::prepare_duplicate(full_duplicate_parent_form, duplicate_capacity_ids, &allocator, &sink)
+            TestSupport::check("multi-selection duplicate rejects parent capacity atomically", not capacity_duplicate.valid)
+            TestSupport::check("capacity failure leaves duplicate graph unchanged", DesignClone::forms_equal(full_duplicate_parent_snapshot, capacity_duplicate.after))
+            TestSupport::check("capacity failure does not consume generated ids", allocator.next == allocator_before_capacity_duplicate)
+
+            root_ids: mutable darray[DesignIds::DesignId] = []
+            root_ids.push(form.root)
+            root_delete: DesignCommand::Prepared = DesignCommand::prepare_delete(form, root_ids, &sink)
+            TestSupport::check("deleting the root is rejected", not root_delete.valid)
+
+            # --- stale prepared commands are rejected ------------------------
+            stale: DesignCommand::Prepared = DesignCommand::prepare_insert(form, registry, actions, -1, "elisa.ui.label", &allocator, &sink)
+            fresh: DesignCommand::Prepared = DesignCommand::prepare_insert(form, registry, actions, -1, "elisa.ui.button", &allocator, &sink)
+            TestSupport::check("fresh command applies", DesignHistory::apply(&history, &form, &fresh))
+            TestSupport::check("stale command is rejected", not DesignHistory::apply(&history, &form, &stale))
+
+            # --- duplicate remaps internal references ------------------------
+            profile: DesignIds::DesignId = DesignIds::from_text("node-profile")
+            label_child: DesignIds::DesignId = DesignIds::from_text("node-name-label")
+            reference_value: DesignValues::DesignValue = DesignValues::node_ref(DesignValues::append(&form.strings.bytes, DesignIds::text(&label_child, &id_text_storage)))
+            ref_prepare: DesignCommand::Prepared = DesignCommand::prepare_set_property(form, one_of(profile), "linkedNode", reference_value, &sink)
+            _ = DesignHistory::apply(&history, &form, &ref_prepare)
+
+            missing_node: DesignIds::DesignId = DesignIds::from_text("node-does-not-exist")
+            duplicate_count_before: usize = form.nodes.count
+            allocator_before_invalid_duplicate: u64 = allocator.next
+            invalid_duplicate_ids: mutable darray[DesignIds::DesignId] = []
+            invalid_duplicate_ids.push(profile)
+            invalid_duplicate_ids.push(missing_node)
+            invalid_duplicate: DesignCommand::Prepared = DesignCommand::prepare_duplicate(form, invalid_duplicate_ids, &allocator, &sink)
+            TestSupport::check("duplicate rejects a missing selected id", not invalid_duplicate.valid)
+            TestSupport::check("failed duplicate leaves prepared graph unchanged", invalid_duplicate.after.nodes.count == duplicate_count_before)
+            TestSupport::check("failed duplicate does not consume generated ids", allocator.next == allocator_before_invalid_duplicate)
+            root_and_profile: mutable darray[DesignIds::DesignId] = []
+            root_and_profile.push(form.root)
+            root_and_profile.push(profile)
+            root_duplicate: DesignCommand::Prepared = DesignCommand::prepare_duplicate(form, root_and_profile, &allocator, &sink)
+            TestSupport::check("duplicate rejects a selection containing the form root atomically", not root_duplicate.valid and root_duplicate.after.nodes.count == duplicate_count_before)
+
+            duplicate_ids: mutable darray[DesignIds::DesignId] = []
+            duplicate_ids.push(profile)
+            duplicate_prepare: DesignCommand::Prepared = DesignCommand::prepare_duplicate(form, duplicate_ids, &allocator, &sink)
+            TestSupport::check("duplicate prepares", duplicate_prepare.valid)
+            TestSupport::check("duplicate applies", DesignHistory::apply(&history, &form, &duplicate_prepare))
+            copy_root: DesignIds::DesignId = duplicate_prepare.created[0.usize()]
+            TestSupport::check("duplicate got a fresh root id", not DesignIds::equal(copy_root, profile))
+            copy_index: i64 = DesignForms::find_node(form, copy_root)
+            TestSupport::check("duplicate root exists", copy_index >= 0)
+            copy_child: DesignIds::DesignId = form.nodes[copy_index.usize()].children[0.usize()]
+            TestSupport::check("duplicate child got a fresh id", not DesignIds::equal(copy_child, label_child))
+            TestSupport::check("duplicate child points at the copy", DesignIds::equal(form.nodes[DesignForms::find_node(form, copy_child).usize()].parent, copy_root))
+            TestSupport::check("duplicate root got a fresh symbol", not DesignText::equal(find_symbol(form, copy_root), find_symbol(form, profile)))
+            TestSupport::check("duplicate child got a fresh symbol", not DesignText::equal(find_symbol(form, copy_child), find_symbol(form, label_child)))
+            TestSupport::check_text("duplicate remapped the node reference", find_property_text(form, copy_root, "linkedNode"), DesignIds::text(&copy_child, &id_text_storage))
+            TestSupport::check_text("original reference is unchanged", find_property_text(form, profile, "linkedNode"), DesignIds::text(&label_child, &id_text_storage))
+
+            # One map covers NodeRefs between separately selected subtrees.
+            save_id: DesignIds::DesignId = DesignIds::from_text("node-save")
+            cross_reference: DesignValues::DesignValue = DesignValues::node_ref(DesignValues::append(&form.strings.bytes, DesignIds::text(&save_id, &id_text_storage)))
+            cross_ref_prepare: DesignCommand::Prepared = DesignCommand::prepare_set_property(form, one_of(profile), "crossLink", cross_reference, &sink)
+            _ = DesignHistory::apply(&history, &form, &cross_ref_prepare)
+            multi_duplicate_ids: mutable darray[DesignIds::DesignId] = []
+            multi_duplicate_ids.push(profile)
+            multi_duplicate_ids.push(actions)
+            multi_duplicate: DesignCommand::Prepared = DesignCommand::prepare_duplicate(form, multi_duplicate_ids, &allocator, &sink)
+            TestSupport::check("multi-selection duplicate prepares atomically", multi_duplicate.valid and multi_duplicate.created.count == 2)
+            _ = DesignHistory::apply(&history, &form, &multi_duplicate)
+            multi_profile_copy: DesignIds::DesignId = multi_duplicate.created[0.usize()]
+            multi_actions_copy: DesignIds::DesignId = multi_duplicate.created[1.usize()]
+            copied_save: DesignIds::DesignId = find_id_with_symbol_text(form, "save_button_copy_")
+            TestSupport::check("multi-selection duplicate includes the referenced copy", not DesignIds::is_empty(copied_save))
+            TestSupport::check_text("multi-selection duplicate remaps cross-root NodeRef", find_property_text(form, multi_profile_copy, "crossLink"), DesignIds::text(&copied_save, &id_text_storage))
+            TestSupport::check("multi-selection duplicate gives each root a fresh symbol", not DesignText::equal(find_symbol(form, multi_profile_copy), find_symbol(form, profile)) and not DesignText::equal(find_symbol(form, multi_actions_copy), find_symbol(form, actions)))
+
+            # A surviving NodeRef blocks deletion so the command cannot leave
+            # an unresolved reference. Event handlers are external symbols.
+            delete_probe: mutable DesignForms::Form = DesignClone::clone_form(form)
+            probe_history: mutable DesignHistory::History = DesignHistory::empty_history(64 * 1024 * 1024)
+            external_ref: DesignValues::DesignValue = DesignValues::node_ref(DesignValues::append(&delete_probe.strings.bytes, DesignIds::text(&profile, &id_text_storage)))
+            external_ref_prepare: DesignCommand::Prepared = DesignCommand::prepare_set_property(delete_probe, one_of(DesignIds::from_text("node-heading")), "linkedNode", external_ref, &sink)
+            _ = DesignHistory::apply(&probe_history, &delete_probe, &external_ref_prepare)
+            delete_probe_snapshot: DesignForms::Form = DesignClone::clone_form(delete_probe)
+            delete_sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
+            blocked_delete: DesignCommand::Prepared = DesignCommand::prepare_delete(delete_probe, one_of(profile), &delete_sink)
+            TestSupport::check("delete rejects a surviving NodeRef into the deleted subtree", not blocked_delete.valid)
+            TestSupport::check("delete diagnoses the external NodeRef", TestSupport::has_error_code(delete_sink, DesignDiagnostics::Code.MissingParent))
+            TestSupport::check("rejected referenced delete leaves graph unchanged", DesignClone::forms_equal(delete_probe_snapshot, blocked_delete.after))
+
+            event_probe: mutable DesignForms::Form = DesignClone::clone_form(form)
+            heading_index: i64 = DesignForms::find_node(event_probe, DesignIds::from_text("node-heading"))
+            DesignNodes::ensure_events(&event_probe.nodes[heading_index.usize()].events, event_probe.nodes[heading_index.usize()].events.count + 1)
+            event_probe.nodes[heading_index.usize()].events.push(DesignNodes::EventConnection{
+                event_key: DesignValues::append(event_probe.strings.bytes, "click"),
+                handler: DesignValues::append(event_probe.strings.bytes, "profile_row"),
+            })
+            event_delete_sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
+            event_delete: DesignCommand::Prepared = DesignCommand::prepare_delete(event_probe, one_of(profile), &event_delete_sink)
+            TestSupport::check("delete treats event handler symbols as external source names", event_delete.valid)
+            event_heading_index: i64 = DesignForms::find_node(event_delete.after, DesignIds::from_text("node-heading"))
+            TestSupport::check_text("deleting another node preserves the event handler", DesignValues::text_of(event_delete.after.strings, event_delete.after.nodes[event_heading_index.usize()].events[0.usize()].handler), "profile_row")
+
+            # --- selection ---------------------------------------------------
+            selection: mutable DesignSelection::Selection = DesignSelection::empty()
+            DesignSelection::select_only(&selection, copy_root)
+            DesignSelection::include_id(&selection, copy_child)
+            TestSupport::check("selection holds two ids", DesignSelection::selected_count(selection) == 2)
+            DesignSelection::toggle_id(&selection, copy_root)
+            TestSupport::check("toggle removes", DesignSelection::selected_count(selection) == 1)
+            delete_prepare: DesignCommand::Prepared = DesignCommand::prepare_delete(form, one_of(copy_root), &sink)
+            _ = DesignHistory::apply(&history, &form, &delete_prepare)
+            DesignSelection::prune(&selection, form)
+            TestSupport::check("selection prunes deleted ids", DesignSelection::selected_count(selection) == 0)
+            TestSupport::check("pruned primary is empty", DesignIds::is_empty(selection.primary))
+
+            # Branching from undo must remove the redo snapshots from the byte
+            # total along with the entries themselves.
+            branch_form: mutable DesignForms::Form = DesignClone::clone_form(form)
+            branch_history: mutable DesignHistory::History = DesignHistory::empty_history(64 * 1024 * 1024)
+            branch_first: DesignCommand::Prepared = DesignCommand::prepare_set_property(branch_form, one_of(profile), "text", text_value(branch_form, "first"), &sink)
+            _ = DesignHistory::apply(&branch_history, &branch_form, &branch_first)
+            first_entry_bytes: i64 = branch_history.entries[0.usize()].bytes
+            branch_second: DesignCommand::Prepared = DesignCommand::prepare_rename_symbol(branch_form, profile, "profile_branch", &sink)
+            _ = DesignHistory::apply(&branch_history, &branch_form, &branch_second)
+            _ = DesignHistory::undo(&branch_history, &branch_form)
+            branch_third: DesignCommand::Prepared = DesignCommand::prepare_rename_symbol(branch_form, profile, "profile_alternative", &sink)
+            TestSupport::check("branch command applies after undo", DesignHistory::apply(&branch_history, &branch_form, &branch_third))
+            expected_branch_bytes: i64 = first_entry_bytes + branch_history.entries[1.usize()].bytes
+            TestSupport::check("redo tail is discarded after branching", branch_history.entries.count == 2 and not DesignHistory::can_redo(branch_history))
+            TestSupport::check("redo tail byte accounting is discarded", branch_history.bytes_used == expected_branch_bytes)
+            return TestSupport::report("design_command")
+
+def main() -> i64:
+    return DesignCommandTest::run()

@@ -1,0 +1,26 @@
+# Shared constants for the bounded preview-form byte contract.
+#
+# This module deliberately contains only plain constants and enums. It is
+# included by both core and UI compilation units; the document model and
+# standard-library codecs remain on the core side of ADR-001.
+
+module PreviewWire:
+    public:
+        const MAGIC_0: u8 = 69
+        const MAGIC_1: u8 = 76
+        const MAGIC_2: u8 = 80
+        const MAGIC_3: u8 = 70
+        const VERSION: u16 = 1
+        const HEADER_BYTES: usize = 28
+        const MAX_NODES: usize = 256
+        const MAX_ID_BYTES: usize = 24
+        const MAX_TEXT_BYTES: usize = 4096
+        const MAX_PAYLOAD_BYTES: usize = 4194304
+
+        const enum Component of u8:
+            Column = 1
+            Row = 2
+            Panel = 3
+            Label = 4
+            Button = 5
+            TextField = 6

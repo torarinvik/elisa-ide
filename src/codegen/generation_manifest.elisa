@@ -1,0 +1,435 @@
+# Pure generated-file ownership model and preflight checks.
+#
+# The manifest is a record of exactly which relative paths the generator owns
+# and the bytes last written at each path. This module performs no filesystem
+# access: callers supply a snapshot of current file bytes, then use the result
+# before staging or publishing any generated output.
+
+include "../model/design_text.elisa"
+include "../model/design_values.elisa"
+include "../model/fingerprint.elisa"
+include "../validation/design_diagnostics.elisa"
+
+include "../../compiler/elisacore_std/elisacore_runtime.elisa"
+include "../../compiler/elisacore_std/collections.elisa"
+include "../../compiler/elisacore_std/elisacore_json.elisa"
+
+module GenerationManifest:
+    private:
+        const MAX_GENERATED_FILES: usize = 512
+        const MAX_MANIFEST_BYTES: usize = 1048576
+
+        global mutable manifest_arena: Arena = Arena{begin: null, end: null, end_index: 0, strategy: 0}
+
+        def empty_arena() -> Arena:
+            return Arena{begin: null, end: null, end_index: 0, strategy: 0}
+
+        def durable(bytes: darray[u8]) -> darray[u8]:
+            result: mutable darray[u8] = []
+            index: mutable i64 = 0
+            while index < bytes.count.i64():
+                result.push(bytes[index.usize()])
+                index <- index + 1
+            return result
+
+        def member_key(value: JsonValue, index: i64) -> sview:
+            return catch json_key_at(value, index):
+                value:
+                    value
+                error e:
+                    ""
+
+        def member_value(value: JsonValue, index: i64) -> JsonValue:
+            return catch json_value_at(value, index):
+                value:
+                    value
+                error e:
+                    JsonValue.Null
+
+        def array_value(value: JsonValue, index: i64) -> JsonValue:
+            return catch json_at(value, index):
+                value:
+                    value
+                error e:
+                    JsonValue.Null
+
+        def member_at(value: JsonValue, key: sview) -> JsonValue:
+            return catch json_get(value, key):
+                value:
+                    value
+                error e:
+                    JsonValue.Null
+
+        def string_value(value: JsonValue) -> sview:
+            return catch json_as_string(value):
+                value:
+                    value
+                error e:
+                    ""
+
+        def duplicate_members(value: JsonValue) -> bool:
+            return false if json_kind(value) != JsonKind.OBJECT
+            count: i64 = json_object_len(value)
+            index: mutable i64 = 0
+            while index < count:
+                key: sview = member_key(value, index)
+                earlier: mutable i64 = 0
+                while earlier < index:
+                    return true if DesignText::equal(member_key(value, earlier), key)
+                    earlier <- earlier + 1
+                index <- index + 1
+            return false
+
+        def hex_digit(byte: u8) -> i64:
+            if byte >= 48 and byte <= 57:
+                return (byte - 48).i64()
+            if byte >= 97 and byte <= 102:
+                return (byte - 97 + 10).i64()
+            if byte >= 65 and byte <= 70:
+                return (byte - 65 + 10).i64()
+            return -1
+
+        def parse_hash(text: sview, valid: mutable bool&) -> u64:
+            valid <- false
+            return 0 if text.len != 16
+            value: mutable u64 = 0
+            index: mutable i64 = 0
+            while index < 16:
+                digit: i64 = hex_digit(text[index])
+                return 0 if digit < 0
+                value <- (value << 4) | digit.u64()
+                index <- index + 1
+            valid <- true
+            return value
+
+        def hash_text(value: u64) -> darray[u8]:
+            text: mutable darray[u8] = []
+            for shift in 0..<16:
+                bit_shift: i64 = (15 - shift) * 4
+                nibble: u64 = (value >> bit_shift) & 15
+                text.push((48 + nibble.u8()) if nibble < 10 else (87 + nibble.u8()))
+            return text
+
+        def json_text_member(arena: mutable Arena&, members: mutable darray[JsonMember]&, key: sview, value: sview) -> void:
+            members.push(json_member(arena, key, json_string(arena, value)))
+
+        def json_hash_member(arena: mutable Arena&, members: mutable darray[JsonMember]&, key: sview, value: u64) -> void:
+            text: darray[u8] = hash_text(value)
+            json_text_member(arena, members, key, DesignText::view_of(text))
+
+        def report_manifest_error(sink: mutable DesignDiagnostics::Sink&, message: sview) -> void:
+            _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.InvalidReference, "generation.manifest", message)
+
+        def issue_message(issue: Issue) -> sview:
+            match issue:
+                Issue.UnsupportedVersion:
+                    return "generation manifest version is not supported"
+                Issue.InvalidTargetId:
+                    return "generation manifest target identity is missing or invalid"
+                Issue.InvalidFrameworkId:
+                    return "generation manifest framework identity is missing or invalid"
+                Issue.TooManyGeneratedFiles:
+                    return "generation manifest has too many owned files"
+                Issue.InvalidManifestPath:
+                    return "generation manifest contains an unsafe relative path"
+                Issue.DuplicateManifestPath:
+                    return "generation manifest contains a duplicate owned path"
+                _:
+                    return "generation manifest is invalid"
+
+        def reserve_entries(target: mutable darray[FileEntry]&, capacity: usize) -> void:
+            _ = arena_da_reserve(&manifest_arena, target, capacity)
+
+        def path_is_normalized_relative(path: sview) -> bool:
+            return false if path.len == 0 or path.len > 4096
+            return false if path[0] == 47 or path[0] == 92
+            return false if path.len >= 2 and ((path[0] >= 65 and path[0] <= 90) or (path[0] >= 97 and path[0] <= 122)) and path[1] == 58
+
+            segment_start: mutable i64 = 0
+            index: mutable i64 = 0
+            while index <= path.len:
+                at_end: bool = index == path.len
+                byte: mutable u8 = 0
+                if not at_end:
+                    byte <- path[index]
+                    return false if byte == 92 or byte == 58 or byte < 32 or byte == 127
+                if at_end or byte == 47:
+                    segment: sview = path[segment_start:index]
+                    return false if segment.len == 0 or DesignText::equal(segment, ".") or DesignText::equal(segment, "..")
+                    segment_start <- index + 1
+                index <- index + 1
+            return true
+
+        def metadata_is_valid(value: sview) -> bool:
+            return false if value.len == 0 or value.len > 256
+            index: mutable i64 = 0
+            while index < value.len:
+                byte: u8 = value[index]
+                return false if byte < 32 or byte == 127
+                index <- index + 1
+            return true
+
+        def find_entry(manifest: Manifest&, path: sview) -> i64:
+            index: mutable i64 = 0
+            while index < manifest.files.count.i64():
+                current: sview = DesignValues::text_of(manifest.strings, manifest.files[index.usize()].relative_path)
+                if DesignText::equal(current, path):
+                    return index
+                index <- index + 1
+            return -1
+
+        def find_current(current: darray[CurrentFile], path: sview) -> i64:
+            index: mutable i64 = 0
+            while index < current.count.i64():
+                if DesignText::equal(current[index.usize()].relative_path, path):
+                    return index
+                index <- index + 1
+            return -1
+
+        def result(code: Issue, manifest_index: i64, current_index: i64) -> Validation:
+            return Validation{ok: code == Issue.None, code: code, manifest_index: manifest_index, current_index: current_index}
+
+        def successful() -> Validation:
+            return result(Issue.None, -1, -1)
+
+    public:
+        const SUPPORTED_VERSION: i64 = 1
+
+        const enum Issue of i32:
+            None = 0
+            UnsupportedVersion = 1
+            InvalidTargetId = 2
+            InvalidFrameworkId = 3
+            TooManyGeneratedFiles = 4
+            InvalidManifestPath = 5
+            DuplicateManifestPath = 6
+            TooManyCurrentFiles = 7
+            InvalidCurrentPath = 8
+            DuplicateCurrentPath = 9
+            ModifiedOwnedFile = 10
+            UnownedOutputCollision = 11
+
+        struct FileEntry:
+            relative_path: mutable DesignValues::StringRef
+            content_hash: mutable u64
+
+        struct Manifest:
+            version: mutable i64
+            target_id: mutable DesignValues::StringRef
+            framework_id: mutable DesignValues::StringRef
+            document_hash: mutable u64
+            strings: mutable DesignValues::StringPool
+            files: mutable darray[FileEntry]
+
+        # A caller-provided, read-only filesystem snapshot. `content` is a
+        # counted byte view; no path is opened and no data is retained here.
+        struct CurrentFile:
+            relative_path: mutable sview
+            content: mutable sview
+
+        struct Validation:
+            ok: mutable bool
+            code: mutable Issue
+            # Indexes let a UI attach a diagnostic to the responsible record.
+            # -1 means that the failure applies to manifest metadata.
+            manifest_index: mutable i64
+            current_index: mutable i64
+
+        def empty(target_id: sview, framework_id: sview, document_hash: u64) -> Manifest:
+            manifest: mutable Manifest = Manifest{
+                version: SUPPORTED_VERSION,
+                target_id: DesignValues::no_text(),
+                framework_id: DesignValues::no_text(),
+                document_hash: document_hash,
+                strings: DesignValues::empty_pool(),
+                files: [],
+            }
+            manifest.target_id <- DesignValues::append(manifest.strings.bytes, target_id)
+            manifest.framework_id <- DesignValues::append(manifest.strings.bytes, framework_id)
+            return manifest
+
+        # Records ownership metadata for content already generated in memory.
+        # Structural validation remains a separate step so decoded manifests
+        # receive the same checks as freshly built ones.
+        def add_file(manifest: mutable Manifest&, relative_path: sview, content: sview) -> bool:
+            return false if manifest.files.count >= MAX_GENERATED_FILES
+            reserve_entries(&manifest.files, manifest.files.count + 1)
+            manifest.files.push(FileEntry{
+                relative_path: DesignValues::append(manifest.strings.bytes, relative_path),
+                content_hash: Fingerprint::fnv1a64(content),
+            })
+            return true
+
+        # Useful for manifest decoders and corruption tests that already have a
+        # stored digest rather than the original bytes.
+        def add_hashed_file(manifest: mutable Manifest&, relative_path: sview, content_hash: u64) -> bool:
+            return false if manifest.files.count >= MAX_GENERATED_FILES
+            reserve_entries(&manifest.files, manifest.files.count + 1)
+            manifest.files.push(FileEntry{
+                relative_path: DesignValues::append(manifest.strings.bytes, relative_path),
+                content_hash: content_hash,
+            })
+            return true
+
+        def validate(manifest: Manifest&) -> Validation:
+            return result(Issue.UnsupportedVersion, -1, -1) if manifest.version != SUPPORTED_VERSION
+            return result(Issue.InvalidTargetId, -1, -1) if not metadata_is_valid(DesignValues::text_of(manifest.strings, manifest.target_id))
+            return result(Issue.InvalidFrameworkId, -1, -1) if not metadata_is_valid(DesignValues::text_of(manifest.strings, manifest.framework_id))
+            return result(Issue.TooManyGeneratedFiles, -1, -1) if manifest.files.count > MAX_GENERATED_FILES
+
+            index: mutable i64 = 0
+            while index < manifest.files.count.i64():
+                path: sview = DesignValues::text_of(manifest.strings, manifest.files[index.usize()].relative_path)
+                return result(Issue.InvalidManifestPath, index, -1) if not path_is_normalized_relative(path)
+                earlier: mutable i64 = 0
+                while earlier < index:
+                    previous_path: sview = DesignValues::text_of(manifest.strings, manifest.files[earlier.usize()].relative_path)
+                    return result(Issue.DuplicateManifestPath, index, -1) if DesignText::equal(path, previous_path)
+                    earlier <- earlier + 1
+                index <- index + 1
+            return successful()
+
+        # Check whether a proposed manifest can replace the currently observed
+        # generated files without overwriting user edits or unowned files.
+        # An old path omitted from `next` is an obsolete deletion candidate;
+        # when it still exists, its bytes must still match the old manifest.
+        def validate_transition(previous: Manifest&, next: Manifest&, current: darray[CurrentFile]) -> Validation:
+            old_valid: Validation = validate(previous)
+            return old_valid if not old_valid.ok
+            new_valid: Validation = validate(next)
+            return new_valid if not new_valid.ok
+            return result(Issue.TooManyCurrentFiles, -1, -1) if current.count > MAX_GENERATED_FILES * 2
+
+            current_index: mutable i64 = 0
+            while current_index < current.count.i64():
+                path: sview = current[current_index.usize()].relative_path
+                return result(Issue.InvalidCurrentPath, -1, current_index) if not path_is_normalized_relative(path)
+                earlier: mutable i64 = 0
+                while earlier < current_index:
+                    if DesignText::equal(path, current[earlier.usize()].relative_path):
+                        return result(Issue.DuplicateCurrentPath, -1, current_index)
+                    earlier <- earlier + 1
+                current_index <- current_index + 1
+
+            # Any current bytes at an old generated path must still be exactly
+            # the version the generator last wrote. This protects both a
+            # replacement and an obsolete-file deletion from clobbering edits.
+            old_index: mutable i64 = 0
+            while old_index < previous.files.count.i64():
+                old_entry: FileEntry = previous.files[old_index.usize()]
+                old_path: sview = DesignValues::text_of(previous.strings, old_entry.relative_path)
+                observed_index: i64 = find_current(current, old_path)
+                if observed_index >= 0:
+                    actual_hash: u64 = Fingerprint::fnv1a64(current[observed_index.usize()].content)
+                    if actual_hash != old_entry.content_hash:
+                        return result(Issue.ModifiedOwnedFile, old_index, observed_index)
+                old_index <- old_index + 1
+
+            # Existing paths that the new generation would create or replace
+            # must either be in the previous ownership manifest or absent.
+            new_index: mutable i64 = 0
+            while new_index < next.files.count.i64():
+                new_path: sview = DesignValues::text_of(next.strings, next.files[new_index.usize()].relative_path)
+                if find_current(current, new_path) >= 0 and find_entry(previous, new_path) < 0:
+                    return result(Issue.UnownedOutputCollision, new_index, find_current(current, new_path))
+                new_index <- new_index + 1
+
+            return successful()
+
+        # Canonical on-disk representation. Hashes are fixed-width hexadecimal
+        # strings so all 64 bits survive JSON implementations whose numeric
+        # type is IEEE-754. Output ordering is stable and contains no timestamps.
+        def encode(manifest: Manifest&, sink: mutable DesignDiagnostics::Sink&) -> darray[u8]:
+            checked: Validation = validate(manifest)
+            if not checked.ok:
+                report_manifest_error(sink, issue_message(checked.code))
+                return []
+
+            arena: mutable Arena = empty_arena()
+            members: mutable darray[JsonMember] = []
+            json_text_member(&arena, &members, "format", "elisa-ide-generation-manifest")
+            members.push(json_member(&arena, "version", json_number(manifest.version.f64())))
+            json_text_member(&arena, &members, "targetId", DesignValues::text_of(manifest.strings, manifest.target_id))
+            json_text_member(&arena, &members, "frameworkId", DesignValues::text_of(manifest.strings, manifest.framework_id))
+            json_hash_member(&arena, &members, "documentHash", manifest.document_hash)
+
+            files: mutable darray[JsonValue] = []
+            index: mutable i64 = 0
+            while index < manifest.files.count.i64():
+                entry: FileEntry = manifest.files[index.usize()]
+                file_members: mutable darray[JsonMember] = []
+                json_text_member(&arena, &file_members, "path", DesignValues::text_of(manifest.strings, entry.relative_path))
+                json_hash_member(&arena, &file_members, "contentHash", entry.content_hash)
+                files.push(json_object_from(&arena, file_members))
+                index <- index + 1
+            members.push(json_member(&arena, "files", json_array_from(&arena, files)))
+            output: darray[u8] = json_write(&arena, json_object_from(&arena, members))
+            return durable(output)
+
+        # Decode accepts only this exact format/version, rejects duplicate
+        # object keys and malformed hash values, and returns an empty fail-closed
+        # manifest with a diagnostic on any structural error.
+        def decode(text: sview, sink: mutable DesignDiagnostics::Sink&) -> Manifest:
+            empty_manifest: Manifest = empty("", "", 0)
+            if text.len < 0 or text.len.usize() > MAX_MANIFEST_BYTES:
+                _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.InputTooLarge, "generation.manifest", "generation manifest exceeds the one-megabyte input limit")
+                return empty_manifest
+            arena: mutable Arena = empty_arena()
+            parsed: JsonParseResult = json_parse_checked(arena, text)
+            if parsed.code != JsonErrorCode.OK or json_kind(parsed.value) != JsonKind.OBJECT:
+                _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.MalformedJson, "generation.manifest", "generation manifest is not a valid JSON object")
+                return empty_manifest
+            root: JsonValue = parsed.value
+            if duplicate_members(root):
+                _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.DuplicateKey, "generation.manifest", "generation manifest contains duplicate object keys")
+                return empty_manifest
+            if not DesignText::equal(string_value(member_at(root, "format")), "elisa-ide-generation-manifest"):
+                report_manifest_error(sink, "generation manifest format marker is missing or invalid")
+                return empty_manifest
+            version_value: JsonValue = member_at(root, "version")
+            if not json_is_number(version_value):
+                report_manifest_error(sink, "generation manifest version must be a number")
+                return empty_manifest
+            version_number: f64 = catch json_as_number(version_value):
+                value:
+                    value
+                error e:
+                    -1.0
+            if version_number != SUPPORTED_VERSION.f64():
+                _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.UnsupportedSchemaVersion, "generation.manifest.version", "generation manifest version is not supported")
+                return empty_manifest
+
+            target: sview = string_value(member_at(root, "targetId"))
+            framework: sview = string_value(member_at(root, "frameworkId"))
+            document_hash_ok: mutable bool = false
+            document_hash: u64 = parse_hash(string_value(member_at(root, "documentHash")), &document_hash_ok)
+            files_value: JsonValue = member_at(root, "files")
+            if not document_hash_ok or json_kind(files_value) != JsonKind.ARRAY:
+                report_manifest_error(sink, "generation manifest needs a hexadecimal document hash and files array")
+                return empty_manifest
+            file_count: i64 = json_array_len(files_value)
+            if file_count < 0 or file_count > MAX_GENERATED_FILES.i64():
+                report_manifest_error(sink, "generation manifest has too many owned files")
+                return empty_manifest
+
+            manifest: mutable Manifest = empty(target, framework, document_hash)
+            manifest.version <- version_number.i64()
+            index: mutable i64 = 0
+            while index < file_count:
+                file_value: JsonValue = array_value(files_value, index)
+                if json_kind(file_value) != JsonKind.OBJECT or duplicate_members(file_value):
+                    _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.DuplicateKey, "generation.manifest.files", "owned file record is not an unambiguous object")
+                    return empty_manifest
+                path: sview = string_value(member_at(file_value, "path"))
+                hash_ok: mutable bool = false
+                content_hash: u64 = parse_hash(string_value(member_at(file_value, "contentHash")), &hash_ok)
+                if path.len == 0 or not hash_ok or not add_hashed_file(&manifest, path, content_hash):
+                    report_manifest_error(sink, "owned file needs a relative path and a fixed-width hexadecimal content hash")
+                    return empty_manifest
+                index <- index + 1
+
+            checked: Validation = validate(manifest)
+            if not checked.ok:
+                report_manifest_error(sink, issue_message(checked.code))
+                return empty_manifest
+            return manifest

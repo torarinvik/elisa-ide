@@ -1,0 +1,72 @@
+# Registry tests: the built-in component set, its property metadata, and
+# self-validation (duplicate keys, unknown editor kinds, invalid defaults).
+
+include "../../src/registry/design_registry.elisa"
+include "test_support.elisa"
+
+module DesignRegistryTest:
+    public:
+        def run() -> i64:
+            registry: DesignRegistry::Registry = DesignRegistry::build_builtin()
+            TestSupport::check("built-in registry validates", DesignRegistry::validate(registry) == 0)
+
+            # Every M01 component resolves by its stable key.
+            column: i64 = DesignRegistry::find_component(registry, "elisa.ui.column")
+            row: i64 = DesignRegistry::find_component(registry, "elisa.ui.row")
+            panel: i64 = DesignRegistry::find_component(registry, "elisa.ui.panel")
+            label: i64 = DesignRegistry::find_component(registry, "elisa.ui.label")
+            button: i64 = DesignRegistry::find_component(registry, "elisa.ui.button")
+            field: i64 = DesignRegistry::find_component(registry, "elisa.ui.text_field")
+            TestSupport::check("column registered", column >= 0)
+            TestSupport::check("row registered", row >= 0)
+            TestSupport::check("panel registered", panel >= 0)
+            TestSupport::check("label registered", label >= 0)
+            TestSupport::check("button registered", button >= 0)
+            TestSupport::check("text field registered", field >= 0)
+
+            # Containers can nest; leaves cannot.
+            TestSupport::check("column can have children", registry.components[column.usize()].can_have_children)
+            TestSupport::check("button cannot have children", not registry.components[button.usize()].can_have_children)
+            TestSupport::check("label cannot have children", not registry.components[label.usize()].can_have_children)
+
+            # Property descriptors carry type, default, range, and effect flags.
+            padding: i64 = DesignRegistry::find_property(registry, column, "padding")
+            TestSupport::check("padding descriptor exists", padding >= 0)
+            if padding >= 0:
+                descriptor: DesignRegistry::PropertyDescriptor = registry.components[column.usize()].properties[padding.usize()]
+                TestSupport::check("padding is a length", descriptor.tag == DesignValues::ValueTag.Length)
+                TestSupport::check("padding affects layout", descriptor.affects_layout)
+                TestSupport::check("padding default is 8", descriptor.default_value.scalar_value == 8.0)
+
+            background: i64 = DesignRegistry::find_property(registry, column, "background")
+            if background >= 0:
+                color: DesignRegistry::PropertyDescriptor = registry.components[column.usize()].properties[background.usize()]
+                TestSupport::check("background is a color", color.tag == DesignValues::ValueTag.Color)
+                TestSupport::check("background affects paint", color.affects_paint)
+
+            text_color: i64 = DesignRegistry::find_property(registry, button, "textColor")
+            if text_color >= 0:
+                descriptor: DesignRegistry::PropertyDescriptor = registry.components[button.usize()].properties[text_color.usize()]
+                TestSupport::check("button text color is explicit metadata", descriptor.tag == DesignValues::ValueTag.Color)
+                TestSupport::check("button text color differs from fill", descriptor.default_value.color_value.r != 64)
+
+            alignment: i64 = DesignRegistry::find_property(registry, column, "crossAlignment")
+            if alignment >= 0:
+                enum_descriptor: DesignRegistry::PropertyDescriptor = registry.components[column.usize()].properties[alignment.usize()]
+                TestSupport::check("alignment is an enum", enum_descriptor.tag == DesignValues::ValueTag.EnumKey)
+                TestSupport::check("alignment lists keys", DesignValues::text_of(registry.strings, enum_descriptor.enum_keys).len > 0)
+
+            # Events are per component.
+            click: i64 = DesignRegistry::find_event(registry, button, "click")
+            TestSupport::check("button has a click event", click >= 0)
+            TestSupport::check("label has no events", DesignRegistry::find_event(registry, label, "click") < 0)
+            change: i64 = DesignRegistry::find_event(registry, field, "change")
+            TestSupport::check("text field has a change event", change >= 0)
+
+            # Unknown lookups fail closed.
+            TestSupport::check("unknown component not found", DesignRegistry::find_component(registry, "elisa.ui.mystery") < 0)
+            TestSupport::check("unknown property not found", DesignRegistry::find_property(registry, column, "nonsense") < 0)
+            return TestSupport::report("design_registry")
+
+def main() -> i64:
+    return DesignRegistryTest::run()

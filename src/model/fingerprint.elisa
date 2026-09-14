@@ -1,0 +1,20 @@
+# Portable fingerprinting used by save transactions, external-change detection,
+# and recovery records. Content identity, never a timestamp.
+#
+# FNV-1a 64-bit over raw bytes. The algorithm is fixed and documented so hashes
+# written into recovery records stay comparable across process runs.
+
+module Fingerprint:
+    private:
+        const FNV_OFFSET_BASIS: u64 = 14695981039346656037
+        const FNV_PRIME: u64 = 1099511628211
+
+    public:
+        def fnv1a64(bytes: sview) -> u64:
+            hash: mutable u64 = FNV_OFFSET_BASIS
+            for index in 0..<bytes.len |hash, bytes|:
+                hash <- (hash ^ bytes[index].u64()) * FNV_PRIME
+            return hash
+
+        def equal(left: u64, right: u64) -> bool:
+            return left == right

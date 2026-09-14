@@ -1,0 +1,444 @@
+# Deterministic Elisa source emitter for the initial SDL3/UiHandles target.
+#
+# Output is one generated view module. It assumes the target entrypoint includes
+# the chosen elisa-ui adapter and the user's handwritten handler module. The
+# emitter never edits those files; publishing and ownership manifests are a
+# separate transaction above this pure byte-generation layer.
+
+include "../model/design_limits.elisa"
+include "../model/design_text.elisa"
+include "../model/design_values.elisa"
+include "../model/design_ids.elisa"
+include "../model/design_node.elisa"
+include "../model/design_form.elisa"
+include "../registry/design_registry.elisa"
+include "../validation/design_diagnostics.elisa"
+include "../lowering/design_lower.elisa"
+include "./source_map.elisa"
+
+include "../../compiler/elisacore_std/elisacore_runtime.elisa"
+include "../../compiler/elisacore_std/collections.elisa"
+include "../../compiler/elisacore_std/elisacore_json.elisa"
+
+module ElisaEmit:
+    private:
+        struct PendingSpan:
+            start_byte: mutable i64
+            end_byte: mutable i64
+            kind: mutable CodegenSourceMap::OriginKind
+            source_node: mutable i64
+            member: mutable sview
+
+        def push_char(out: mutable darray[u8]&, value: u8) -> void:
+            out.push(value)
+
+        def push_text(out: mutable darray[u8]&, value: sview) -> void:
+            DesignText::push_view(out, value)
+
+        def push_cstr(out: mutable darray[u8]&, value: cstr) -> void:
+            DesignText::push_cstr(out, value)
+
+        def push_index(out: mutable darray[u8]&, value: i64) -> void:
+            DesignText::push_i64(out, value)
+
+        def record_span(pending: mutable darray[PendingSpan]&, start_byte: i64, end_byte: i64, kind: CodegenSourceMap::OriginKind, source_node: i64, member: sview) -> void:
+            return if start_byte < 0 or end_byte <= start_byte
+            pending.push(PendingSpan{
+                start_byte: start_byte,
+                end_byte: end_byte,
+                kind: kind,
+                source_node: source_node,
+                member: member,
+            })
+
+        def hex_digit(value: u8) -> u8:
+            return 48 + value if value < 10 else 87 + value
+
+        # Elisa string literals use the compiler's fixed-width Unicode escape
+        # form for ASCII control bytes. UTF-8 bytes for ordinary Unicode text
+        # pass through unchanged; quotes, slashes, tabs and line endings are
+        # escaped so no document value can break generated syntax.
+        def push_quoted(out: mutable darray[u8]&, value: sview) -> void:
+            push_char(out, 34)
+            index: mutable i64 = 0
+            while index < value.len:
+                byte: u8 = value[index]
+                if byte == 34:
+                    push_text(out, "\\\"")
+                elif byte == 92:
+                    push_text(out, "\\\\")
+                elif byte == 9:
+                    push_text(out, "\\t")
+                elif byte == 10:
+                    push_text(out, "\\n")
+                elif byte == 13:
+                    push_text(out, "\\r")
+                elif byte < 32 or byte == 127:
+                    push_text(out, "\\u00")
+                    push_char(out, hex_digit(byte / 16))
+                    push_char(out, hex_digit(byte % 16))
+                else:
+                    push_char(out, byte)
+                index <- index + 1
+            push_char(out, 34)
+
+        def numeric_value(value: DesignValues::DesignValue) -> f64:
+            if value.tag == DesignValues::ValueTag.Integer:
+                return value.int_value.f64()
+            return value.scalar_value
+
+        def property_index(form: DesignForms::Form&, registry: DesignRegistry::Registry&, node: DesignNodes::Node&, component_index: i64, key: sview) -> i64:
+            return DesignNodes::property_index(node, form.strings, key)
+
+        def effective_value(form: DesignForms::Form&, registry: DesignRegistry::Registry&, node: DesignNodes::Node&, component_index: i64, key: sview) -> DesignValues::DesignValue:
+            explicit_index: i64 = property_index(form, registry, node, component_index, key)
+            if explicit_index >= 0:
+                return node.properties[explicit_index.usize()].value
+            descriptor_index: i64 = DesignRegistry::find_property(registry, component_index, key)
+            if descriptor_index < 0:
+                return DesignValues::boolean(false)
+            return registry.components[component_index.usize()].properties[descriptor_index.usize()].default_value
+
+        def effective_text(form: DesignForms::Form&, registry: DesignRegistry::Registry&, node: DesignNodes::Node&, component_index: i64, key: sview) -> sview:
+            explicit_index: i64 = property_index(form, registry, node, component_index, key)
+            if explicit_index >= 0:
+                value: DesignValues::DesignValue = node.properties[explicit_index.usize()].value
+                return DesignValues::text_of(form.strings, value.text_ref)
+            descriptor_index: i64 = DesignRegistry::find_property(registry, component_index, key)
+            return "" if descriptor_index < 0
+            value: DesignValues::DesignValue = registry.components[component_index.usize()].properties[descriptor_index.usize()].default_value
+            return DesignValues::text_of(registry.strings, value.text_ref)
+
+        def effective_number(form: DesignForms::Form&, registry: DesignRegistry::Registry&, node: DesignNodes::Node&, component_index: i64, key: sview) -> f64:
+            return numeric_value(effective_value(form, registry, node, component_index, key))
+
+        def effective_bool(form: DesignForms::Form&, registry: DesignRegistry::Registry&, node: DesignNodes::Node&, component_index: i64, key: sview) -> bool:
+            return effective_value(form, registry, node, component_index, key).bool_value
+
+        def effective_color(form: DesignForms::Form&, registry: DesignRegistry::Registry&, node: DesignNodes::Node&, component_index: i64, key: sview) -> DesignValues::ColorValue:
+            return effective_value(form, registry, node, component_index, key).color_value
+
+        def is_finite(value: f64) -> bool:
+            return value == value and value < 1.7976931348623157e308 and value > -1.7976931348623157e308
+
+        def push_number(out: mutable darray[u8]&, value: f64) -> bool:
+            return false if not is_finite(value)
+            number: mutable darray[u8] = []
+            json_emit_number(&number, value)
+            return false if number.count == 0 or DesignText::equal(DesignText::view_of(number), "null")
+            source: sview = DesignText::view_of(number)
+            push_text(out, source)
+            has_decimal: bool = DesignText::has_text(source, ".") or DesignText::has_text(source, "e") or DesignText::has_text(source, "E")
+            push_text(out, ".0") if not has_decimal
+            return true
+
+        def push_color(out: mutable darray[u8]&, color: DesignValues::ColorValue) -> void:
+            push_text(out, "UiCore::Color{r: ")
+            push_index(out, color.r.i64())
+            push_text(out, ", g: ")
+            push_index(out, color.g.i64())
+            push_text(out, ", b: ")
+            push_index(out, color.b.i64())
+            push_text(out, ", a: ")
+            push_index(out, color.a.i64())
+            push_char(out, 125)
+
+        def push_handle(out: mutable darray[u8]&, operation_index: i64) -> void:
+            push_text(out, "widgets[")
+            push_index(out, operation_index)
+            push_char(out, 93)
+
+        def push_parent(out: mutable darray[u8]&, parent_operation: i64) -> void:
+            if parent_operation < 0:
+                push_text(out, "UiHandles::root_parent()")
+            else:
+                push_handle(out, parent_operation)
+
+        def numeric_argument(out: mutable darray[u8]&, form: DesignForms::Form&, registry: DesignRegistry::Registry&, node: DesignNodes::Node&, component: i64, key: sview) -> bool:
+            return push_number(out, effective_number(form, registry, node, component, key))
+
+        def mapped_numeric_argument(out: mutable darray[u8]&, pending: mutable darray[PendingSpan]&, form: DesignForms::Form&, registry: DesignRegistry::Registry&, node: DesignNodes::Node&, component: i64, source_node: i64, key: sview) -> bool:
+            start_byte: i64 = out.count.i64()
+            emitted: bool = numeric_argument(out, form, registry, node, component, key)
+            if emitted:
+                record_span(pending, start_byte, out.count.i64(), CodegenSourceMap::OriginKind.Property, source_node, key)
+            return emitted
+
+        def mapped_number(out: mutable darray[u8]&, pending: mutable darray[PendingSpan]&, source_node: i64, key: sview, value: f64) -> bool:
+            start_byte: i64 = out.count.i64()
+            emitted: bool = push_number(out, value)
+            if emitted:
+                record_span(pending, start_byte, out.count.i64(), CodegenSourceMap::OriginKind.Property, source_node, key)
+            return emitted
+
+        def mapped_text(out: mutable darray[u8]&, pending: mutable darray[PendingSpan]&, source_node: i64, key: sview, value: sview) -> void:
+            start_byte: i64 = out.count.i64()
+            push_quoted(out, value)
+            record_span(pending, start_byte, out.count.i64(), CodegenSourceMap::OriginKind.Property, source_node, key)
+
+        def mapped_color(out: mutable darray[u8]&, pending: mutable darray[PendingSpan]&, source_node: i64, key: sview, value: DesignValues::ColorValue) -> void:
+            start_byte: i64 = out.count.i64()
+            push_color(out, value)
+            record_span(pending, start_byte, out.count.i64(), CodegenSourceMap::OriginKind.Property, source_node, key)
+
+        def mapped_token(out: mutable darray[u8]&, pending: mutable darray[PendingSpan]&, source_node: i64, key: sview, value: sview) -> void:
+            start_byte: i64 = out.count.i64()
+            push_text(out, value)
+            record_span(pending, start_byte, out.count.i64(), CodegenSourceMap::OriginKind.Property, source_node, key)
+
+        def emit_constructor(out: mutable darray[u8]&, pending: mutable darray[PendingSpan]&, form: DesignForms::Form&, registry: DesignRegistry::Registry&, operation: DesignLower::Operation, operation_index: i64, sink: mutable DesignDiagnostics::Sink&) -> bool:
+            node: DesignNodes::Node = form.nodes[operation.source_node.usize()]
+            component: DesignRegistry::ComponentDescriptor = registry.components[operation.component_index.usize()]
+            type_key: sview = DesignValues::text_of(form.strings, node.type_key)
+            push_text(out, "            widgets[")
+            push_index(out, operation_index)
+            push_text(out, "] <- UiHandles::")
+
+            if DesignText::equal(type_key, "elisa.ui.column") or DesignText::equal(type_key, "elisa.ui.row"):
+                push_text(out, "column(" if DesignText::equal(type_key, "elisa.ui.column") else "row(")
+                push_parent(out, operation.parent_operation)
+                push_text(out, ", ")
+                return false if not mapped_numeric_argument(out, pending, form, registry, node, operation.component_index, operation.source_node, "padding")
+                push_text(out, ", ")
+                return false if not mapped_numeric_argument(out, pending, form, registry, node, operation.component_index, operation.source_node, "spacing")
+                push_text(out, ", ")
+                mapped_color(out, pending, operation.source_node, "background", effective_color(form, registry, node, operation.component_index, "background"))
+                push_text(out, ")\n")
+            elif DesignText::equal(type_key, "elisa.ui.panel"):
+                push_text(out, "panel(")
+                push_parent(out, operation.parent_operation)
+                push_text(out, ", ")
+                mapped_token(out, pending, operation.source_node, "axis", "UiConst::Axis.Row" if DesignText::equal(effective_text(form, registry, node, operation.component_index, "axis"), "row") else "UiConst::Axis.Column")
+                push_text(out, ", ")
+                return false if not mapped_numeric_argument(out, pending, form, registry, node, operation.component_index, operation.source_node, "padding")
+                push_text(out, ", ")
+                return false if not mapped_numeric_argument(out, pending, form, registry, node, operation.component_index, operation.source_node, "spacing")
+                push_text(out, ", ")
+                mapped_color(out, pending, operation.source_node, "background", effective_color(form, registry, node, operation.component_index, "background"))
+                push_text(out, ")\n")
+            elif DesignText::equal(type_key, "elisa.ui.label"):
+                push_text(out, "label(")
+                push_parent(out, operation.parent_operation)
+                push_text(out, ", ")
+                mapped_text(out, pending, operation.source_node, "text", effective_text(form, registry, node, operation.component_index, "text"))
+                push_text(out, ", ")
+                return false if not mapped_numeric_argument(out, pending, form, registry, node, operation.component_index, operation.source_node, "size")
+                push_text(out, ", ")
+                mapped_color(out, pending, operation.source_node, "color", effective_color(form, registry, node, operation.component_index, "color"))
+                push_text(out, ")\n")
+            elif DesignText::equal(type_key, "elisa.ui.button"):
+                push_text(out, "button(")
+                push_parent(out, operation.parent_operation)
+                push_text(out, ", ")
+                return false if not mapped_numeric_argument(out, pending, form, registry, node, operation.component_index, operation.source_node, "minimumWidth")
+                push_text(out, ", ")
+                return false if not mapped_numeric_argument(out, pending, form, registry, node, operation.component_index, operation.source_node, "minimumHeight")
+                push_text(out, ", ")
+                mapped_color(out, pending, operation.source_node, "color", effective_color(form, registry, node, operation.component_index, "color"))
+                push_text(out, ", ")
+                mapped_color(out, pending, operation.source_node, "hoverColor", effective_color(form, registry, node, operation.component_index, "hoverColor"))
+                push_text(out, ", ")
+                mapped_color(out, pending, operation.source_node, "pressColor", effective_color(form, registry, node, operation.component_index, "pressColor"))
+                push_text(out, ")\n")
+            elif DesignText::equal(type_key, "elisa.ui.text_field"):
+                push_text(out, "text_field(")
+                push_parent(out, operation.parent_operation)
+                push_text(out, ", ")
+                mapped_text(out, pending, operation.source_node, "label", effective_text(form, registry, node, operation.component_index, "label"))
+                push_text(out, ", ")
+                mapped_text(out, pending, operation.source_node, "placeholder", effective_text(form, registry, node, operation.component_index, "placeholder"))
+                push_text(out, ", ")
+                mapped_text(out, pending, operation.source_node, "initial", effective_text(form, registry, node, operation.component_index, "initial"))
+                push_text(out, ", ")
+                return false if not mapped_numeric_argument(out, pending, form, registry, node, operation.component_index, operation.source_node, "minimumWidth")
+                push_text(out, ", ")
+                return false if not mapped_numeric_argument(out, pending, form, registry, node, operation.component_index, operation.source_node, "minimumHeight")
+                push_text(out, ", ")
+                return false if not mapped_numeric_argument(out, pending, form, registry, node, operation.component_index, operation.source_node, "size")
+                push_text(out, ", ")
+                mapped_color(out, pending, operation.source_node, "ink", effective_color(form, registry, node, operation.component_index, "ink"))
+                push_text(out, ", ")
+                mapped_color(out, pending, operation.source_node, "fill", effective_color(form, registry, node, operation.component_index, "fill"))
+                push_text(out, ")\n")
+            else:
+                _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.UnsupportedTarget, "component", "the selected component has no source constructor mapping")
+                return false
+
+            return true
+
+        def emit_style(out: mutable darray[u8]&, pending: mutable darray[PendingSpan]&, form: DesignForms::Form&, registry: DesignRegistry::Registry&, operation: DesignLower::Operation, operation_index: i64) -> bool:
+            node: DesignNodes::Node = form.nodes[operation.source_node.usize()]
+            type_key: sview = DesignValues::text_of(form.strings, node.type_key)
+            handle_out: mutable darray[u8] = []
+            push_handle(&handle_out, operation_index)
+            handle: sview = DesignText::view_of(handle_out)
+
+            push_text(out, "            if not UiHandles::is_valid(")
+            push_text(out, handle)
+            push_text(out, "): return false\n")
+
+            if DesignRegistry::find_property(registry, operation.component_index, "grow") >= 0:
+                push_text(out, "            UiHandles::set_grow(")
+                push_text(out, handle)
+                push_text(out, ", ")
+                return false if not mapped_numeric_argument(out, pending, form, registry, node, operation.component_index, operation.source_node, "grow")
+                push_text(out, ")\n")
+
+            if DesignRegistry::find_property(registry, operation.component_index, "minimumWidth") >= 0 and not DesignText::equal(type_key, "elisa.ui.label"):
+                push_text(out, "            UiHandles::set_min_size(")
+                push_text(out, handle)
+                push_text(out, ", ")
+                return false if not mapped_numeric_argument(out, pending, form, registry, node, operation.component_index, operation.source_node, "minimumWidth")
+                push_text(out, ", ")
+                min_height: f64 = effective_number(form, registry, node, operation.component_index, "minimumHeight") if DesignRegistry::find_property(registry, operation.component_index, "minimumHeight") >= 0 else 0.0
+                return false if not mapped_number(out, pending, operation.source_node, "minimumHeight", min_height)
+                push_text(out, ")\n")
+
+            if DesignRegistry::find_property(registry, operation.component_index, "margin") >= 0:
+                push_text(out, "            UiHandles::set_margin(")
+                push_text(out, handle)
+                push_text(out, ", ")
+                return false if not mapped_numeric_argument(out, pending, form, registry, node, operation.component_index, operation.source_node, "margin")
+                push_text(out, ")\n")
+
+            if DesignRegistry::find_property(registry, operation.component_index, "crossAlignment") >= 0:
+                alignment: sview = effective_text(form, registry, node, operation.component_index, "crossAlignment")
+                push_text(out, "            UiHandles::set_cross_alignment(")
+                push_text(out, handle)
+                push_text(out, ", ")
+                mapped_token(out, pending, operation.source_node, "crossAlignment", "UiConst::CrossAlignment.Stretch" if DesignText::equal(alignment, "stretch") else "UiConst::CrossAlignment.Start" if DesignText::equal(alignment, "start") else "UiConst::CrossAlignment.Center" if DesignText::equal(alignment, "center") else "UiConst::CrossAlignment.End")
+                push_text(out, ")\n")
+
+            if DesignRegistry::find_property(registry, operation.component_index, "mainAlignment") >= 0:
+                alignment: sview = effective_text(form, registry, node, operation.component_index, "mainAlignment")
+                push_text(out, "            UiHandles::set_main_alignment(")
+                push_text(out, handle)
+                push_text(out, ", ")
+                mapped_token(out, pending, operation.source_node, "mainAlignment", "UiConst::MainAlignment.Start" if DesignText::equal(alignment, "start") else "UiConst::MainAlignment.Center" if DesignText::equal(alignment, "center") else "UiConst::MainAlignment.End" if DesignText::equal(alignment, "end") else "UiConst::MainAlignment.SpaceBetween")
+                push_text(out, ")\n")
+
+            if DesignText::equal(type_key, "elisa.ui.button"):
+                push_text(out, "            UiHandles::set_text(")
+                push_text(out, handle)
+                push_text(out, ", ")
+                mapped_text(out, pending, operation.source_node, "text", effective_text(form, registry, node, operation.component_index, "text"))
+                push_text(out, ", ")
+                return false if not mapped_numeric_argument(out, pending, form, registry, node, operation.component_index, operation.source_node, "size")
+                push_text(out, ", ")
+                mapped_color(out, pending, operation.source_node, "textColor", effective_color(form, registry, node, operation.component_index, "textColor"))
+                push_text(out, ")\n")
+                push_text(out, "            UiHandles::set_enabled(")
+                push_text(out, handle)
+                push_text(out, ", ")
+                mapped_token(out, pending, operation.source_node, "enabled", "true" if effective_bool(form, registry, node, operation.component_index, "enabled") else "false")
+                push_text(out, ")\n")
+
+            if DesignText::equal(type_key, "elisa.ui.text_field"):
+                push_text(out, "            UiHandles::set_secure(")
+                push_text(out, handle)
+                push_text(out, ", ")
+                mapped_token(out, pending, operation.source_node, "secure", "true" if effective_bool(form, registry, node, operation.component_index, "secure") else "false")
+                push_text(out, ")\n")
+
+            if DesignRegistry::find_property(registry, operation.component_index, "visible") >= 0:
+                push_text(out, "            UiHandles::set_visible(")
+                push_text(out, handle)
+                push_text(out, ", ")
+                shown: bool = effective_bool(form, registry, node, operation.component_index, "visible") and not node.runtime_hidden
+                mapped_token(out, pending, operation.source_node, "visible", "true" if shown else "false")
+                push_text(out, ")\n")
+            return true
+
+        def event_kind(event: sview) -> sview:
+            if DesignText::equal(event, "click"):
+                return "UiConst::WidgetEvent.Click"
+            if DesignText::equal(event, "change"):
+                return "UiConst::WidgetEvent.Change"
+            if DesignText::equal(event, "submit"):
+                return "UiConst::WidgetEvent.Submit"
+            return "UiConst::WidgetEvent.Click"
+
+        def emit_dispatch(out: mutable darray[u8]&, pending: mutable darray[PendingSpan]&, form: DesignForms::Form&, lowered: DesignLower::LoweredForm) -> void:
+            push_text(out, "        def dispatch_widget_event(widget: usize, event: i32) -> void:\n")
+            operation_index: mutable i64 = 0
+            while operation_index < lowered.operations.count.i64():
+                operation: DesignLower::Operation = lowered.operations[operation_index.usize()]
+                node: DesignNodes::Node = form.nodes[operation.source_node.usize()]
+                event_index: mutable i64 = 0
+                while event_index < node.events.count.i64():
+                    connection: DesignNodes::EventConnection = node.events[event_index.usize()]
+                    event_start: i64 = out.count.i64()
+                    push_text(out, "            if UiHandles::event_is(event, ")
+                    push_text(out, event_kind(DesignValues::text_of(form.strings, connection.event_key)))
+                    push_text(out, ") and UiHandles::callback_matches(widget, ")
+                    push_handle(out, operation_index)
+                    push_text(out, "):\n                ")
+                    push_text(out, DesignValues::text_of(form.strings, connection.handler))
+                    push_text(out, "(widget, event)\n                return\n")
+                    record_span(pending, event_start, out.count.i64(), CodegenSourceMap::OriginKind.Event, operation.source_node, DesignValues::text_of(form.strings, connection.event_key))
+                    event_index <- event_index + 1
+                operation_index <- operation_index + 1
+
+        def build_source_map(source: darray[u8], form: DesignForms::Form&, pending: darray[PendingSpan]) -> CodegenSourceMap::SourceMap:
+            source_text: sview = DesignText::view_of(source)
+            map: mutable CodegenSourceMap::SourceMap = CodegenSourceMap::empty(source_text)
+            form_id_bytes: mutable u8[24] = zeroed
+            form_id_text: sview = DesignIds::text(&form.id, &form_id_bytes)
+            index: mutable i64 = 0
+            while index < pending.count.i64():
+                span: PendingSpan = pending[index.usize()]
+                node_id_text: mutable sview = ""
+                node_id_bytes: mutable u8[24] = zeroed
+                if span.source_node >= 0 and span.source_node < form.nodes.count.i64():
+                    node_id_text <- DesignIds::text(&form.nodes[span.source_node.usize()].id, &node_id_bytes)
+                added: bool = CodegenSourceMap::add_span(&map, span.start_byte, span.end_byte, span.kind, form_id_text, node_id_text, span.member)
+                if not added:
+                    map.version <- -1
+                    return map
+                index <- index + 1
+            return map
+
+    public:
+        struct Emission:
+            source: mutable darray[u8]
+            source_map: mutable CodegenSourceMap::SourceMap
+            valid: mutable bool
+
+        def emit_view(form: DesignForms::Form&, registry: DesignRegistry::Registry&, lowered: DesignLower::LoweredForm, sink: mutable DesignDiagnostics::Sink&) -> Emission:
+            empty: mutable Emission = Emission{source: [], source_map: CodegenSourceMap::empty(""), valid: false}
+            if not lowered.valid:
+                _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.UnsupportedTarget, "generation", "generation requires a valid lowered form")
+                return empty
+
+            out: mutable darray[u8] = []
+            pending: mutable darray[PendingSpan] = []
+            push_text(&out, "# Generated by Elisa IDE. Do not edit; change the form document or handwritten application source.\n")
+            form_span_start: i64 = out.count.i64()
+            push_text(&out, "module ")
+            push_text(&out, DesignValues::text_of(form.strings, form.module_symbol))
+            push_text(&out, ":\n")
+            record_span(&pending, form_span_start, out.count.i64(), CodegenSourceMap::OriginKind.Form, -1, "")
+            push_text(&out, "    private:\n        global mutable widgets: UiHandles::Handle[")
+            push_index(&out, lowered.operations.count.i64())
+            push_text(&out, "] = zeroed\n\n    public:\n        def build() -> bool:\n")
+            push_text(&out, "            UiHandles::reset()\n")
+
+            operation_index: mutable i64 = 0
+            while operation_index < lowered.operations.count.i64():
+                operation: DesignLower::Operation = lowered.operations[operation_index.usize()]
+                node_span_start: i64 = out.count.i64()
+                return empty if not emit_constructor(&out, &pending, form, registry, operation, operation_index, sink)
+                return empty if not emit_style(&out, &pending, form, registry, operation, operation_index)
+                record_span(&pending, node_span_start, out.count.i64(), CodegenSourceMap::OriginKind.Node, operation.source_node, "")
+                operation_index <- operation_index + 1
+
+            push_text(&out, "            return true\n\n")
+            emit_dispatch(&out, &pending, form, lowered)
+            record_span(&pending, 0, out.count.i64(), CodegenSourceMap::OriginKind.Template, -1, "elisa.ui.generated-view")
+            source_map: mutable CodegenSourceMap::SourceMap = build_source_map(out, form, pending)
+            source_view: sview = DesignText::view_of(out)
+            map_validation: CodegenSourceMap::Validation = CodegenSourceMap::validate(source_map, source_view)
+            if not map_validation.ok:
+                _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.InvalidReference, "generation.source-map", "generated source map does not validate against emitted bytes")
+                return empty
+            return Emission{source: out, source_map: source_map, valid: true}

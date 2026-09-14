@@ -1,0 +1,184 @@
+# Typed preview payload codecs reject unsafe layouts and malformed geometry.
+
+include "../../src/preview/preview_payloads.elisa"
+include "../model/test_support.elisa"
+
+module PreviewPayloadsTest:
+    private:
+        def wire(bytes: darray[u8]) -> sview:
+            return bytes_view(bytes)
+
+        def set_u32(bytes: mutable darray[u8]&, start: i64, value: u32) -> void:
+            for shift in 0..<4:
+                bytes[(start + shift).usize()] <- ((value >> (shift * 8)) & 255).u8()
+
+        def set_u64(bytes: mutable darray[u8]&, start: i64, value: u64) -> void:
+            for shift in 0..<8:
+                bytes[(start + shift).usize()] <- ((value >> (shift * 8)) & 255).u8()
+
+        def near(actual: f64, expected: f64) -> bool:
+            delta: f64 = actual - expected
+            return delta >= -0.001 and delta <= 0.001
+
+        def viewport_bytes() -> darray[u8]:
+            encoded: PreviewPayloads::ViewportEncodeResult = PreviewPayloads::encode_viewport(PreviewPayloads::Viewport{width: 800.5, height: 600.25, device_scale_milli: 1250})
+            return encoded.bytes
+
+        def frame_bytes(pixels: sview) -> darray[u8]:
+            encoded: PreviewPayloads::FrameEncodeResult = PreviewPayloads::encode_frame(PreviewPayloads::Frame{frame_id: 0x0102030405060708, width: 3, height: 2, bytes_per_pixel: 4, row_stride: 16, pixels: pixels})
+            return encoded.bytes
+
+        def geometry_value() -> PreviewPayloads::Geometry:
+            records: mutable darray[PreviewPayloads::GeometryRecord] = []
+            records.push(PreviewPayloads::GeometryRecord{id: "node-a", bounds: DesignGeometry::rect(10.125, 20.333, 80.5, 44.25), clip: DesignGeometry::rect(0.25, 0.5, 100.0, 80.0), visible: true, selectable: true})
+            records.push(PreviewPayloads::GeometryRecord{id: "node-b", bounds: DesignGeometry::rect(0.0, 0.0, 1.0, 1.0), clip: DesignGeometry::rect(0.0, 0.0, 20.0, 20.0), visible: false, selectable: true})
+            return PreviewPayloads::Geometry{records: records}
+
+        def geometry_bytes() -> darray[u8]:
+            encoded: PreviewPayloads::GeometryEncodeResult = PreviewPayloads::encode_geometry(geometry_value())
+            return encoded.bytes
+
+    public:
+        def run() -> i64:
+            viewport: PreviewPayloads::Viewport = PreviewPayloads::Viewport{width: 800.5, height: 600.25, device_scale_milli: 1250}
+            viewport_encoded: PreviewPayloads::ViewportEncodeResult = PreviewPayloads::encode_viewport(viewport)
+            viewport_decoded: PreviewPayloads::ViewportDecodeResult = PreviewPayloads::decode_viewport(wire(viewport_encoded.bytes))
+            TestSupport::check("viewport schema round-trips logical size and deterministic device scale", viewport_encoded.code == PreviewPayloads::Issue.None and viewport_encoded.bytes.count.i64() == 28 and viewport_encoded.bytes[0] == 69 and viewport_encoded.bytes[1] == 76 and viewport_encoded.bytes[2] == 80 and viewport_encoded.bytes[3] == 68 and viewport_encoded.bytes[4] == 1 and viewport_encoded.bytes[5] == 0 and viewport_decoded.code == PreviewPayloads::Issue.None and near(viewport_decoded.value.width, 800.5) and near(viewport_decoded.value.height, 600.25) and viewport_decoded.value.device_scale_milli == 1250)
+
+            short_viewport: darray[u8] = viewport_bytes()
+            short_viewport_view: PreviewPayloads::ViewportDecodeResult = PreviewPayloads::decode_viewport(string_view_prefix(wire(short_viewport), short_viewport.count.i64() - 1))
+            TestSupport::check("viewport rejects truncated records", short_viewport_view.code == PreviewPayloads::Issue.Truncated)
+            extra_viewport: mutable darray[u8] = viewport_bytes()
+            extra_viewport.push(0)
+            extra_viewport_view: PreviewPayloads::ViewportDecodeResult = PreviewPayloads::decode_viewport(wire(extra_viewport))
+            TestSupport::check("viewport rejects trailing bytes", extra_viewport_view.code == PreviewPayloads::Issue.TrailingBytes)
+            bad_viewport_version: mutable darray[u8] = viewport_bytes()
+            bad_viewport_version[4.usize()] <- 2
+            bad_viewport_version_result: PreviewPayloads::ViewportDecodeResult = PreviewPayloads::decode_viewport(wire(bad_viewport_version))
+            TestSupport::check("viewport rejects unsupported schema versions", bad_viewport_version_result.code == PreviewPayloads::Issue.InvalidVersion)
+            bad_viewport_kind: mutable darray[u8] = viewport_bytes()
+            bad_viewport_kind[6.usize()] <- 2
+            bad_viewport_kind_result: PreviewPayloads::ViewportDecodeResult = PreviewPayloads::decode_viewport(wire(bad_viewport_kind))
+            TestSupport::check("viewport rejects another payload kind", bad_viewport_kind_result.code == PreviewPayloads::Issue.InvalidPayloadKind)
+            zero_width: mutable darray[u8] = viewport_bytes()
+            set_u64(&zero_width, 8, 0)
+            zero_width_result: PreviewPayloads::ViewportDecodeResult = PreviewPayloads::decode_viewport(wire(zero_width))
+            TestSupport::check("viewport rejects zero dimensions", zero_width_result.code == PreviewPayloads::Issue.InvalidDimensions)
+            huge_width: mutable darray[u8] = viewport_bytes()
+            set_u64(&huge_width, 8, 1024000000000001)
+            huge_width_result: PreviewPayloads::ViewportDecodeResult = PreviewPayloads::decode_viewport(wire(huge_width))
+            TestSupport::check("viewport rejects logical sizes outside the safe fixed-point range", huge_width_result.code == PreviewPayloads::Issue.InvalidDimensions)
+            bad_scale: mutable darray[u8] = viewport_bytes()
+            set_u32(&bad_scale, 24, 0)
+            bad_scale_result: PreviewPayloads::ViewportDecodeResult = PreviewPayloads::decode_viewport(wire(bad_scale))
+            TestSupport::check("viewport requires a nonzero device scale", bad_scale_result.code == PreviewPayloads::Issue.InvalidDeviceScale)
+            excessive_scale: mutable darray[u8] = viewport_bytes()
+            set_u32(&excessive_scale, 24, PreviewPayloads::MAX_DEVICE_SCALE + 1)
+            excessive_scale_result: PreviewPayloads::ViewportDecodeResult = PreviewPayloads::decode_viewport(wire(excessive_scale))
+            TestSupport::check("viewport bounds device scale to a safe deterministic range", excessive_scale_result.code == PreviewPayloads::Issue.InvalidDeviceScale)
+            invalid_viewport_encode: PreviewPayloads::ViewportEncodeResult = PreviewPayloads::encode_viewport(PreviewPayloads::Viewport{width: -1.0, height: 2.0, device_scale_milli: 1000})
+            TestSupport::check("viewport encoder rejects negative logical dimensions before emitting bytes", invalid_viewport_encode.code == PreviewPayloads::Issue.InvalidDimensions and invalid_viewport_encode.bytes.count == 0)
+
+            pixels: mutable darray[u8] = [0, 1, 2, 3, 0, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]
+            pixels_view: sview = wire(pixels)
+            frame: PreviewPayloads::Frame = PreviewPayloads::Frame{frame_id: 0x0102030405060708, width: 3, height: 2, bytes_per_pixel: 4, row_stride: 16, pixels: pixels_view}
+            frame_encoded: PreviewPayloads::FrameEncodeResult = PreviewPayloads::encode_frame(frame)
+            frame_decoded: PreviewPayloads::FrameDecodeResult = PreviewPayloads::decode_frame(wire(frame_encoded.bytes))
+            TestSupport::check("frame-ready schema round-trips metadata and preserves embedded NUL pixel bytes", frame_encoded.code == PreviewPayloads::Issue.None and frame_decoded.code == PreviewPayloads::Issue.None and frame_decoded.value.frame_id == frame.frame_id and frame_decoded.value.width == frame.width and frame_decoded.value.height == frame.height and frame_decoded.value.bytes_per_pixel == frame.bytes_per_pixel and frame_decoded.value.row_stride == frame.row_stride and frame_decoded.value.pixels.len == pixels_view.len and frame_decoded.value.pixels[0] == 0 and frame_decoded.value.pixels[4] == 0 and frame_decoded.value.pixels[31] == 31)
+            short_frame: darray[u8] = frame_bytes(pixels_view)
+            short_frame_result: PreviewPayloads::FrameDecodeResult = PreviewPayloads::decode_frame(string_view_prefix(wire(short_frame), short_frame.count.i64() - 1))
+            TestSupport::check("frame-ready rejects truncated image data", short_frame_result.code == PreviewPayloads::Issue.Truncated)
+            extra_frame: mutable darray[u8] = frame_bytes(pixels_view)
+            extra_frame.push(0)
+            extra_frame_result: PreviewPayloads::FrameDecodeResult = PreviewPayloads::decode_frame(wire(extra_frame))
+            TestSupport::check("frame-ready rejects trailing image data", extra_frame_result.code == PreviewPayloads::Issue.TrailingBytes)
+            zero_frame_id: mutable darray[u8] = frame_bytes(pixels_view)
+            set_u64(&zero_frame_id, 8, 0)
+            zero_frame_id_result: PreviewPayloads::FrameDecodeResult = PreviewPayloads::decode_frame(wire(zero_frame_id))
+            TestSupport::check("frame-ready requires a nonzero frame identifier", zero_frame_id_result.code == PreviewPayloads::Issue.InvalidFrameId)
+            bad_frame_bpp: mutable darray[u8] = frame_bytes(pixels_view)
+            bad_frame_bpp[24.usize()] <- 5
+            bad_frame_bpp_result: PreviewPayloads::FrameDecodeResult = PreviewPayloads::decode_frame(wire(bad_frame_bpp))
+            TestSupport::check("frame-ready rejects unsupported pixel widths", bad_frame_bpp_result.code == PreviewPayloads::Issue.InvalidBytesPerPixel)
+            bad_frame_dims: mutable darray[u8] = frame_bytes(pixels_view)
+            set_u32(&bad_frame_dims, 20, 0)
+            bad_frame_dims_result: PreviewPayloads::FrameDecodeResult = PreviewPayloads::decode_frame(wire(bad_frame_dims))
+            TestSupport::check("frame-ready rejects zero image dimensions", bad_frame_dims_result.code == PreviewPayloads::Issue.InvalidDimensions)
+            bad_frame_stride: mutable darray[u8] = frame_bytes(pixels_view)
+            set_u32(&bad_frame_stride, 28, 8)
+            bad_frame_stride_result: PreviewPayloads::FrameDecodeResult = PreviewPayloads::decode_frame(wire(bad_frame_stride))
+            TestSupport::check("frame-ready rejects undersized row stride", bad_frame_stride_result.code == PreviewPayloads::Issue.InvalidStride)
+            bad_frame_reserved: mutable darray[u8] = frame_bytes(pixels_view)
+            bad_frame_reserved[26.usize()] <- 1
+            bad_frame_reserved_result: PreviewPayloads::FrameDecodeResult = PreviewPayloads::decode_frame(wire(bad_frame_reserved))
+            TestSupport::check("frame-ready reserved bits must remain zero", bad_frame_reserved_result.code == PreviewPayloads::Issue.ReservedBitsSet)
+            wrong_pixel_length: mutable darray[u8] = frame_bytes(pixels_view)
+            set_u32(&wrong_pixel_length, 32, 31)
+            wrong_pixel_length_result: PreviewPayloads::FrameDecodeResult = PreviewPayloads::decode_frame(wire(wrong_pixel_length))
+            TestSupport::check("frame-ready declared byte count must equal stride times height", wrong_pixel_length_result.code == PreviewPayloads::Issue.InvalidImageLength)
+            huge_frame: mutable darray[u8] = frame_bytes(pixels_view)
+            set_u32(&huge_frame, 16, 1)
+            set_u32(&huge_frame, 20, 0xffffffff)
+            set_u32(&huge_frame, 28, 4)
+            huge_frame_result: PreviewPayloads::FrameDecodeResult = PreviewPayloads::decode_frame(wire(huge_frame))
+            TestSupport::check("frame-ready rejects overflowing and over-limit image extents", huge_frame_result.code == PreviewPayloads::Issue.ImageTooLarge)
+            invalid_frame_encode: PreviewPayloads::FrameEncodeResult = PreviewPayloads::encode_frame(PreviewPayloads::Frame{frame_id: 1, width: 3, height: 2, bytes_per_pixel: 4, row_stride: 16, pixels: string_view_prefix(pixels_view, 31)})
+            TestSupport::check("frame-ready encoder rejects a pixel buffer with the wrong byte length", invalid_frame_encode.code == PreviewPayloads::Issue.InvalidImageLength and invalid_frame_encode.bytes.count == 0)
+
+            geometry: PreviewPayloads::Geometry = geometry_value()
+            geometry_encoded: PreviewPayloads::GeometryEncodeResult = PreviewPayloads::encode_geometry(geometry)
+            geometry_decoded: PreviewPayloads::GeometryDecodeResult = PreviewPayloads::decode_geometry(wire(geometry_encoded.bytes))
+            TestSupport::check("geometry snapshot round-trips bounds, clip, stable IDs, visibility, and selectability", geometry_encoded.code == PreviewPayloads::Issue.None and geometry_decoded.code == PreviewPayloads::Issue.None and geometry_decoded.value.records.count == 2 and DesignText::equal(geometry_decoded.value.records[0.usize()].id, "node-a") and DesignText::equal(geometry_decoded.value.records[1.usize()].id, "node-b") and near(geometry_decoded.value.records[0.usize()].bounds.x, 10.125) and near(geometry_decoded.value.records[0.usize()].bounds.y, 20.333) and near(geometry_decoded.value.records[0.usize()].bounds.width, 80.5) and near(geometry_decoded.value.records[0.usize()].bounds.height, 44.25) and near(geometry_decoded.value.records[0.usize()].clip.x, 0.25) and near(geometry_decoded.value.records[0.usize()].clip.y, 0.5) and near(geometry_decoded.value.records[0.usize()].clip.width, 100.0) and near(geometry_decoded.value.records[0.usize()].clip.height, 80.0) and geometry_decoded.value.records[0.usize()].visible and geometry_decoded.value.records[0.usize()].selectable and not geometry_decoded.value.records[1.usize()].visible and geometry_decoded.value.records[1.usize()].selectable)
+            short_geometry: darray[u8] = geometry_bytes()
+            short_geometry_result: PreviewPayloads::GeometryDecodeResult = PreviewPayloads::decode_geometry(string_view_prefix(wire(short_geometry), short_geometry.count.i64() - 1))
+            TestSupport::check("geometry snapshot rejects a truncated record", short_geometry_result.code == PreviewPayloads::Issue.Truncated)
+            trailing_geometry: mutable darray[u8] = geometry_bytes()
+            trailing_geometry.push(0)
+            trailing_geometry_result: PreviewPayloads::GeometryDecodeResult = PreviewPayloads::decode_geometry(wire(trailing_geometry))
+            TestSupport::check("geometry snapshot rejects trailing bytes", trailing_geometry_result.code == PreviewPayloads::Issue.TrailingBytes)
+            too_many_geometry: mutable darray[u8] = geometry_bytes()
+            set_u32(&too_many_geometry, 8, (PreviewPayloads::MAX_GEOMETRY_RECORDS + 1).u32())
+            too_many_geometry_result: PreviewPayloads::GeometryDecodeResult = PreviewPayloads::decode_geometry(wire(too_many_geometry))
+            TestSupport::check("geometry record count is bounded before record parsing", too_many_geometry_result.code == PreviewPayloads::Issue.TooManyGeometryRecords)
+            empty_id_geometry: mutable darray[u8] = geometry_bytes()
+            empty_id_geometry[12.usize()] <- 0
+            empty_id_result: PreviewPayloads::GeometryDecodeResult = PreviewPayloads::decode_geometry(wire(empty_id_geometry))
+            TestSupport::check("geometry snapshot rejects empty stable IDs", empty_id_result.code == PreviewPayloads::Issue.InvalidId)
+            invalid_id_geometry: mutable darray[u8] = geometry_bytes()
+            invalid_id_geometry[13.usize()] <- 95
+            invalid_id_result: PreviewPayloads::GeometryDecodeResult = PreviewPayloads::decode_geometry(wire(invalid_id_geometry))
+            TestSupport::check("geometry snapshot rejects noncanonical identity bytes", invalid_id_result.code == PreviewPayloads::Issue.InvalidId)
+            long_id_geometry: mutable darray[u8] = geometry_bytes()
+            long_id_geometry[12.usize()] <- 25
+            long_id_result: PreviewPayloads::GeometryDecodeResult = PreviewPayloads::decode_geometry(wire(long_id_geometry))
+            TestSupport::check("geometry snapshot rejects IDs longer than the stable-ID bound", long_id_result.code == PreviewPayloads::Issue.InvalidId)
+            duplicate_id_geometry: mutable darray[u8] = geometry_bytes()
+            duplicate_id_geometry[90.usize()] <- 97
+            duplicate_id_result: PreviewPayloads::GeometryDecodeResult = PreviewPayloads::decode_geometry(wire(duplicate_id_geometry))
+            TestSupport::check("geometry snapshot rejects duplicate stable IDs", duplicate_id_result.code == PreviewPayloads::Issue.DuplicateId)
+            bad_geometry_flags: mutable darray[u8] = geometry_bytes()
+            bad_geometry_flags[83.usize()] <- 4
+            bad_geometry_flags_result: PreviewPayloads::GeometryDecodeResult = PreviewPayloads::decode_geometry(wire(bad_geometry_flags))
+            TestSupport::check("geometry snapshot rejects reserved flag bits", bad_geometry_flags_result.code == PreviewPayloads::Issue.ReservedBitsSet)
+            huge_rect_geometry: mutable darray[u8] = geometry_bytes()
+            set_u64(&huge_rect_geometry, 19, 1024000000000001)
+            huge_rect_result: PreviewPayloads::GeometryDecodeResult = PreviewPayloads::decode_geometry(wire(huge_rect_geometry))
+            TestSupport::check("geometry snapshot rejects coordinates outside the safe finite range", huge_rect_result.code == PreviewPayloads::Issue.InvalidRectangle)
+            negative_rect_encode: PreviewPayloads::GeometryEncodeResult = PreviewPayloads::encode_geometry(PreviewPayloads::Geometry{records: [PreviewPayloads::GeometryRecord{id: "node-x", bounds: DesignGeometry::rect(-1.0, 0.0, 2.0, 2.0), clip: DesignGeometry::rect(0.0, 0.0, 20.0, 20.0), visible: true, selectable: true}]})
+            TestSupport::check("geometry encoder rejects negative rectangles", negative_rect_encode.code == PreviewPayloads::Issue.InvalidRectangle and negative_rect_encode.bytes.count == 0)
+            invalid_clip_encode: PreviewPayloads::GeometryEncodeResult = PreviewPayloads::encode_geometry(PreviewPayloads::Geometry{records: [PreviewPayloads::GeometryRecord{id: "node-c", bounds: DesignGeometry::rect(0.0, 0.0, 2.0, 2.0), clip: DesignGeometry::rect(0.0, 0.0, 0.0, 2.0), visible: true, selectable: false}]})
+            TestSupport::check("geometry encoder requires positive clip viewport dimensions", invalid_clip_encode.code == PreviewPayloads::Issue.InvalidRectangle and invalid_clip_encode.bytes.count == 0)
+            bad_id_encode: PreviewPayloads::GeometryEncodeResult = PreviewPayloads::encode_geometry(PreviewPayloads::Geometry{records: [PreviewPayloads::GeometryRecord{id: "node_bad", bounds: DesignGeometry::rect(0.0, 0.0, 2.0, 2.0), clip: DesignGeometry::rect(0.0, 0.0, 20.0, 20.0), visible: true, selectable: true}]})
+            TestSupport::check("geometry encoder rejects invalid stable IDs", bad_id_encode.code == PreviewPayloads::Issue.InvalidId and bad_id_encode.bytes.count == 0)
+            too_many_records: mutable darray[PreviewPayloads::GeometryRecord] = []
+            record_index: mutable i64 = 0
+            while record_index <= PreviewPayloads::MAX_GEOMETRY_RECORDS:
+                too_many_records.push(PreviewPayloads::GeometryRecord{id: "node-a", bounds: DesignGeometry::rect(0.0, 0.0, 1.0, 1.0), clip: DesignGeometry::rect(0.0, 0.0, 2.0, 2.0), visible: true, selectable: true})
+                record_index <- record_index + 1
+            too_many_encode: PreviewPayloads::GeometryEncodeResult = PreviewPayloads::encode_geometry(PreviewPayloads::Geometry{records: too_many_records})
+            TestSupport::check("geometry encoder enforces the record count limit", too_many_encode.code == PreviewPayloads::Issue.TooManyGeometryRecords and too_many_encode.bytes.count == 0)
+
+            return TestSupport::report("preview_payloads")
+
+def main() -> i64:
+    return PreviewPayloadsTest::run()

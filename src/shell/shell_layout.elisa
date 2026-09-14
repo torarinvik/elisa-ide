@@ -1,0 +1,114 @@
+# Designer shell view state and panel layout.
+#
+# The shell is a UI compilation unit (elisa-ui framework only; see ADR-001).
+# It holds handles for the fixed panes and their rows. Rows are retained
+# widgets rebuilt when the model projection changes, not one widget per
+# document node held forever: with a 256-widget arena, a virtual window over
+# the visible rows is the only honest way to show a large hierarchy or
+# inspector (ADR-008).
+#
+# This module owns geometry and painting policy. Document truth lives in the
+# core unit and reaches the shell through `DesignerSession`.
+
+include "../../framework/src/platform/sdl3/ui_sdl3_flat.elisa"
+
+module ShellLayout:
+    public:
+        # Pane rectangles in logical shell coordinates, resolved from the live
+        # viewport each frame. Ratio fields are workspace preferences, not form
+        # properties (section 9.2).
+        struct PaneRects:
+            menu_top: mutable f32
+            toolbar_top: mutable f32
+            body_top: mutable f32
+            body_bottom: mutable f32
+            left_width: mutable f32
+            right_width: mutable f32
+            bottom_height: mutable f32
+
+        # Minimum widths so a pane cannot collapse into an unusable hit target.
+        const MIN_LEFT: f32 = 180.0
+        const MIN_RIGHT: f32 = 220.0
+        const MIN_BOTTOM: f32 = 90.0
+        const MIN_CENTER: f32 = 240.0
+        const MENU_HEIGHT: f32 = 26.0
+        const TOOLBAR_HEIGHT: f32 = 34.0
+        const STATUS_HEIGHT: f32 = 22.0
+        const COMPACT_BREAKPOINT: f32 = 820.0
+
+        # Split ratios are fractions of the body area. They are clamped so the
+        # center always keeps MIN_CENTER and no side pane drops below its
+        # minimum, which is why a stored ratio can never produce a broken shell.
+        def resolve(width: f32, height: f32, left_ratio: f32, right_ratio: f32, bottom_ratio: f32) -> PaneRects:
+            safe_width: f32 = width if width > 320.0 else 320.0
+            safe_height: f32 = height if height > 240.0 else 240.0
+            menu_top: f32 = 0.0
+            toolbar_top: f32 = MENU_HEIGHT
+            body_top: f32 = MENU_HEIGHT + TOOLBAR_HEIGHT
+            body_bottom: mutable f32 = safe_height - STATUS_HEIGHT
+            if body_bottom < body_top + 120.0:
+                body_bottom <- body_top + 120.0
+            body_extent: f32 = body_bottom - body_top
+
+            left: mutable f32 = safe_width * clamp_ratio(left_ratio)
+            right: mutable f32 = safe_width * clamp_ratio(right_ratio)
+            left <- MIN_LEFT if left < MIN_LEFT
+            right <- MIN_RIGHT if right < MIN_RIGHT
+            # Shrink panes, right first, until the center keeps its minimum.
+            while left + right + MIN_CENTER > safe_width and right > MIN_RIGHT:
+                right <- right - 1.0
+            while left + right + MIN_CENTER > safe_width and left > MIN_LEFT:
+                left <- left - 1.0
+
+            bottom: mutable f32 = body_extent * clamp_ratio(bottom_ratio)
+            bottom <- MIN_BOTTOM if bottom < MIN_BOTTOM
+            if bottom > body_extent - MIN_CENTER:
+                bottom <- body_extent - MIN_CENTER
+            if bottom < 0.0:
+                bottom <- 0.0
+
+            return PaneRects{
+                menu_top: menu_top,
+                toolbar_top: toolbar_top,
+                body_top: body_top,
+                body_bottom: body_bottom,
+                left_width: left,
+                right_width: right,
+                bottom_height: bottom,
+            }
+
+        def clamp_ratio(value: f32) -> f32:
+            if value != value:
+                return 0.22
+            if value < 0.08:
+                return 0.08
+            if value > 0.45:
+                return 0.45
+            return value
+
+        def is_compact(width: f32) -> bool:
+            return width < COMPACT_BREAKPOINT
+
+        # Pointer-to-ratio conversions used by the shell's three draggable
+        # splitters. Keep them here beside the sizing bounds so resize gestures
+        # and restored workspace values obey identical limits.
+        def left_ratio_at(x: f32, width: f32) -> f32:
+            safe_width: f32 = width if width > 1.0 else 1.0
+            return clamp_ratio(x / safe_width)
+
+        def right_ratio_at(x: f32, width: f32) -> f32:
+            safe_width: f32 = width if width > 1.0 else 1.0
+            return clamp_ratio((safe_width - x) / safe_width)
+
+        def bottom_ratio_at(y: f32, height: f32) -> f32:
+            safe_height: f32 = height if height > 240.0 else 240.0
+            body_top: f32 = MENU_HEIGHT + TOOLBAR_HEIGHT
+            body_bottom: mutable f32 = safe_height - STATUS_HEIGHT
+            if body_bottom < body_top + 120.0:
+                body_bottom <- body_top + 120.0
+            extent: f32 = body_bottom - body_top
+            return clamp_ratio((body_bottom - y) / extent)
+
+        def center_width(width: f32, rects: PaneRects&) -> f32:
+            result: f32 = width - rects.left_width - rects.right_width
+            return result if result > 0.0 else 0.0

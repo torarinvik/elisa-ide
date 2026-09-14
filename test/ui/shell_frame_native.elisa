@@ -1,0 +1,198 @@
+# Host-free native smoke test for the retained editor shell.
+#
+# This exercises the global Shell record through the real SDL startup,
+# application callbacks, layout, paint, and teardown path. It deliberately
+# calls build_shell directly instead of ShellApp::init because init also starts
+# the document host. No document host process is needed for this UI regression
+# test.
+
+include "../../framework/src/platform/sdl3/ui_sdl3_flat.elisa"
+include "../../src/shell/shell_app.elisa"
+
+global mutable shell_frame_failure: i64 = 0
+global mutable shell_frame_count: i64 = 0
+
+@link_name("designer_report_i64")
+extern shell_frame_report_i64(label: cstr, value: i64) -> void
+@link_name("designer_report_text")
+extern shell_frame_report_text(text: cstr) -> void
+@link_name("designer_setenv")
+extern shell_frame_setenv(name: cstr, value: cstr) -> i64
+
+def shell_frame_path_cstr(path: mutable darray[u8]&) -> cstr:
+    return (&path[0]).cast[cstr] can Unsafe.PointerCast
+
+def shell_frame_append_path(path: mutable darray[u8]&, text: sview) -> void:
+    index: mutable i64 = 0
+    while index < text.len:
+        path.push(text[index].u8())
+        index <- index + 1
+
+def expect_shell_frame(condition: bool, code: i64) -> void:
+    if not condition and shell_frame_failure == 0:
+        shell_frame_failure <- code
+
+def app_init() -> void:
+    # `init` also launches the document host. Build only the retained UI tree
+    # so this test isolates Shell state and framework rendering.
+    register_shortcuts()
+    preference_path: mutable darray[u8] = []
+    shell_frame_append_path(&preference_path, "build/shell-frame-preferences-test/config/preferences.json")
+    preference_path.push(0)
+    preference_cstr: cstr = shell_frame_path_cstr(&preference_path)
+    _ = PosixFile::remove(preference_cstr)
+    _ = PosixFile::remove("build/shell-frame-preferences-test/config/preferences.json.tmp")
+    _ = shell_frame_setenv("ELISA_IDE_CONFIG", preference_cstr)
+    expect_shell_frame(designer_workspace_preferences_save_ratios(0.3125, 0.34375, 0.28125) == 1, 70)
+    load_pane_preferences(shell)
+    expect_shell_frame(shell.left_ratio == 0.3125 and shell.right_ratio == 0.34375 and shell.bottom_ratio == 0.28125, 71)
+    build_shell(shell)
+
+    shortcuts: UiShortcuts::Decision = UiShortcuts::resolve(UiCore::Key.Z.i32(), UiShortcuts::MOD_CONTROL, false, false)
+    expect_shell_frame(shortcuts.layer == UiShortcuts::Layer.ApplicationCommand and shortcuts.command == ShellCommand.Undo.u32(), 31)
+    focused_shortcut: UiShortcuts::Decision = UiShortcuts::resolve(UiCore::Key.Delete.i32(), 0, true, false)
+    expect_shell_frame(focused_shortcut.layer == UiShortcuts::Layer.FocusedControl, 32)
+
+    expect_shell_frame(UiHandles::is_valid(shell.root), 1)
+    expect_shell_frame(UiHandles::is_valid(shell.menu_bar), 2)
+    expect_shell_frame(UiHandles::is_valid(shell.toolbar), 3)
+    expect_shell_frame(UiHandles::is_valid(shell.compact_navigation), 55)
+    expect_shell_frame(UiHandles::is_valid(shell.compact_path_row), 56)
+    expect_shell_frame(UiHandles::is_valid(shell.compact_open_path_field), 57)
+    expect_shell_frame(UiHandles::is_valid(shell.compact_open_button), 58)
+    expect_shell_frame(UiHandles::is_valid(shell.compact_save_as_button), 59)
+    expect_shell_frame(UiHandles::is_valid(shell.compact_palette_button), 60)
+    expect_shell_frame(UiHandles::is_valid(shell.compact_canvas_button), 61)
+    expect_shell_frame(UiHandles::is_valid(shell.compact_inspector_button), 62)
+    expect_shell_frame(UiHandles::is_valid(shell.body), 4)
+    expect_shell_frame(UiHandles::is_valid(shell.left_pane), 5)
+    expect_shell_frame(UiHandles::is_valid(shell.left_splitter), 48)
+    expect_shell_frame(UiHandles::is_valid(shell.center_pane), 6)
+    expect_shell_frame(UiHandles::is_valid(shell.right_splitter), 49)
+    expect_shell_frame(UiHandles::is_valid(shell.right_pane), 7)
+    expect_shell_frame(UiHandles::is_valid(shell.surface_pane), 50)
+    expect_shell_frame(UiHandles::is_valid(shell.bottom_splitter), 51)
+    expect_shell_frame(UiHandles::is_valid(shell.bottom_pane), 8)
+    expect_shell_frame(UiHandles::is_valid(shell.status_line), 9)
+    expect_shell_frame(UiHandles::is_valid(shell.inspector_list), 25)
+    expect_shell_frame(UiHandles::is_valid(shell.palette_list), 37)
+    expect_shell_frame(UiHandles::is_valid(shell.hierarchy_list), 38)
+    expect_shell_frame(UiHandles::is_valid(shell.problem_list), 39)
+    expect_shell_frame(UiHandles::is_valid(shell.hierarchy_previous_button), 40)
+    expect_shell_frame(UiHandles::is_valid(shell.hierarchy_next_button), 41)
+    expect_shell_frame(UiHandles::is_valid(shell.hierarchy_page_label), 42)
+    expect_shell_frame(UiHandles::is_valid(shell.problem_previous_button), 43)
+    expect_shell_frame(UiHandles::is_valid(shell.problem_next_button), 44)
+    expect_shell_frame(UiHandles::is_valid(shell.problem_page_label), 45)
+    expect_shell_frame(UiHandles::is_valid(shell.palette_search), 33)
+    expect_shell_frame(UiHandles::is_valid(shell.open_path_field), 26)
+    expect_shell_frame(UiHandles::is_valid(shell.open_button), 27)
+    expect_shell_frame(UiHandles::is_valid(shell.save_as_button), 28)
+
+    # Exercise the fixed row arrays stored on the global Shell at both ends.
+    expect_shell_frame(shell.palette_count == 12, 10)
+    expect_shell_frame(shell.hierarchy_count == 12, 11)
+    expect_shell_frame(shell.inspector_count == 12, 12)
+    expect_shell_frame(shell.problem_count == 12, 13)
+    expect_shell_frame(UiHandles::is_valid(shell.palette_rows[0]), 14)
+    expect_shell_frame(UiHandles::is_valid(shell.palette_rows[11]), 15)
+    expect_shell_frame(UiHandles::is_valid(shell.hierarchy_rows[0]), 16)
+    expect_shell_frame(UiHandles::is_valid(shell.hierarchy_rows[11]), 17)
+    expect_shell_frame(UiHandles::is_valid(shell.inspector_rows[11]), 18)
+    expect_shell_frame(UiHandles::is_valid(shell.inspector_editors[11]), 19)
+    expect_shell_frame(UiHandles::is_valid(shell.inspector_action_buttons[11]), 29)
+    expect_shell_frame(UiHandles::is_valid(shell.inspector_readonly_values[11]), 30)
+    expect_shell_frame(UiHandles::is_valid(shell.problem_rows[11]), 20)
+    expect_shell_frame(not UiHandles::overflowed(), 21)
+    expect_shell_frame(UiHandles::count() > 0, 22)
+    expect_shell_frame(UiHandles::count() < 256, 34)
+    expect_shell_frame(contains_ascii_fold("Text Field", "text"), 35)
+    expect_shell_frame(not contains_ascii_fold("Text Field", "panel"), 36)
+    expect_shell_frame(not shell.host_running, 23)
+    expect_shell_frame(ShellLayout::left_ratio_at(0.0, 1000.0) == 0.08, 52)
+    expect_shell_frame(ShellLayout::right_ratio_at(1000.0, 1000.0) == 0.08, 53)
+    expect_shell_frame(ShellLayout::bottom_ratio_at(2000.0, 800.0) == 0.08, 54)
+    expect_shell_frame(ShellLayout::is_compact(600.0) and not ShellLayout::is_compact(900.0), 63)
+
+    # Exercise actual compact panel selection and return to the three-pane
+    # layout at a normal desktop width.
+    UiCore::set_viewport(600.0, 760.0)
+    apply_shell_layout(shell)
+    UiHandles::layout(600.0, 760.0)
+    expect_shell_frame(shell.compact_mode and UiHandles::is_visible(shell.compact_navigation), 64)
+    expect_shell_frame(UiHandles::is_visible(shell.center_pane) and not UiHandles::is_visible(shell.left_pane) and not UiHandles::is_visible(shell.right_pane), 65)
+    shell.compact_panel <- 1
+    apply_shell_layout(shell)
+    UiHandles::layout(600.0, 760.0)
+    expect_shell_frame(UiHandles::is_visible(shell.left_pane) and not UiHandles::is_visible(shell.center_pane), 66)
+    shell.compact_panel <- 2
+    apply_shell_layout(shell)
+    UiHandles::layout(600.0, 760.0)
+    expect_shell_frame(UiHandles::is_visible(shell.right_pane) and not UiHandles::is_visible(shell.left_pane), 67)
+    UiCore::set_viewport(1180.0, 760.0)
+    apply_shell_layout(shell)
+    UiHandles::layout(1180.0, 760.0)
+    expect_shell_frame(not shell.compact_mode and UiHandles::is_visible(shell.left_pane) and UiHandles::is_visible(shell.center_pane) and UiHandles::is_visible(shell.right_pane), 68)
+
+    # A splitter release saves the ratios atomically. A dirty layout left at
+    # shutdown is saved through the same function used by main_native.
+    shell.left_ratio <- 0.375
+    shell.pane_preferences_dirty <- true
+    shell.active_split <- 1
+    handle_shell_event(shell, UiCore::PointerEvent.Up(UiCore::Vec2(0.0, 0.0), UiCore::PointerButton.Primary.i32()))
+    expect_shell_frame(not shell.pane_preferences_dirty and shell.active_split == 0, 72)
+    loaded_left: mutable f64 = 0.0
+    loaded_right: mutable f64 = 0.0
+    loaded_bottom: mutable f64 = 0.0
+    designer_workspace_preferences_load_ratios(&loaded_left, &loaded_right, &loaded_bottom)
+    expect_shell_frame(loaded_left == 0.375 and loaded_right == 0.34375 and loaded_bottom == 0.28125, 73)
+    shell.right_ratio <- 0.40625
+    shell.pane_preferences_dirty <- true
+    _ = save_pane_preferences(shell)
+    designer_workspace_preferences_load_ratios(&loaded_left, &loaded_right, &loaded_bottom)
+    expect_shell_frame(not shell.pane_preferences_dirty and loaded_right == 0.40625, 74)
+
+    page: ShellWindow::Window = ShellWindow::resolve(256, 0, MAX_HIERARCHY_ROWS.i64())
+    expect_shell_frame(page.page_count == 22 and page.first == 0 and page.finish == 12, 46)
+    last_window: ShellWindow::Window = ShellWindow::resolve(256, 21, MAX_HIERARCHY_ROWS.i64())
+    expect_shell_frame(last_window.first == 252 and last_window.finish == 256, 47)
+
+    # Route one retained control through the same widget callback used by the
+    # SDL host. The shell's command handler is intentionally inert while no
+    # document host is running.
+    if shell_frame_failure == 0:
+        app_widget_event(shell.undo_button.widget_id.usize(), UiConst::WidgetEvent.Click.i32())
+
+def app_widget_event(widget: usize, event: i32) -> void:
+    widget_event(shell, widget, event)
+
+def app_event(event: UiCore::Event) -> void:
+    handle_shell_event(shell, event)
+
+def app_text_input(text: sview) -> void:
+    UiHandles::insert_text(text)
+
+def app_text_editing(text: sview, selected_start: i32, selected_length: i32) -> void:
+    UiHandles::update_marked_text_utf8_characters(text, selected_start, selected_length)
+
+def app_frame() -> void:
+    shell_frame_count <- shell_frame_count + 1
+    if shell_frame_failure == 0:
+        frame(shell)
+        expect_shell_frame(UiHandles::is_valid(shell.root), 24)
+
+def main() -> i64:
+    # One frame is enough to exercise app_init, event-loop setup, retained
+    # layout/paint, present, and native teardown while keeping CI bounded.
+    result: i64 = UiSdl3::run("Elisa IDE shell frame test", 1180, 760, 1)
+    if result != 0:
+        shell_frame_report_i64("shell-frame SDL failure=", result)
+        return result
+    if shell_frame_failure != 0:
+        shell_frame_report_i64("shell-frame assertion failure=", shell_frame_failure)
+        return 1
+    if shell_frame_count != 1:
+        shell_frame_report_i64("shell-frame count=", shell_frame_count)
+        return 1
+    shell_frame_report_text("shell-frame: ok")
+    return 0

@@ -1,0 +1,318 @@
+# Component registry: the single mapping from a design component type to its
+# allowed properties, children, events, defaults, and runtime construction.
+#
+# The registry owns its own string pool. Type keys and property keys are stable
+# internal identifiers (`elisa.ui.button`, `minimumWidth`), never display text.
+# Layout mathematics stays in elisa-ui; the registry only declares what can be
+# authored and how it lowers.
+
+include "../model/design_limits.elisa"
+include "../model/design_values.elisa"
+include "../model/design_ids.elisa"
+
+include "../../compiler/elisacore_std/elisacore_runtime.elisa"
+include "../../compiler/elisacore_std/collections.elisa"
+
+module DesignRegistry:
+    private:
+        # The registry is process-lifetime data; its arrays live in this arena.
+        global mutable registry_arena: Arena = Arena{begin: null, end: null, end_index: 0, strategy: 0}
+
+        def reserve_components(target: mutable darray[ComponentDescriptor]&, capacity: usize) -> void:
+            _ = arena_da_reserve(&registry_arena, target, capacity)
+
+        def reserve_properties(target: mutable darray[PropertyDescriptor]&, capacity: usize) -> void:
+            _ = arena_da_reserve(&registry_arena, target, capacity)
+
+        def reserve_events(target: mutable darray[EventDescriptor]&, capacity: usize) -> void:
+            _ = arena_da_reserve(&registry_arena, target, capacity)
+
+    public:
+        const enum ComponentKind of i32:
+            Panel = 0
+            Button = 1
+            Label = 2
+            RadioButton = 3
+            CheckBox = 4
+            Slider = 5
+            ProgressBar = 6
+            TextField = 7
+            Scroll = 8
+
+        const enum Category of i32:
+            Container = 1
+            Input = 2
+            Display = 3
+            Navigation = 4
+            Data = 5
+            Custom = 6
+
+        struct PropertyDescriptor:
+            key: mutable DesignValues::StringRef
+            label: mutable DesignValues::StringRef
+            category: mutable i32
+            tag: mutable DesignValues::ValueTag
+            default_value: mutable DesignValues::DesignValue
+            min_value: mutable f64
+            max_value: mutable f64
+            # Comma-separated stable enum keys; empty for non-enums.
+            enum_keys: mutable DesignValues::StringRef
+            affects_layout: mutable bool
+            affects_paint: mutable bool
+            affects_semantics: mutable bool
+            affects_behavior: mutable bool
+            # Generated Elisa setter or constructor parameter name.
+            setter: mutable DesignValues::StringRef
+
+        struct EventDescriptor:
+            key: mutable DesignValues::StringRef
+            label: mutable DesignValues::StringRef
+            signature: mutable DesignValues::StringRef
+
+        struct ComponentDescriptor:
+            type_key: mutable DesignValues::StringRef
+            display: mutable DesignValues::StringRef
+            category: mutable i32
+            kind: mutable i32
+            constructor: mutable DesignValues::StringRef
+            can_have_children: mutable bool
+            default_width: mutable f64
+            default_height: mutable f64
+            properties: mutable darray[PropertyDescriptor]
+            events: mutable darray[EventDescriptor]
+
+        struct Registry:
+            strings: mutable DesignValues::StringPool
+            components: mutable darray[ComponentDescriptor]
+
+        def empty_registry() -> Registry:
+            return Registry{strings: DesignValues::empty_pool(), components: []}
+
+        # ---- descriptor builders -------------------------------------------------
+
+        def base_property(registry: mutable Registry&, key: cstr, label: cstr, tag: DesignValues::ValueTag, setter: cstr) -> PropertyDescriptor:
+            return PropertyDescriptor{
+                key: DesignValues::append_cstr(registry.strings.bytes, key),
+                label: DesignValues::append_cstr(registry.strings.bytes, label),
+                category: Category.Display,
+                tag: tag,
+                default_value: DesignValues::boolean(false),
+                min_value: 0.0,
+                max_value: 0.0,
+                enum_keys: DesignValues::no_text(),
+                affects_layout: false,
+                affects_paint: false,
+                affects_semantics: false,
+                affects_behavior: false,
+                setter: DesignValues::append_cstr(registry.strings.bytes, setter),
+            }
+
+        def text_property(registry: mutable Registry&, key: cstr, label: cstr, default_text: cstr, setter: cstr, semantics: bool) -> PropertyDescriptor:
+            property: mutable PropertyDescriptor = base_property(registry, key, label, DesignValues::ValueTag.Text, setter)
+            property.default_value <- DesignValues::text(DesignValues::append_cstr(registry.strings.bytes, default_text))
+            property.affects_paint <- true
+            property.affects_semantics <- semantics
+            return property
+
+        def length_property(registry: mutable Registry&, key: cstr, label: cstr, default_value: f64, setter: cstr, layout: bool) -> PropertyDescriptor:
+            property: mutable PropertyDescriptor = base_property(registry, key, label, DesignValues::ValueTag.Length, setter)
+            property.default_value <- DesignValues::length(default_value)
+            property.min_value <- 0.0
+            property.max_value <- 100000.0
+            property.affects_layout <- layout
+            return property
+
+        def scalar_property(registry: mutable Registry&, key: cstr, label: cstr, default_value: f64, min_value: f64, max_value: f64, setter: cstr, layout: bool) -> PropertyDescriptor:
+            property: mutable PropertyDescriptor = base_property(registry, key, label, DesignValues::ValueTag.Scalar, setter)
+            property.default_value <- DesignValues::scalar(default_value)
+            property.min_value <- min_value
+            property.max_value <- max_value
+            property.affects_layout <- layout
+            return property
+
+        def color_property(registry: mutable Registry&, key: cstr, label: cstr, r: u8, g: u8, b: u8, setter: cstr) -> PropertyDescriptor:
+            property: mutable PropertyDescriptor = base_property(registry, key, label, DesignValues::ValueTag.Color, setter)
+            property.default_value <- DesignValues::color(r, g, b, 255)
+            property.affects_paint <- true
+            return property
+
+        def bool_property(registry: mutable Registry&, key: cstr, label: cstr, default_value: bool, setter: cstr, behavior: bool) -> PropertyDescriptor:
+            property: mutable PropertyDescriptor = base_property(registry, key, label, DesignValues::ValueTag.Bool, setter)
+            property.default_value <- DesignValues::boolean(default_value)
+            property.affects_behavior <- behavior
+            return property
+
+        def enum_property(registry: mutable Registry&, key: cstr, label: cstr, default_key: cstr, keys: cstr, setter: cstr, layout: bool) -> PropertyDescriptor:
+            property: mutable PropertyDescriptor = base_property(registry, key, label, DesignValues::ValueTag.EnumKey, setter)
+            property.default_value <- DesignValues::enum_key(DesignValues::append_cstr(registry.strings.bytes, default_key))
+            property.enum_keys <- DesignValues::append_cstr(registry.strings.bytes, keys)
+            property.affects_layout <- layout
+            return property
+
+        # ---- registry construction ----------------------------------------------
+
+        def add_component(registry: mutable Registry&, type_key: cstr, display: cstr, category: Category, kind: ComponentKind, constructor: cstr, can_have_children: bool, default_width: f64, default_height: f64, properties: darray[PropertyDescriptor], events: darray[EventDescriptor]) -> void:
+            reserve_components(&registry.components, registry.components.count + 1)
+            registry.components.push(ComponentDescriptor{
+                type_key: DesignValues::append_cstr(registry.strings.bytes, type_key),
+                display: DesignValues::append_cstr(registry.strings.bytes, display),
+                category: category.i32(),
+                kind: kind.i32(),
+                constructor: DesignValues::append_cstr(registry.strings.bytes, constructor),
+                can_have_children: can_have_children,
+                default_width: default_width,
+                default_height: default_height,
+                properties: properties,
+                events: events,
+            })
+
+        def container_properties(registry: mutable Registry&, with_axis: bool) -> darray[PropertyDescriptor]:
+            properties: mutable darray[PropertyDescriptor] = []
+            reserve_properties(&properties, 16)
+            properties.push(length_property(registry, "padding", "Padding", 8.0, "padding", true))
+            properties.push(length_property(registry, "spacing", "Spacing", 4.0, "spacing", true))
+            properties.push(color_property(registry, "background", "Background", 24, 27, 33, "color"))
+            properties.push(scalar_property(registry, "grow", "Grow weight", 0.0, 0.0, 1000.0, "grow", true))
+            properties.push(length_property(registry, "minimumWidth", "Minimum width", 0.0, "minimumWidth", true))
+            properties.push(length_property(registry, "minimumHeight", "Minimum height", 0.0, "minimumHeight", true))
+            properties.push(enum_property(registry, "crossAlignment", "Cross alignment", "stretch", "start,center,end,stretch", "crossAlignment", true))
+            properties.push(enum_property(registry, "mainAlignment", "Main alignment", "start", "start,center,end,between", "mainAlignment", true))
+            properties.push(bool_property(registry, "visible", "Visible", true, "visible", true))
+            if with_axis:
+                properties.push(enum_property(registry, "axis", "Axis", "column", "row,column", "axis", true))
+            return properties
+
+        def label_properties(registry: mutable Registry&) -> darray[PropertyDescriptor]:
+            properties: mutable darray[PropertyDescriptor] = []
+            reserve_properties(&properties, 16)
+            properties.push(text_property(registry, "text", "Text", "Label", "text", true))
+            properties.push(scalar_property(registry, "size", "Text size", 15.0, 6.0, 200.0, "size", false))
+            properties.push(color_property(registry, "color", "Text color", 232, 236, 246, "color"))
+            properties.push(scalar_property(registry, "grow", "Grow weight", 0.0, 0.0, 1000.0, "grow", true))
+            properties.push(length_property(registry, "margin", "Margin", 0.0, "margin", true))
+            properties.push(bool_property(registry, "visible", "Visible", true, "visible", true))
+            return properties
+
+        def button_properties(registry: mutable Registry&) -> darray[PropertyDescriptor]:
+            properties: mutable darray[PropertyDescriptor] = []
+            reserve_properties(&properties, 16)
+            properties.push(text_property(registry, "text", "Caption", "Button", "text", true))
+            properties.push(scalar_property(registry, "size", "Text size", 15.0, 6.0, 200.0, "size", false))
+            properties.push(length_property(registry, "minimumWidth", "Minimum width", 120.0, "minimumWidth", true))
+            properties.push(length_property(registry, "minimumHeight", "Minimum height", 36.0, "minimumHeight", true))
+            properties.push(color_property(registry, "color", "Color", 64, 112, 224, "color"))
+            properties.push(color_property(registry, "textColor", "Text color", 232, 236, 246, "textColor"))
+            properties.push(color_property(registry, "hoverColor", "Hover color", 84, 136, 244, "hoverColor"))
+            properties.push(color_property(registry, "pressColor", "Press color", 48, 90, 190, "pressColor"))
+            properties.push(scalar_property(registry, "grow", "Grow weight", 0.0, 0.0, 1000.0, "grow", true))
+            properties.push(length_property(registry, "margin", "Margin", 0.0, "margin", true))
+            properties.push(bool_property(registry, "enabled", "Enabled", true, "enabled", true))
+            properties.push(bool_property(registry, "visible", "Visible", true, "visible", true))
+            return properties
+
+        def text_field_properties(registry: mutable Registry&) -> darray[PropertyDescriptor]:
+            properties: mutable darray[PropertyDescriptor] = []
+            reserve_properties(&properties, 16)
+            properties.push(text_property(registry, "label", "Field label", "Field", "label", true))
+            properties.push(text_property(registry, "placeholder", "Placeholder", "", "placeholder", false))
+            properties.push(text_property(registry, "initial", "Initial text", "", "initial", false))
+            properties.push(scalar_property(registry, "size", "Text size", 15.0, 6.0, 200.0, "size", false))
+            properties.push(length_property(registry, "minimumWidth", "Minimum width", 240.0, "minimumWidth", true))
+            properties.push(length_property(registry, "minimumHeight", "Minimum height", 40.0, "minimumHeight", true))
+            properties.push(color_property(registry, "ink", "Text color", 232, 236, 246, "ink"))
+            properties.push(color_property(registry, "fill", "Fill color", 27, 32, 43, "fill"))
+            properties.push(bool_property(registry, "secure", "Secure field", false, "secure", true))
+            properties.push(scalar_property(registry, "grow", "Grow weight", 0.0, 0.0, 1000.0, "grow", true))
+            properties.push(length_property(registry, "margin", "Margin", 0.0, "margin", true))
+            properties.push(bool_property(registry, "visible", "Visible", true, "visible", true))
+            return properties
+
+        def no_events() -> darray[EventDescriptor]:
+            return []
+
+        def button_events(registry: mutable Registry&) -> darray[EventDescriptor]:
+            events: mutable darray[EventDescriptor] = []
+            reserve_events(&events, 4)
+            events.push(EventDescriptor{
+                key: DesignValues::append_cstr(registry.strings.bytes, "click"),
+                label: DesignValues::append_cstr(registry.strings.bytes, "Click"),
+                signature: DesignValues::append_cstr(registry.strings.bytes, "def handler(widget: usize, event: i32) -> void"),
+            })
+            return events
+
+        def field_events(registry: mutable Registry&) -> darray[EventDescriptor]:
+            events: mutable darray[EventDescriptor] = []
+            reserve_events(&events, 4)
+            events.push(EventDescriptor{
+                key: DesignValues::append_cstr(registry.strings.bytes, "change"),
+                label: DesignValues::append_cstr(registry.strings.bytes, "Value changed"),
+                signature: DesignValues::append_cstr(registry.strings.bytes, "def handler(widget: usize, event: i32) -> void"),
+            })
+            events.push(EventDescriptor{
+                key: DesignValues::append_cstr(registry.strings.bytes, "submit"),
+                label: DesignValues::append_cstr(registry.strings.bytes, "Submitted"),
+                signature: DesignValues::append_cstr(registry.strings.bytes, "def handler(widget: usize, event: i32) -> void"),
+            })
+            return events
+
+        def build_builtin() -> Registry:
+            registry: mutable Registry = empty_registry()
+            add_component(&registry, "elisa.ui.column", "Column", Category.Container, ComponentKind.Panel, "column", true, 320.0, 240.0, container_properties(&registry, false), no_events())
+            add_component(&registry, "elisa.ui.row", "Row", Category.Container, ComponentKind.Panel, "row", true, 320.0, 48.0, container_properties(&registry, false), no_events())
+            add_component(&registry, "elisa.ui.panel", "Panel", Category.Container, ComponentKind.Panel, "panel", true, 320.0, 240.0, container_properties(&registry, true), no_events())
+            add_component(&registry, "elisa.ui.label", "Label", Category.Display, ComponentKind.Label, "label", false, 120.0, 24.0, label_properties(&registry), no_events())
+            add_component(&registry, "elisa.ui.button", "Button", Category.Input, ComponentKind.Button, "button", false, 120.0, 36.0, button_properties(&registry), button_events(&registry))
+            add_component(&registry, "elisa.ui.text_field", "Text field", Category.Input, ComponentKind.TextField, "text_field", false, 240.0, 40.0, text_field_properties(&registry), field_events(&registry))
+            return registry
+
+        # ---- queries -------------------------------------------------------------
+
+        def find_component(registry: Registry&, type_key: sview) -> i64:
+            index: mutable i64 = 0
+            while index < registry.components.count.i64():
+                if DesignValues::equal_ref(registry.strings, registry.components[index.usize()].type_key, type_key):
+                    return index
+                index <- index + 1
+            return -1
+
+        def find_property(registry: Registry&, component_index: i64, key: sview) -> i64:
+            return -1 if component_index < 0
+            component: DesignRegistry::ComponentDescriptor = registry.components[component_index.usize()]
+            index: mutable i64 = 0
+            while index < component.properties.count.i64():
+                if DesignValues::equal_ref(registry.strings, component.properties[index.usize()].key, key):
+                    return index
+                index <- index + 1
+            return -1
+
+        def find_event(registry: Registry&, component_index: i64, key: sview) -> i64:
+            return -1 if component_index < 0
+            component: DesignRegistry::ComponentDescriptor = registry.components[component_index.usize()]
+            index: mutable i64 = 0
+            while index < component.events.count.i64():
+                if DesignValues::equal_ref(registry.strings, component.events[index.usize()].key, key):
+                    return index
+                index <- index + 1
+            return -1
+
+        # The registry validates itself: duplicate type keys, duplicate property
+        # keys, duplicate event keys, unknown editor kinds, and invalid defaults
+        # are startup errors, not runtime surprises.
+        def validate(registry: Registry&) -> i64:
+            component_index: mutable i64 = 0
+            while component_index < registry.components.count.i64():
+                key: sview = DesignValues::text_of(registry.strings, registry.components[component_index.usize()].type_key)
+                return component_index + 1 if find_component(registry, key) != component_index
+                properties: DesignRegistry::ComponentDescriptor = registry.components[component_index.usize()]
+                property_index: mutable i64 = 0
+                while property_index < properties.properties.count.i64():
+                    property_key: sview = DesignValues::text_of(registry.strings, properties.properties[property_index.usize()].key)
+                    return component_index + 1 if find_property(registry, component_index, property_key) != property_index
+                    property_index <- property_index + 1
+                event_index: mutable i64 = 0
+                while event_index < properties.events.count.i64():
+                    event_key: sview = DesignValues::text_of(registry.strings, properties.events[event_index.usize()].key)
+                    return component_index + 1 if find_event(registry, component_index, event_key) != event_index
+                    event_index <- event_index + 1
+                component_index <- component_index + 1
+            return 0

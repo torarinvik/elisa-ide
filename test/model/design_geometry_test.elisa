@@ -1,0 +1,86 @@
+include "../../src/canvas/design_geometry.elisa"
+include "test_support.elisa"
+
+module DesignGeometryTest:
+    private:
+        def near(actual: f64, expected: f64) -> bool:
+            difference: f64 = actual - expected
+            return difference >= -0.0000001 and difference <= 0.0000001
+
+    public:
+        def run() -> i64:
+            viewport: DesignGeometry::Rect = DesignGeometry::rect(130.0, 80.0, 420.0, 300.0)
+            shell: DesignGeometry::Point = DesignGeometry::point(191.25, 140.5)
+            canvas: mutable DesignGeometry::Point = DesignGeometry::point(-900.0, -900.0)
+            canvas_ok: bool = DesignGeometry::shell_to_canvas(viewport, shell, &canvas)
+            shell_again: mutable DesignGeometry::Point = DesignGeometry::point(-900.0, -900.0)
+            shell_ok: bool = DesignGeometry::canvas_to_shell(viewport, canvas, &shell_again)
+            TestSupport::check("shell and viewport-local points round-trip", canvas_ok and shell_ok and near(canvas.x, 61.25) and near(canvas.y, 60.5) and near(shell_again.x, shell.x) and near(shell_again.y, shell.y))
+
+            view: mutable DesignGeometry::ViewState = DesignGeometry::identity_view()
+            TestSupport::check("fractional zoom and negative pan are accepted", DesignGeometry::set_view(&view, 0.125, -48.5, 9.25))
+            form_point: DesignGeometry::Point = DesignGeometry::point(12.25, -4.5)
+            canvas_point: mutable DesignGeometry::Point = DesignGeometry::point(0.0, 0.0)
+            form_round_trip: mutable DesignGeometry::Point = DesignGeometry::point(0.0, 0.0)
+            forward_ok: bool = DesignGeometry::form_to_canvas(view, form_point, &canvas_point)
+            inverse_ok: bool = DesignGeometry::canvas_to_form(view, canvas_point, &form_round_trip)
+            TestSupport::check("fractional-scale point transform round-trips", forward_ok and inverse_ok and near(form_round_trip.x, form_point.x) and near(form_round_trip.y, form_point.y))
+
+            form_rect: DesignGeometry::Rect = DesignGeometry::rect(4.0, 8.0, 100.0, 60.0)
+            canvas_rect: mutable DesignGeometry::Rect = DesignGeometry::rect(0.0, 0.0, 0.0, 0.0)
+            form_rect_again: mutable DesignGeometry::Rect = DesignGeometry::rect(0.0, 0.0, 0.0, 0.0)
+            rect_forward_ok: bool = DesignGeometry::form_rect_to_canvas(view, form_rect, &canvas_rect)
+            rect_inverse_ok: bool = DesignGeometry::canvas_rect_to_form(view, canvas_rect, &form_rect_again)
+            TestSupport::check("logical rectangles round-trip without losing dimensions", rect_forward_ok and rect_inverse_ok and near(form_rect_again.x, form_rect.x) and near(form_rect_again.y, form_rect.y) and near(form_rect_again.width, form_rect.width) and near(form_rect_again.height, form_rect.height))
+
+            anchor_view: mutable DesignGeometry::ViewState = DesignGeometry::identity_view()
+            _ = DesignGeometry::set_view(&anchor_view, 1.25, -38.0, 14.0)
+            zoom_viewport: DesignGeometry::Rect = DesignGeometry::rect(100.0, 50.0, 600.0, 420.0)
+            anchor_shell: DesignGeometry::Point = DesignGeometry::point(345.75, 221.5)
+            anchor_form_before: mutable DesignGeometry::Point = DesignGeometry::point(0.0, 0.0)
+            anchor_form_after: mutable DesignGeometry::Point = DesignGeometry::point(0.0, 0.0)
+            before_ok: bool = DesignGeometry::shell_to_form(zoom_viewport, anchor_view, anchor_shell, &anchor_form_before)
+            zoom_ok: bool = DesignGeometry::zoom_at(&anchor_view, zoom_viewport, anchor_shell, 2.5)
+            after_ok: bool = DesignGeometry::shell_to_form(zoom_viewport, anchor_view, anchor_shell, &anchor_form_after)
+            TestSupport::check("pointer anchored zoom preserves the design point under the pointer", before_ok and zoom_ok and after_ok and near(anchor_view.zoom, 2.5) and near(anchor_form_before.x, anchor_form_after.x) and near(anchor_form_before.y, anchor_form_after.y))
+
+            fit_view: mutable DesignGeometry::ViewState = DesignGeometry::identity_view()
+            fit_form: DesignGeometry::Rect = DesignGeometry::rect(0.0, 0.0, 800.0, 600.0)
+            fit_viewport: DesignGeometry::Rect = DesignGeometry::rect(20.0, 30.0, 400.0, 300.0)
+            fit_ok: bool = DesignGeometry::fit_to_viewport(&fit_view, fit_form, fit_viewport, 10.0)
+            fit_canvas: mutable DesignGeometry::Rect = DesignGeometry::rect(0.0, 0.0, 0.0, 0.0)
+            fit_rect_ok: bool = DesignGeometry::form_rect_to_canvas(fit_view, fit_form, &fit_canvas)
+            fit_shell_center: mutable DesignGeometry::Point = DesignGeometry::point(0.0, 0.0)
+            fit_center_ok: bool = DesignGeometry::form_to_shell(fit_viewport, fit_view, DesignGeometry::point(400.0, 300.0), &fit_shell_center)
+            TestSupport::check("fit centers a form locally and applies nonzero shell origin once", fit_ok and fit_rect_ok and fit_center_ok and near(fit_view.zoom, 280.0 / 600.0) and near(fit_canvas.x, 13.3333333333) and near(fit_canvas.y, 10.0) and near(fit_canvas.width, 373.3333333333) and near(fit_canvas.height, 280.0) and near(fit_shell_center.x, 220.0) and near(fit_shell_center.y, 180.0))
+
+            clamped_view: mutable DesignGeometry::ViewState = DesignGeometry::identity_view()
+            low_zoom_ok: bool = DesignGeometry::set_zoom(&clamped_view, 0.0001)
+            low_clamped: bool = clamped_view.zoom == DesignGeometry::MIN_ZOOM
+            high_zoom_ok: bool = DesignGeometry::set_zoom(&clamped_view, 100.0)
+            high_clamped: bool = clamped_view.zoom == DesignGeometry::MAX_ZOOM
+            TestSupport::check("finite zoom requests clamp to the supported range", low_zoom_ok and low_clamped and high_zoom_ok and high_clamped)
+
+            unchanged: mutable DesignGeometry::ViewState = DesignGeometry::identity_view()
+            invalid_pan_ok: bool = DesignGeometry::set_pan(&unchanged, 1.0e13, 2.0)
+            TestSupport::check("invalid pan is rejected without partial mutation", not invalid_pan_ok and unchanged.pan_x == 0.0 and unchanged.pan_y == 0.0)
+            TestSupport::check("zero and negative-sized viewports are invalid", not DesignGeometry::valid_viewport(DesignGeometry::rect(0.0, 0.0, 0.0, 100.0)) and not DesignGeometry::valid_viewport(DesignGeometry::rect(0.0, 0.0, 100.0, -1.0)))
+            zero_viewport: DesignGeometry::Rect = DesignGeometry::rect(0.0, 0.0, 0.0, 100.0)
+            untouched_point: mutable DesignGeometry::Point = DesignGeometry::point(17.0, 19.0)
+            zero_origin_ok: bool = DesignGeometry::shell_to_canvas(zero_viewport, shell, &untouched_point)
+            TestSupport::check("zero-sized viewport transform is rejected and leaves output unchanged", not zero_origin_ok and untouched_point.x == 17.0 and untouched_point.y == 19.0)
+            zero_form: DesignGeometry::Rect = DesignGeometry::rect(0.0, 0.0, 0.0, 600.0)
+            fit_before: DesignGeometry::ViewState = fit_view
+            zero_fit_ok: bool = DesignGeometry::fit_to_viewport(&fit_view, zero_form, fit_viewport, 10.0)
+            zero_fit_viewport_ok: bool = DesignGeometry::fit_to_viewport(&fit_view, fit_form, zero_viewport, 10.0)
+            TestSupport::check("fit rejects zero form or viewport dimensions without changing zoom", not zero_fit_ok and not zero_fit_viewport_ok and fit_view.zoom == fit_before.zoom and fit_view.pan_x == fit_before.pan_x and fit_view.pan_y == fit_before.pan_y)
+
+            invalid_view: DesignGeometry::ViewState = DesignGeometry::ViewState{zoom: 0.0, pan_x: 0.0, pan_y: 0.0}
+            untouched_form: mutable DesignGeometry::Point = DesignGeometry::point(17.0, 19.0)
+            invalid_inverse_ok: bool = DesignGeometry::canvas_to_form(invalid_view, canvas, &untouched_form)
+            TestSupport::check("inverse transform rejects invalid zoom and preserves its output", not invalid_inverse_ok and untouched_form.x == 17.0 and untouched_form.y == 19.0)
+
+            return TestSupport::report("design_geometry")
+
+def main() -> i64:
+    return DesignGeometryTest::run()

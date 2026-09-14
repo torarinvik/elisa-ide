@@ -1,0 +1,105 @@
+# Validation tests: structural invariants and property applicability fail with
+# stable codes and useful locations.
+
+include "../../src/schema/design_json_decode.elisa"
+include "../../src/validation/design_validate.elisa"
+include "test_support.elisa"
+
+module DesignValidateTest:
+    private:
+        const DUPLICATE_IDS: cstr = "{\"schemaVersion\":1,\"id\":\"form-dup\",\"name\":\"Dup\",\"moduleSymbol\":\"dup_view\",\"root\":\"node-a\",\"nodes\":[{\"id\":\"node-a\",\"type\":\"elisa.ui.label\",\"name\":\"A\",\"symbol\":\"label_a\",\"properties\":{},\"children\":[],\"events\":{}},{\"id\":\"node-a\",\"type\":\"elisa.ui.label\",\"name\":\"B\",\"symbol\":\"label_b\",\"properties\":{},\"children\":[],\"events\":{}}]}"
+        const CYCLE: cstr = "{\"schemaVersion\":1,\"id\":\"form-cycle\",\"name\":\"Cycle\",\"moduleSymbol\":\"cycle_view\",\"root\":\"node-a\",\"nodes\":[{\"id\":\"node-a\",\"type\":\"elisa.ui.column\",\"name\":\"A\",\"symbol\":\"col_a\",\"properties\":{},\"children\":[\"node-b\"],\"events\":{}},{\"id\":\"node-b\",\"type\":\"elisa.ui.column\",\"name\":\"B\",\"symbol\":\"col_b\",\"properties\":{},\"children\":[\"node-a\"],\"events\":{}}]}"
+        const LEAF_PARENT: cstr = "{\"schemaVersion\":1,\"id\":\"form-leaf\",\"name\":\"Leaf\",\"moduleSymbol\":\"leaf_view\",\"root\":\"node-root\",\"nodes\":[{\"id\":\"node-root\",\"type\":\"elisa.ui.button\",\"name\":\"Root\",\"symbol\":\"root_button\",\"properties\":{},\"children\":[\"node-child\"],\"events\":{}},{\"id\":\"node-child\",\"type\":\"elisa.ui.label\",\"name\":\"Child\",\"symbol\":\"child_label\",\"properties\":{},\"children\":[],\"events\":{}}]}"
+        const WRONG_TYPE: cstr = "{\"schemaVersion\":1,\"id\":\"form-type\",\"name\":\"Type\",\"moduleSymbol\":\"type_view\",\"root\":\"node-root\",\"nodes\":[{\"id\":\"node-root\",\"type\":\"elisa.ui.label\",\"name\":\"Root\",\"symbol\":\"root_label\",\"properties\":{\"text\":5},\"children\":[],\"events\":{}}]}"
+        const OUT_OF_RANGE: cstr = "{\"schemaVersion\":1,\"id\":\"form-range\",\"name\":\"Range\",\"moduleSymbol\":\"range_view\",\"root\":\"node-root\",\"nodes\":[{\"id\":\"node-root\",\"type\":\"elisa.ui.column\",\"name\":\"Root\",\"symbol\":\"root_column\",\"properties\":{\"padding\":-5},\"children\":[],\"events\":{}}]}"
+        const MISSING_ROOT: cstr = "{\"schemaVersion\":1,\"id\":\"form-noroot\",\"name\":\"No root\",\"moduleSymbol\":\"noroot_view\",\"root\":\"node-nope\",\"nodes\":[{\"id\":\"node-root\",\"type\":\"elisa.ui.label\",\"name\":\"Root\",\"symbol\":\"root_label\",\"properties\":{},\"children\":[],\"events\":{}}]}"
+        const TWO_ROOTS: cstr = "{\"schemaVersion\":1,\"id\":\"form-two\",\"name\":\"Two\",\"moduleSymbol\":\"two_view\",\"root\":\"node-a\",\"nodes\":[{\"id\":\"node-a\",\"type\":\"elisa.ui.label\",\"name\":\"A\",\"symbol\":\"label_a\",\"properties\":{},\"children\":[],\"events\":{}},{\"id\":\"node-b\",\"type\":\"elisa.ui.label\",\"name\":\"B\",\"symbol\":\"label_b\",\"properties\":{},\"children\":[],\"events\":{}}]}"
+
+        def registry_with_node_reference() -> DesignRegistry::Registry:
+            registry: mutable DesignRegistry::Registry = DesignRegistry::build_builtin()
+            registry.components[0.usize()].properties.push(DesignRegistry::PropertyDescriptor{
+                key: DesignValues::append(&registry.strings.bytes, "target"),
+                label: DesignValues::append(&registry.strings.bytes, "Target"),
+                category: DesignRegistry::Category.Navigation.i32(),
+                tag: DesignValues::ValueTag.NodeRef,
+                default_value: DesignValues::node_ref(DesignValues::no_text()),
+                min_value: 0.0,
+                max_value: 0.0,
+                enum_keys: DesignValues::no_text(),
+                affects_layout: false,
+                affects_paint: false,
+                affects_semantics: false,
+                affects_behavior: true,
+                setter: DesignValues::append(&registry.strings.bytes, "target"),
+            })
+            return registry
+
+        def validate_text(registry: DesignRegistry::Registry&, text: sview, sink: mutable DesignDiagnostics::Sink&) -> DesignForms::Form:
+            form: DesignForms::Form = DesignDecode::decode_form(text, registry, sink)
+            DesignValidate::validate_form(form, registry, sink)
+            return form
+
+    public:
+        def run() -> i64:
+            registry: DesignRegistry::Registry = DesignRegistry::build_builtin()
+
+            duplicate_sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
+            _ = validate_text(registry, sview(DUPLICATE_IDS, 0, -1), &duplicate_sink)
+            TestSupport::check("duplicate ids rejected", TestSupport::has_error_code(duplicate_sink, DesignDiagnostics::Code.DuplicateId))
+
+            cycle_sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
+            _ = validate_text(registry, sview(CYCLE, 0, -1), &cycle_sink)
+            TestSupport::check("cycles rejected", TestSupport::has_error_code(cycle_sink, DesignDiagnostics::Code.Cycle))
+
+            leaf_sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
+            _ = validate_text(registry, sview(LEAF_PARENT, 0, -1), &leaf_sink)
+            TestSupport::check("leaf parents rejected", TestSupport::has_error_code(leaf_sink, DesignDiagnostics::Code.LeafParent))
+
+            type_sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
+            _ = validate_text(registry, sview(WRONG_TYPE, 0, -1), &type_sink)
+            TestSupport::check("wrong property type rejected", TestSupport::has_error_code(type_sink, DesignDiagnostics::Code.InvalidPropertyType))
+
+            range_sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
+            _ = validate_text(registry, sview(OUT_OF_RANGE, 0, -1), &range_sink)
+            TestSupport::check("out-of-range value rejected", TestSupport::has_error_code(range_sink, DesignDiagnostics::Code.PropertyOutOfRange))
+
+            root_sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
+            _ = validate_text(registry, sview(MISSING_ROOT, 0, -1), &root_sink)
+            TestSupport::check("missing root rejected", TestSupport::has_error_code(root_sink, DesignDiagnostics::Code.MissingRoot))
+
+            two_sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
+            _ = validate_text(registry, sview(TWO_ROOTS, 0, -1), &two_sink)
+            TestSupport::check("multiple roots rejected", TestSupport::has_error_code(two_sink, DesignDiagnostics::Code.MultipleRoots))
+
+            reference_registry: DesignRegistry::Registry = registry_with_node_reference()
+            reference_bytes: darray[u8] = TestSupport::read_fixture("test/fixtures/settings-form.elisaform.json")
+            reference_form: mutable DesignForms::Form = DesignDecode::decode_form(TestSupport::view_of(reference_bytes), reference_registry, &two_sink)
+            root_index: i64 = DesignForms::find_node(reference_form, DesignIds::from_text("node-root"))
+            if root_index >= 0:
+                reference_key: DesignValues::StringRef = DesignValues::append(&reference_form.strings.bytes, "target")
+                valid_target: DesignValues::DesignValue = DesignValues::node_ref(DesignValues::append(&reference_form.strings.bytes, "node-save"))
+                _ = DesignNodes::set_property(&reference_form.nodes[root_index.usize()], &reference_form.strings, reference_key, valid_target)
+            valid_reference_sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
+            DesignValidate::validate_form(reference_form, reference_registry, &valid_reference_sink)
+            TestSupport::check("in-form NodeRef resolves", not TestSupport::has_error_code(valid_reference_sink, DesignDiagnostics::Code.InvalidReference))
+
+            if root_index >= 0:
+                invalid_target: DesignValues::DesignValue = DesignValues::node_ref(DesignValues::append(&reference_form.strings.bytes, "node-missing"))
+                invalid_key: DesignValues::StringRef = DesignValues::append(&reference_form.strings.bytes, "target")
+                _ = DesignNodes::set_property(&reference_form.nodes[root_index.usize()], &reference_form.strings, invalid_key, invalid_target)
+            invalid_reference_sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
+            DesignValidate::validate_form(reference_form, reference_registry, &invalid_reference_sink)
+            TestSupport::check("dangling NodeRef rejected", TestSupport::has_error_code(invalid_reference_sink, DesignDiagnostics::Code.InvalidReference))
+
+            # A diagnostic carries a location, not just a code.
+            located: mutable bool = false
+            index: mutable i64 = 0
+            while index < duplicate_sink.items.count.i64():
+                if duplicate_sink.items[index.usize()].code == DesignDiagnostics::Code.DuplicateId and duplicate_sink.items[index.usize()].path.count > 0:
+                    located <- true
+                index <- index + 1
+            TestSupport::check("diagnostic carries a path", located)
+            return TestSupport::report("design_validate")
+
+def main() -> i64:
+    return DesignValidateTest::run()

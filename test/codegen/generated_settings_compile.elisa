@@ -1,0 +1,5 @@
+# Type-check and run the generated application composition root. The preceding
+# core codegen test writes both generated_settings_view.elisa and
+# generated_settings_app.elisa; the latter owns every top-level callback and
+# main entrypoint while including the handwritten handler module explicitly.
+include "../../build/generated_settings_app.elisa"

@@ -1,0 +1,58 @@
+# Design identity tests: parsing, canonical form, equality, deterministic
+# allocation, and generated-symbol validation.
+
+include "../../src/model/design_ids.elisa"
+include "test_support.elisa"
+
+module DesignIdsTest:
+    public:
+        def run() -> i64:
+            text_storage: mutable u8[24] = zeroed
+            # Valid IDs canonicalize case and keep their bytes.
+            id: DesignIds::DesignId = DesignIds::from_text("Node-ABC1")
+            TestSupport::check("valid id parses", not DesignIds::is_empty(id))
+            TestSupport::check_text("id canonicalizes to lowercase", DesignIds::text(&id, &text_storage), "node-abc1")
+            TestSupport::check("id round-trips through text", DesignIds::equal(DesignIds::from_text(DesignIds::text(&id, &text_storage)), id))
+            TestSupport::check("ID FNV hash remains byte-compatible", DesignIds::hash(id) == 11936944811201540003)
+
+            # Exercise all three scalar words and value copies through dynamic
+            # storage, including the final partial-word byte.
+            long_id: DesignIds::DesignId = DesignIds::from_text("node-abcdefghijklmnopqrs")
+            copied_ids: mutable darray[DesignIds::DesignId] = []
+            copied_ids.push(long_id)
+            copied_id: DesignIds::DesignId = copied_ids[0.usize()]
+            TestSupport::check("maximum-length ID survives aggregate storage", DesignIds::equal(copied_id, long_id))
+            TestSupport::check_text("maximum-length ID preserves every packed byte", DesignIds::text(&copied_id, &text_storage), "node-abcdefghijklmnopqrs")
+
+            # Invalid IDs fail closed.
+            TestSupport::check("empty id rejected", DesignIds::is_empty(DesignIds::from_text("")))
+            TestSupport::check("leading digit rejected", DesignIds::is_empty(DesignIds::from_text("1node")))
+            TestSupport::check("space rejected", DesignIds::is_empty(DesignIds::from_text("no de")))
+            TestSupport::check("underscore rejected in ids", DesignIds::is_empty(DesignIds::from_text("no_de")))
+            TestSupport::check("overlong id rejected", DesignIds::is_empty(DesignIds::from_text("a1234567890123456789012345")))
+
+            # Equality and hash agree on content.
+            left: DesignIds::DesignId = DesignIds::from_text("node-a")
+            right: DesignIds::DesignId = DesignIds::from_text("NODE-A")
+            other: DesignIds::DesignId = DesignIds::from_text("node-b")
+            TestSupport::check("equal ignores canonical case", DesignIds::equal(left, right))
+            TestSupport::check("different ids differ", not DesignIds::equal(left, other))
+            TestSupport::check("hash agrees with equality", DesignIds::hash(left) == DesignIds::hash(right))
+
+            # The allocator is deterministic and collision-free within a run.
+            allocator: mutable DesignIds::Allocator = DesignIds::allocator(110)
+            first: DesignIds::DesignId = DesignIds::alloc(&allocator)
+            second: DesignIds::DesignId = DesignIds::alloc(&allocator)
+            TestSupport::check_text("first generated id", DesignIds::text(&first, &text_storage), "n1")
+            TestSupport::check_text("second generated id", DesignIds::text(&second, &text_storage), "n2")
+            TestSupport::check("generated ids differ", not DesignIds::equal(first, second))
+
+            # Symbol rules are stricter than id rules.
+            TestSupport::check("symbol accepts snake case", DesignIds::valid_symbol("save_button"))
+            TestSupport::check("symbol rejects leading digit", not DesignIds::valid_symbol("1button"))
+            TestSupport::check("symbol rejects hyphen", not DesignIds::valid_symbol("save-button"))
+            TestSupport::check("symbol rejects uppercase", not DesignIds::valid_symbol("SaveButton"))
+            return TestSupport::report("design_ids")
+
+def main() -> i64:
+    return DesignIdsTest::run()

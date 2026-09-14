@@ -1,0 +1,69 @@
+# Shared helpers for headless model/schema tests. Core units only (ADR-001).
+
+include "../../compiler/elisacore_std/elisacore_runtime.elisa"
+include "../../compiler/elisacore_std/collections.elisa"
+include "../../compiler/elisacore_std/elisacore_fileio.elisa"
+include "../../src/model/design_text.elisa"
+include "../../src/validation/design_diagnostics.elisa"
+
+module TestSupport:
+    private:
+        global mutable failure_count: i64 = 0
+
+    public:
+        def check(name: cstr, condition: bool) -> void:
+            if not condition:
+                print("FAIL: ")
+                print(name)
+                print("\n")
+                failure_count <- failure_count + 1
+
+        def check_text(name: cstr, actual: sview, expected: sview) -> void:
+            check(name, DesignText::equal(actual, expected))
+
+        def failures() -> i64:
+            return failure_count
+
+        def report(test_name: cstr) -> i64:
+            if failure_count == 0:
+                print("ok ")
+                print(test_name)
+                print("\n")
+            return failure_count
+
+        # Reads a fixture into a leaked arena so the bytes outlive this call.
+        # Test fixtures are process-lifetime by design.
+        def read_fixture(path: cstr) -> darray[u8]:
+            arena: mutable Arena = Arena{begin: null, end: null, end_index: 0, strategy: 0}
+            bytes: darray[u8] = catch read_entire_file(&arena, path):
+                value:
+                    value
+                error e:
+                    []
+            return bytes
+
+        def view_of(bytes: darray[u8]) -> sview:
+            return "" if bytes.count == 0
+            return sview(&bytes[0], 0, bytes.count.i64())
+
+        def text_contains(haystack: sview, needle: sview) -> bool:
+            return DesignText::has_text(haystack, needle)
+
+        def sink() -> DesignDiagnostics::Sink:
+            return DesignDiagnostics::empty_sink()
+
+        def has_error_code(sink: DesignDiagnostics::Sink&, code: DesignDiagnostics::Code) -> bool:
+            index: mutable i64 = 0
+            while index < sink.items.count.i64():
+                if sink.items[index.usize()].code == code:
+                    return true
+                index <- index + 1
+            return false
+
+        def has_warning_code(sink: DesignDiagnostics::Sink&, code: DesignDiagnostics::Code) -> bool:
+            index: mutable i64 = 0
+            while index < sink.items.count.i64():
+                if sink.items[index.usize()].code == code and sink.items[index.usize()].severity == DesignDiagnostics::Severity.Warning:
+                    return true
+                index <- index + 1
+            return false

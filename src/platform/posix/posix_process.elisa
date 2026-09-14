@@ -1,0 +1,147 @@
+# POSIX process service: structured launch, bounded output capture,
+# cancellation, and reaping.
+#
+# The plan requires structured argument arrays (never a concatenated shell
+# command), a responsive editor while a child runs, bounded retained output,
+# and no owned process left behind. This adapter supplies exactly that:
+#
+#   * `start` launches one command with an explicit argument vector;
+#   * `poll` drains stdout/stderr without blocking and reports completion;
+#   * `read_stdout`/`read_stderr` copy the bounded capture out;
+#   * `cancel` sends SIGTERM, escalates to SIGKILL, and reaps;
+#   * `dispose` never leaves a running child.
+#
+# Output beyond the shim's 4 MiB per stream is truncated and flagged, not
+# silently dropped; the build supervisor decides what to spool to disk.
+
+# No standard-library includes: this adapter must compile in a UI unit that
+# includes the elisa-ui framework (see ADR-001).
+
+# Externs stay at file scope: stage1 declines a call to an extern declared
+# inside the module that calls it.
+@link_name("designer_process_write")
+extern designer_process_write(handle: heap void&, bytes: void&, count: usize) -> i64 can[Blocking.IO]
+@link_name("designer_process_close_stdin")
+extern designer_process_close_stdin(handle: heap void&) -> i64 can[Blocking.IO]
+@link_name("designer_process_start")
+extern designer_process_start(argv: void&, argc: usize) -> mutable heap void&? can[Blocking.IO, Memory.Allocate, Memory.Release]
+@link_name("designer_process_poll")
+extern designer_process_poll(handle: heap void&, timeout_ms: i64) -> i64 can[Blocking.IO]
+@link_name("designer_process_stdout")
+extern designer_process_stdout(handle: heap void&, out: mutable void&, capacity: usize) -> usize can[Blocking.IO]
+@link_name("designer_process_stderr")
+extern designer_process_stderr(handle: heap void&, out: mutable void&, capacity: usize) -> usize can[Blocking.IO]
+@link_name("designer_process_cancel")
+extern designer_process_cancel(handle: heap void&) -> i64 can[Blocking.IO]
+@link_name("designer_process_finished")
+extern designer_process_finished(handle: heap void&) -> i64 can[Blocking.IO]
+@link_name("designer_process_exit_code")
+extern designer_process_exit_code(handle: heap void&) -> i64
+@link_name("designer_process_term_signal")
+extern designer_process_term_signal(handle: heap void&) -> i64
+@link_name("designer_process_was_cancelled")
+extern designer_process_was_cancelled(handle: heap void&) -> i64
+@link_name("designer_process_truncated")
+extern designer_process_truncated(handle: heap void&) -> i64
+@link_name("designer_process_free")
+extern designer_process_free(handle: mutable heap void&) -> void can[Memory.Release]
+@link_name("designer_monotonic_ms")
+extern designer_monotonic_ms() -> i64
+
+module PosixProcess:
+    public:
+        struct Process:
+            handle: mutable heap void&?
+
+        struct Status:
+            finished: mutable bool
+            exit_code: mutable i32
+            term_signal: mutable i32
+            cancelled: mutable bool
+            stdout_truncated: mutable bool
+
+        # Launch `arguments[0]` with the remaining entries as its argument
+        # vector. The returned handle is invalid (null) when the command could
+        # not be spawned; callers must check `valid` before polling.
+        def start(arguments: mutable darray[cstr]&) -> Process:
+            can Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast:
+                if arguments.count == 0:
+                    return Process{handle: null}
+                argv_pointer: void& = (&arguments[0]).cast[void&] can Unsafe.PointerCast
+                raw: mutable heap void&? = designer_process_start(argv_pointer, arguments.count)
+                return Process{handle: raw}
+
+        def valid(process: Process&) -> bool:
+            return process.handle != null
+
+        # Write a bounded request to the child's stdin. Returns the number of
+        # bytes written, or a negative errno.
+        def write_stdin(process: Process&, bytes: sview) -> i64:
+            can Blocking.IO, Unsafe.PointerCast:
+                return -1 if process.handle == null
+                payload: void& = bytes.data.cast[void&]
+                return designer_process_write(process.handle, payload, bytes.len)
+
+        # Close the child's stdin so it observes end of input.
+        def close_stdin(process: Process&) -> i64:
+            can Blocking.IO:
+                return -1 if process.handle == null
+                return designer_process_close_stdin(process.handle)
+
+        # Non-blocking poll: true when the child has exited and been reaped.
+        # `timeout_ms` of -1 waits up to the shim's bound; 0 returns
+        # immediately after draining.
+        def poll(process: Process&, timeout_ms: i64) -> bool:
+            can Blocking.IO:
+                true return if process.handle == null
+                return designer_process_poll(process.handle, timeout_ms) == 1
+
+        # Copy captured stdout into `out`, replacing its contents. Never copies
+        # more than `capacity` bytes; the return value is the copied length.
+        def read_stdout(process: Process&, out: mutable darray[u8]&, capacity: usize) -> usize:
+            can Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast:
+                0 return if process.handle == null
+                out.resize(capacity)
+                out_pointer: mutable void& = (&out[0]).cast[mutable void&] can Unsafe.PointerCast
+                amount: usize = designer_process_stdout(process.handle, out_pointer, capacity)
+                out.resize(amount)
+                return amount
+
+        def read_stderr(process: Process&, out: mutable darray[u8]&, capacity: usize) -> usize:
+            can Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast:
+                0 return if process.handle == null
+                out.resize(capacity)
+                err_pointer: mutable void& = (&out[0]).cast[mutable void&] can Unsafe.PointerCast
+                amount: usize = designer_process_stderr(process.handle, err_pointer, capacity)
+                out.resize(amount)
+                return amount
+
+        # SIGTERM, then SIGKILL if the child does not exit, then reap. Returns
+        # the wait status.
+        def cancel(process: Process&) -> i64:
+            can Blocking.IO:
+                return 0 if process.handle == null
+                return designer_process_cancel(process.handle)
+
+        def status(process: Process&) -> Status:
+            can Blocking.IO:
+                if process.handle == null:
+                    return Status{finished: true, exit_code: -1, term_signal: 0, cancelled: false, stdout_truncated: false}
+                return Status{
+                    finished: designer_process_finished(process.handle) == 1,
+                    exit_code: designer_process_exit_code(process.handle).i32(),
+                    term_signal: designer_process_term_signal(process.handle).i32(),
+                    cancelled: designer_process_was_cancelled(process.handle) == 1,
+                    stdout_truncated: designer_process_truncated(process.handle) == 1,
+                }
+
+        def dispose(process: mutable Process&) -> void:
+            can Blocking.IO, Memory.Release:
+                if process.handle != null:
+                    designer_process_free(process.handle)
+                    process.handle <- null
+
+        # Milliseconds from an arbitrary monotonic origin. Used for job
+        # timeouts and cancellation budgets, never for file timestamps.
+        def monotonic_ms() -> i64:
+            return designer_monotonic_ms()

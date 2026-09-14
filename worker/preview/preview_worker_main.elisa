@@ -1,0 +1,20 @@
+# Preview worker entry: AppKit canvas backend + the worker application.
+#
+# The parent runs this with ELISA_UI_SMOKE_FRAMES=1 so the framework constructs
+# the real view, renders one frame off-screen, and exits; ELISA_UI_SNAPSHOT
+# names the PNG to write. Geometry lines go to stdout.
+
+include "../../framework/src/platform/appkit/ui_appkit_canvas_flat.elisa"
+include "preview_worker_app.elisa"
+
+def main() -> i64:
+    preview_width: mutable f32 = 400.0
+    preview_height: mutable f32 = 300.0
+    input_path_opt: cstr? = getenv("ELISA_UI_PREVIEW_INPUT")
+    if input_path_opt is input_path:
+        bytes: mutable darray[u8] = []
+        amount: usize = PosixFile::read_bytes(&bytes, input_path, PreviewWire::MAX_PAYLOAD_BYTES)
+        return 20 if amount == 0 or not PreviewWorkerApp::load_preview(bytes)
+        preview_width <- PreviewWorkerApp::viewport_width()
+        preview_height <- PreviewWorkerApp::viewport_height()
+    return UiAppKitCanvas::run_with_min_size("Elisa IDE preview", preview_width, preview_height, 240.0, 180.0)

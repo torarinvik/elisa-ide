@@ -1,0 +1,73 @@
+# Form document: identity, root, ordered node graph, and its string pool.
+
+include "./design_limits.elisa"
+include "./design_ids.elisa"
+include "./design_values.elisa"
+include "./design_node.elisa"
+include "./design_store.elisa"
+
+module DesignForms:
+    public:
+        struct Form:
+            id: mutable DesignIds::DesignId
+            name: mutable DesignValues::StringRef
+            module_symbol: mutable DesignValues::StringRef
+            schema_version: mutable i64
+            viewport_width: mutable f64
+            viewport_height: mutable f64
+            root: mutable DesignIds::DesignId
+            nodes: mutable darray[DesignNodes::Node]
+            strings: mutable DesignValues::StringPool
+            extensions: mutable darray[u8]
+            # In-memory document revision, incremented by committed commands.
+            # Not serialized: reopening a document starts a fresh edit session.
+            revision: mutable i64
+
+        def empty_form() -> Form:
+            return Form{
+                id: DesignIds::empty(),
+                name: DesignValues::no_text(),
+                module_symbol: DesignValues::no_text(),
+                schema_version: DesignLimits::SCHEMA_VERSION,
+                viewport_width: 800.0,
+                viewport_height: 600.0,
+                root: DesignIds::empty(),
+                nodes: [],
+                strings: DesignValues::empty_pool(),
+                extensions: [],
+                revision: 0,
+            }
+
+        def find_node(form: Form&, id: DesignIds::DesignId) -> i64:
+            index: mutable i64 = 0
+            while index < form.nodes.count.i64():
+                return index if DesignIds::equal(form.nodes[index.usize()].id, id)
+                index <- index + 1
+            return -1
+
+        # Append a node after checking identity uniqueness and the node budget.
+        # The caller is responsible for linking parent/children; validation
+        # checks the result. False means the document limit was reached or the
+        # ID is already present.
+        def add_node(form: mutable Form&, node: DesignNodes::Node&) -> bool:
+            return false if form.nodes.count >= DesignLimits::MAX_NODES
+            return false if find_node(form, node.id) >= 0
+            DesignNodes::ensure_nodes(&form.nodes, form.nodes.count + 1)
+            # Preserve the established large-Node append path for its nested
+            # arena-backed arrays, then repair the two identity fields with
+            # explicit scalar copies.
+            form.nodes.push(node)
+            stored_index: usize = form.nodes.count - 1.usize()
+            DesignIds::copy_into(&form.nodes[stored_index].id, &node.id)
+            DesignIds::copy_into(&form.nodes[stored_index].parent, &node.parent)
+            return true
+
+        def node_name(form: Form&, id: DesignIds::DesignId) -> sview:
+            index: i64 = find_node(form, id)
+            return "" if index < 0
+            return DesignValues::text_of(form.strings, form.nodes[index.usize()].name)
+
+        def node_type(form: Form&, id: DesignIds::DesignId) -> sview:
+            index: i64 = find_node(form, id)
+            return "" if index < 0
+            return DesignValues::text_of(form.strings, form.nodes[index.usize()].type_key)

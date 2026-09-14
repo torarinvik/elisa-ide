@@ -1,0 +1,92 @@
+# M00 spike: bounded JSON parse/write with owned string lifetime.
+#
+# Proves the plan's parser-buffer-disposal requirement in a small fixture:
+#   * build a JSON document in an owning arena and serialize it to bytes;
+#   * write and read the bytes through the std file I/O surface;
+#   * parse the read bytes into a scratch arena;
+#   * copy decoded text into application-owned storage;
+#   * reset the parse/read arenas and verify the owned copy is untouched.
+#
+# Exit codes identify the failed step so the spike is usable as a gate.
+
+include "../../compiler/elisacore_std/elisacore_runtime.elisa"
+include "../../compiler/elisacore_std/collections.elisa"
+include "../../compiler/elisacore_std/elisacore_json.elisa"
+include "../../compiler/elisacore_std/elisacore_fileio.elisa"
+
+module JsonLifetimeSpike:
+    private:
+        const OUTPUT_PATH: cstr = "build/spikes/json_lifetime.json"
+
+        def empty_arena() -> Arena:
+            return Arena{begin: null, end: null, end_index: 0, strategy: 0}
+
+        def bytes_equal(bytes: darray[u8], expected: sview) -> bool:
+            return false if bytes.count != expected.len.usize()
+            for index in 0..<expected.len |bytes, expected|:
+                return false if bytes[index] != expected[index]
+            return true
+
+        def copy_into_owned(bytes: mutable darray[u8]&, text: sview) -> void:
+            for index in 0..<text.len |bytes, text|:
+                bytes.push(text[index])
+
+    public:
+        def run() -> i64:
+            # 1. Build a small document in an arena that owns the DOM.
+            owners: mutable Arena = empty_arena()
+            members: mutable darray[JsonMember] = []
+            members.push(json_member(&owners, "name", json_string(&owners, "Designer")))
+            members.push(json_member(&owners, "count", json_number(3.0)))
+            members.push(json_member(&owners, "enabled", json_bool(true)))
+            document: JsonValue = json_object_from(&owners, members)
+
+            encoded: darray[u8] = json_write(&owners, document)
+            return 10 if encoded.count == 0
+
+            written: i64 = catch write_entire_file(OUTPUT_PATH, sview(&encoded[0], 0, encoded.count.i64())):
+                value:
+                    value
+                error e:
+                    return 11
+            return 12 if written != encoded.count.i64()
+
+            # 2. Read it back into a disposable arena and parse it there.
+            read_arena: mutable Arena = empty_arena()
+            loaded: darray[u8] = catch read_entire_file(&read_arena, OUTPUT_PATH):
+                value:
+                    value
+                error e:
+                    return 13
+            return 14 if loaded.count == 0
+
+            parse_arena: mutable Arena = empty_arena()
+            parsed: JsonParseResult = json_parse_checked(&parse_arena, sview(&loaded[0], 0, loaded.count.i64()))
+            return 15 if parsed.code != JsonErrorCode.OK
+
+            name_value: JsonValue = catch json_get(parsed.value, "name"):
+                value:
+                    value
+                error e:
+                    return 16
+            name_text: sview = catch json_as_string(name_value):
+                value:
+                    value
+                error e:
+                    return 17
+
+            # 3. Copy decoded text into application-owned storage, then release
+            #    the parser/read arenas. The copy must survive both resets.
+            owned: mutable darray[u8] = []
+            copy_into_owned(&owned, name_text)
+            arena_reset(&parse_arena)
+            arena_reset(&read_arena)
+
+            return 18 if not bytes_equal(owned, "Designer")
+            return 19 if not bytes_equal(encoded, sview("{\"name\":\"Designer\",\"count\":3,\"enabled\":true}", 0, -1))
+
+            print("spike json_lifetime: ok\n")
+            return 0
+
+def main() -> i64:
+    return JsonLifetimeSpike::run()

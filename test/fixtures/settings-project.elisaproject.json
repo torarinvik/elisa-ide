@@ -1,0 +1,31 @@
+{
+  "format": "elisa-ide-project",
+  "schemaVersion": 1,
+  "projectId": "project-settings",
+  "name": "Settings Example",
+  "applicationId": "org.example.settings",
+  "framework": {
+    "dependency": "elisa-ui"
+  },
+  "forms": [
+    {
+      "id": "form-settings",
+      "path": "forms/settings.elisaform.json"
+    }
+  ],
+  "entryForm": "form-settings",
+  "source": {
+    "roots": ["src"]
+  },
+  "generation": {
+    "namespace": "SettingsExample",
+    "outputRoot": "generated"
+  },
+  "targets": [
+    {
+      "id": "desktop",
+      "backend": "appkit-canvas",
+      "renderer": "skia"
+    }
+  ]
+}

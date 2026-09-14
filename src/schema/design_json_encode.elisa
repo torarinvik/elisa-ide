@@ -1,0 +1,242 @@
+# Project and form document encoding.
+#
+# Output is canonical: compact JSON, fixed member order (never map iteration
+# order), locale-independent number formatting, and no timestamps or random
+# values. Encoding the same document twice is byte-identical, which the
+# round-trip fixtures assert. A single trailing newline makes the file
+# text-friendly without affecting stability.
+
+include "../model/design_limits.elisa"
+include "../model/design_text.elisa"
+include "../model/design_ids.elisa"
+include "../model/design_values.elisa"
+include "../model/design_node.elisa"
+include "../model/design_form.elisa"
+include "../model/design_project.elisa"
+include "../model/design_store.elisa"
+
+include "../../compiler/elisacore_std/elisacore_runtime.elisa"
+include "../../compiler/elisacore_std/collections.elisa"
+include "../../compiler/elisacore_std/elisacore_json.elisa"
+
+module DesignEncode:
+    private:
+        def empty_arena() -> Arena:
+            return Arena{begin: null, end: null, end_index: 0, strategy: 0}
+
+        def text_member(arena: mutable Arena&, members: mutable darray[JsonMember]&, key: sview, text: sview) -> void:
+            members.push(json_member(arena, key, json_string(arena, text)))
+
+        def number_member(arena: mutable Arena&, members: mutable darray[JsonMember]&, key: sview, value: f64) -> void:
+            members.push(json_member(arena, key, json_number(value)))
+
+        def bool_member(arena: mutable Arena&, members: mutable darray[JsonMember]&, key: sview, value: bool) -> void:
+            members.push(json_member(arena, key, json_bool(value)))
+
+        def color_text(arena: mutable Arena&, value: DesignValues::ColorValue) -> sview:
+            buffer: mutable darray[u8] = []
+            # This view is passed directly to json_string after this helper
+            # returns, so its bytes must live in the encoder arena rather
+            # than this function's temporary region.
+            _ = arena_da_reserve(arena, &buffer, 9.usize())
+            buffer.push(35)
+            push_hex(&buffer, value.r)
+            push_hex(&buffer, value.g)
+            push_hex(&buffer, value.b)
+            push_hex(&buffer, value.a)
+            return DesignText::view_of(buffer)
+
+        def push_hex(buffer: mutable darray[u8]&, value: u8) -> void:
+            high: u8 = value / 16
+            low: u8 = value % 16
+            buffer.push(hex_byte(high))
+            buffer.push(hex_byte(low))
+
+        def hex_byte(nibble: u8) -> u8:
+            return 48 + nibble if nibble < 10 else 97 + (nibble - 10)
+
+        def value_json(arena: mutable Arena&, pool: DesignValues::StringPool&, value: DesignValues::DesignValue&) -> JsonValue:
+            match value.tag:
+                DesignValues::ValueTag.Bool:
+                    return json_bool(value.bool_value)
+                DesignValues::ValueTag.Integer:
+                    return json_number(value.int_value.f64())
+                DesignValues::ValueTag.Scalar:
+                    return json_number(value.scalar_value)
+                DesignValues::ValueTag.Length:
+                    return json_number(value.scalar_value)
+                DesignValues::ValueTag.Text:
+                    return json_string(arena, DesignValues::text_of(pool, value.text_ref))
+                DesignValues::ValueTag.EnumKey:
+                    return json_string(arena, DesignValues::text_of(pool, value.text_ref))
+                DesignValues::ValueTag.Color:
+                    return json_string(arena, color_text(arena, value.color_value))
+                DesignValues::ValueTag.NodeRef:
+                    return json_string(arena, DesignValues::text_of(pool, value.text_ref))
+                DesignValues::ValueTag.Unsupported:
+                    raw: darray[u8] = DesignValues::text_of(pool, value.text_ref)
+                    parsed: JsonParseResult = json_parse_checked(arena, DesignText::view_of(raw))
+                    return json_string(arena, DesignText::view_of(raw)) if parsed.code != JsonErrorCode.OK
+                    return parsed.value
+            return json_null()
+
+        def property_json(arena: mutable Arena&, pool: DesignValues::StringPool&, property: DesignNodes::Property&) -> JsonMember:
+            return json_member(arena, DesignValues::text_of(pool, property.key), value_json(arena, pool, property.value))
+
+        def node_json(arena: mutable Arena&, form: DesignForms::Form&, node: DesignNodes::Node&) -> JsonValue:
+            members: mutable darray[JsonMember] = []
+            id_text_storage: mutable u8[24] = zeroed
+            text_member(arena, &members, "id", DesignIds::text(&node.id, &id_text_storage))
+            text_member(arena, &members, "type", DesignValues::text_of(form.strings, node.type_key))
+            text_member(arena, &members, "name", DesignValues::text_of(form.strings, node.name))
+            text_member(arena, &members, "symbol", DesignValues::text_of(form.strings, node.symbol))
+
+            property_members: mutable darray[JsonMember] = []
+            index: mutable i64 = 0
+            while index < node.properties.count.i64():
+                property_members.push(property_json(arena, form.strings, node.properties[index.usize()]))
+                index <- index + 1
+            members.push(json_member(arena, "properties", json_object_from(arena, property_members)))
+
+            children: mutable darray[JsonValue] = []
+            index <- 0
+            while index < node.children.count.i64():
+                children.push(json_string(arena, DesignIds::text(&node.children[index.usize()], &id_text_storage)))
+                index <- index + 1
+            members.push(json_member(arena, "children", json_array_from(arena, children)))
+
+            event_members: mutable darray[JsonMember] = []
+            index <- 0
+            while index < node.events.count.i64():
+                connection: DesignNodes::EventConnection = node.events[index.usize()]
+                handler_members: mutable darray[JsonMember] = []
+                text_member(arena, &handler_members, "handler", DesignValues::text_of(form.strings, connection.handler))
+                event_members.push(json_member(arena, DesignValues::text_of(form.strings, connection.event_key), json_object_from(arena, handler_members)))
+                index <- index + 1
+            members.push(json_member(arena, "events", json_object_from(arena, event_members)))
+
+            if node.runtime_hidden:
+                bool_member(arena, &members, "runtimeHidden", true)
+            if node.editor_locked:
+                bool_member(arena, &members, "editorLocked", true)
+            if node.editor_hidden:
+                bool_member(arena, &members, "editorHidden", true)
+
+            append_raw_members(arena, &members, node.extension_json)
+            return json_object_from(arena, members)
+
+        # Parse a preserved raw object and append its members. Malformed
+        # preserved text is dropped rather than corrupting the document; the
+        # decode step only stores JSON it just produced.
+        def append_raw_members(arena: mutable Arena&, members: mutable darray[JsonMember]&, raw: darray[u8]) -> void:
+            return if raw.count == 0
+            parsed: JsonParseResult = json_parse_checked(arena, DesignText::view_of(raw))
+            return if parsed.code != JsonErrorCode.OK or json_kind(parsed.value) != JsonKind.OBJECT
+            count: i64 = json_object_len(parsed.value)
+            index: mutable i64 = 0
+            while index < count:
+                key: sview = catch json_key_at(parsed.value, index):
+                    value:
+                        value
+                    error e:
+                        ""
+                value: JsonValue = catch json_value_at(parsed.value, index):
+                    value:
+                        value
+                    error e:
+                        JsonValue.Null
+                members.push(json_member(arena, key, value))
+                index <- index + 1
+
+    private:
+        # JSON bytes are copied into the document arena so callers can hold
+        # them across frames (the encoder's local arena dies on return).
+        def durable(bytes: darray[u8]) -> darray[u8]:
+            result: mutable darray[u8] = []
+            DesignStore::ensure_bytes(&result, bytes.count + 1)
+            index: mutable i64 = 0
+            while index < bytes.count.i64():
+                result.push(bytes[index.usize()])
+                index <- index + 1
+            return result
+
+    public:
+        def encode_form(form: DesignForms::Form&) -> darray[u8]:
+            arena: mutable Arena = empty_arena()
+            members: mutable darray[JsonMember] = []
+            id_text_storage: mutable u8[24] = zeroed
+            text_member(&arena, &members, "format", "elisa-ide-form")
+            number_member(&arena, &members, "schemaVersion", form.schema_version.f64())
+            text_member(&arena, &members, "id", DesignIds::text(&form.id, &id_text_storage))
+            text_member(&arena, &members, "name", DesignValues::text_of(form.strings, form.name))
+            text_member(&arena, &members, "moduleSymbol", DesignValues::text_of(form.strings, form.module_symbol))
+
+            viewport_members: mutable darray[JsonMember] = []
+            number_member(&arena, &viewport_members, "width", form.viewport_width)
+            number_member(&arena, &viewport_members, "height", form.viewport_height)
+            members.push(json_member(&arena, "viewport", json_object_from(&arena, viewport_members)))
+
+            text_member(&arena, &members, "root", DesignIds::text(&form.root, &id_text_storage))
+            nodes: mutable darray[JsonValue] = []
+            index: mutable i64 = 0
+            while index < form.nodes.count.i64():
+                nodes.push(node_json(&arena, form, form.nodes[index.usize()]))
+                index <- index + 1
+            members.push(json_member(&arena, "nodes", json_array_from(&arena, nodes)))
+
+            append_raw_members(&arena, &members, form.extensions)
+            encoded: darray[u8] = durable(json_write(&arena, json_object_from(&arena, members)))
+            return encoded
+
+        def encode_project(project: DesignProjects::Project&) -> darray[u8]:
+            arena: mutable Arena = empty_arena()
+            members: mutable darray[JsonMember] = []
+            id_text_storage: mutable u8[24] = zeroed
+            text_member(&arena, &members, "format", "elisa-ide-project")
+            number_member(&arena, &members, "schemaVersion", project.schema_version.f64())
+            text_member(&arena, &members, "projectId", DesignIds::text(&project.id, &id_text_storage))
+            text_member(&arena, &members, "name", DesignValues::text_of(project.strings, project.name))
+            text_member(&arena, &members, "applicationId", DesignValues::text_of(project.strings, project.application_id))
+
+            framework_members: mutable darray[JsonMember] = []
+            text_member(&arena, &framework_members, "dependency", "elisa-ui")
+            members.push(json_member(&arena, "framework", json_object_from(&arena, framework_members)))
+
+            forms: mutable darray[JsonValue] = []
+            index: mutable i64 = 0
+            while index < project.forms.count.i64():
+                entry_members: mutable darray[JsonMember] = []
+                text_member(&arena, &entry_members, "id", DesignIds::text(&project.forms[index.usize()].id, &id_text_storage))
+                text_member(&arena, &entry_members, "path", DesignValues::text_of(project.strings, project.forms[index.usize()].path))
+                forms.push(json_object_from(&arena, entry_members))
+                index <- index + 1
+            members.push(json_member(&arena, "forms", json_array_from(&arena, forms)))
+            text_member(&arena, &members, "entryForm", DesignIds::text(&project.entry_form, &id_text_storage))
+
+            source_members: mutable darray[JsonMember] = []
+            roots: mutable darray[JsonValue] = []
+            index <- 0
+            while index < project.source_roots.count.i64():
+                roots.push(json_string(&arena, DesignValues::text_of(project.strings, project.source_roots[index.usize()])))
+                index <- index + 1
+            source_members.push(json_member(&arena, "roots", json_array_from(&arena, roots)))
+            members.push(json_member(&arena, "source", json_object_from(&arena, source_members)))
+
+            generation_members: mutable darray[JsonMember] = []
+            text_member(&arena, &generation_members, "namespace", DesignValues::text_of(project.strings, project.generation_namespace))
+            text_member(&arena, &generation_members, "outputRoot", DesignValues::text_of(project.strings, project.generation_output_root))
+            members.push(json_member(&arena, "generation", json_object_from(&arena, generation_members)))
+
+            targets: mutable darray[JsonValue] = []
+            index <- 0
+            while index < project.targets.count.i64():
+                target_members: mutable darray[JsonMember] = []
+                text_member(&arena, &target_members, "id", DesignIds::text(&project.targets[index.usize()].id, &id_text_storage))
+                text_member(&arena, &target_members, "backend", DesignValues::text_of(project.strings, project.targets[index.usize()].backend))
+                text_member(&arena, &target_members, "renderer", DesignValues::text_of(project.strings, project.targets[index.usize()].renderer))
+                targets.push(json_object_from(&arena, target_members))
+                index <- index + 1
+            members.push(json_member(&arena, "targets", json_array_from(&arena, targets)))
+
+            append_raw_members(&arena, &members, project.extensions)
+            return durable(json_write(&arena, json_object_from(&arena, members)))

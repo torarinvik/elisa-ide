@@ -1,0 +1,253 @@
+# Core-side lowering of one validated design form into the small byte schema
+# consumed by the isolated UI preview worker. This is a process boundary, not
+# a pointer-sharing shortcut: the worker receives no model arenas or handles.
+
+include "../model/design_text.elisa"
+include "../model/design_ids.elisa"
+include "../model/design_values.elisa"
+include "../model/design_node.elisa"
+include "../model/design_form.elisa"
+include "../model/design_store.elisa"
+include "../registry/design_registry.elisa"
+include "../validation/design_diagnostics.elisa"
+include "../lowering/design_lower.elisa"
+include "preview_wire.elisa"
+
+include "../../compiler/elisacore_std/elisacore_runtime.elisa"
+include "../../compiler/elisacore_std/collections.elisa"
+
+module PreviewForm:
+    private:
+        const MAX_VIEWPORT_Q10: f64 = 4194303.0
+
+        def push_u8(out: mutable darray[u8]&, value: u8) -> void:
+            out.push(value)
+
+        def push_u16(out: mutable darray[u8]&, value: u16) -> void:
+            out.push((value & 255).u8())
+            out.push((value >> 8).u8())
+
+        def push_u32(out: mutable darray[u8]&, value: u32) -> void:
+            for shift in 0..<4:
+                out.push(((value >> (shift * 8)) & 255).u8())
+
+        def push_u64(out: mutable darray[u8]&, value: u64) -> void:
+            for shift in 0..<8:
+                out.push(((value >> (shift * 8)) & 255).u8())
+
+        def push_view(out: mutable darray[u8]&, value: sview) -> bool:
+            return false if value.len < 0 or value.len > PreviewWire::MAX_TEXT_BYTES.i64()
+            return false if out.count + value.len.usize() > PreviewWire::MAX_PAYLOAD_BYTES
+            push_u16(out, value.len.u16())
+            index: mutable i64 = 0
+            while index < value.len:
+                out.push(value[index])
+                index <- index + 1
+            return true
+
+        def q10(value: f64, cap: f64) -> u32:
+            safe: mutable f64 = value
+            safe <- 0.0 if value != value or value < 0.0
+            safe <- cap if safe > cap
+            return (safe * 1024.0).u64().u32()
+
+        def effective_value(form: DesignForms::Form&, registry: DesignRegistry::Registry&, node: DesignNodes::Node&, component: i64, key: sview) -> DesignValues::DesignValue:
+            explicit_index: i64 = DesignNodes::property_index(node, form.strings, key)
+            if explicit_index >= 0:
+                return node.properties[explicit_index.usize()].value
+            descriptor_index: i64 = DesignRegistry::find_property(registry, component, key)
+            if descriptor_index < 0:
+                return DesignValues::boolean(false)
+            return registry.components[component.usize()].properties[descriptor_index.usize()].default_value
+
+        def effective_number(form: DesignForms::Form&, registry: DesignRegistry::Registry&, node: DesignNodes::Node&, component: i64, key: sview) -> f64:
+            descriptor: i64 = DesignRegistry::find_property(registry, component, key)
+            return 0.0 if descriptor < 0
+            value: DesignValues::DesignValue = effective_value(form, registry, node, component, key)
+            return value.int_value.f64() if value.tag == DesignValues::ValueTag.Integer
+            return value.scalar_value
+
+        def effective_text(form: DesignForms::Form&, registry: DesignRegistry::Registry&, node: DesignNodes::Node&, component: i64, key: sview) -> sview:
+            return "" if DesignRegistry::find_property(registry, component, key) < 0
+            value: DesignValues::DesignValue = effective_value(form, registry, node, component, key)
+            return DesignValues::text_of(form.strings, value.text_ref) if DesignNodes::property_index(node, form.strings, key) >= 0
+            return DesignValues::text_of(registry.strings, value.text_ref)
+
+        def effective_bool(form: DesignForms::Form&, registry: DesignRegistry::Registry, node: DesignNodes::Node&, component: i64, key: sview, fallback: bool) -> bool:
+            return fallback if DesignRegistry::find_property(registry, component, key) < 0
+            return effective_value(form, registry, node, component, key).bool_value
+
+        def effective_color(form: DesignForms::Form&, registry: DesignRegistry::Registry&, node: DesignNodes::Node&, component: i64, key: sview, fallback: DesignValues::ColorValue) -> DesignValues::ColorValue:
+            return fallback if DesignRegistry::find_property(registry, component, key) < 0
+            return effective_value(form, registry, node, component, key).color_value
+
+        def type_code(type_key: sview) -> PreviewWire::Component:
+            if DesignText::equal(type_key, "elisa.ui.column"):
+                return PreviewWire::Component.Column
+            if DesignText::equal(type_key, "elisa.ui.row"):
+                return PreviewWire::Component.Row
+            if DesignText::equal(type_key, "elisa.ui.panel"):
+                return PreviewWire::Component.Panel
+            if DesignText::equal(type_key, "elisa.ui.label"):
+                return PreviewWire::Component.Label
+            if DesignText::equal(type_key, "elisa.ui.button"):
+                return PreviewWire::Component.Button
+            return PreviewWire::Component.TextField
+
+        def enum_cross(value: sview) -> u8:
+            return 0 if DesignText::equal(value, "start")
+            return 1 if DesignText::equal(value, "center")
+            return 2 if DesignText::equal(value, "end")
+            return 3
+
+        def enum_main(value: sview) -> u8:
+            return 0 if DesignText::equal(value, "start")
+            return 1 if DesignText::equal(value, "center")
+            return 2 if DesignText::equal(value, "end")
+            return 3
+
+        def push_color(out: mutable darray[u8]&, value: DesignValues::ColorValue) -> void:
+            push_u8(out, value.r)
+            push_u8(out, value.g)
+            push_u8(out, value.b)
+            push_u8(out, value.a)
+
+        # Callee-local darrays live in a temporary region. The shell asks for
+        # this snapshot after the encoder returns, so copy it into the core
+        # document arena before it crosses the host protocol boundary.
+        def durable(bytes: darray[u8]) -> darray[u8]:
+            result: mutable darray[u8] = []
+            DesignStore::ensure_bytes(&result, bytes.count)
+            index: mutable i64 = 0
+            while index < bytes.count.i64():
+                result.push(bytes[index.usize()])
+                index <- index + 1
+            return result
+
+        def push_node(out: mutable darray[u8]&, form: DesignForms::Form&, registry: DesignRegistry::Registry&, operation: DesignLower::Operation) -> bool:
+            node: DesignNodes::Node = form.nodes[operation.source_node.usize()]
+            component: i64 = operation.component_index
+            kind: PreviewWire::Component = type_code(DesignValues::text_of(form.strings, node.type_key))
+
+            id_storage: mutable u8[PreviewWire::MAX_ID_BYTES] = zeroed
+            id_text: sview = DesignIds::text(&node.id, &id_storage[0])
+            return false if id_text.len <= 0 or id_text.len > PreviewWire::MAX_ID_BYTES.i64()
+            return false if out.count + 70 + id_text.len.usize() > PreviewWire::MAX_PAYLOAD_BYTES
+
+            push_u8(out, id_text.len.u8())
+            push_u8(out, kind.u8())
+            parent: u16 = 65535 if operation.parent_operation < 0 else operation.parent_operation.u16()
+            push_u16(out, parent)
+
+            flags: mutable u16 = 0
+            flags <- flags | 1 if effective_bool(form, registry, node, component, "visible", true) and not node.runtime_hidden
+            flags <- flags | 2 if effective_bool(form, registry, node, component, "enabled", true)
+            flags <- flags | 4 if effective_bool(form, registry, node, component, "secure", false)
+            push_u16(out, flags)
+
+            axis: mutable u8 = 1 if kind == PreviewWire::Component.Column else 0
+            axis <- 0 if kind == PreviewWire::Component.Row
+            axis <- 0 if kind == PreviewWire::Component.Panel and DesignText::equal(effective_text(form, registry, node, component, "axis"), "row")
+            cross: u8 = enum_cross(effective_text(form, registry, node, component, "crossAlignment"))
+            main: u8 = enum_main(effective_text(form, registry, node, component, "mainAlignment"))
+            push_u8(out, axis)
+            push_u8(out, cross)
+            push_u8(out, main)
+            push_u8(out, 0)
+
+            index: mutable i64 = 0
+            while index < id_text.len:
+                out.push(id_text[index])
+                index <- index + 1
+
+            push_u32(out, q10(effective_number(form, registry, node, component, "padding"), 100000.0))
+            push_u32(out, q10(effective_number(form, registry, node, component, "spacing"), 100000.0))
+            push_u32(out, q10(effective_number(form, registry, node, component, "grow"), 1000.0))
+            push_u32(out, q10(effective_number(form, registry, node, component, "minimumWidth"), 100000.0))
+            push_u32(out, q10(effective_number(form, registry, node, component, "minimumHeight"), 100000.0))
+            push_u32(out, q10(effective_number(form, registry, node, component, "margin"), 100000.0))
+            push_u32(out, q10(effective_number(form, registry, node, component, "size"), 200.0))
+
+            background_default: DesignValues::ColorValue = DesignValues::ColorValue{r: 24, g: 27, b: 33, a: 255}
+            foreground_default: DesignValues::ColorValue = DesignValues::ColorValue{r: 232, g: 236, b: 246, a: 255}
+            hover_default: DesignValues::ColorValue = DesignValues::ColorValue{r: 84, g: 136, b: 244, a: 255}
+            press_default: DesignValues::ColorValue = DesignValues::ColorValue{r: 48, g: 90, b: 190, a: 255}
+            fill_default: DesignValues::ColorValue = DesignValues::ColorValue{r: 27, g: 32, b: 43, a: 255}
+            background: mutable DesignValues::ColorValue = effective_color(form, registry, node, component, "background", background_default)
+            background <- effective_color(form, registry, node, component, "color", background) if kind == PreviewWire::Component.Button
+            background <- effective_color(form, registry, node, component, "fill", fill_default) if kind == PreviewWire::Component.TextField
+            foreground: mutable DesignValues::ColorValue = effective_color(form, registry, node, component, "color", foreground_default)
+            foreground <- effective_color(form, registry, node, component, "textColor", foreground) if kind == PreviewWire::Component.Button
+            foreground <- effective_color(form, registry, node, component, "ink", foreground) if kind == PreviewWire::Component.TextField
+            hover: DesignValues::ColorValue = effective_color(form, registry, node, component, "hoverColor", hover_default)
+            press: DesignValues::ColorValue = effective_color(form, registry, node, component, "pressColor", press_default)
+            fill: DesignValues::ColorValue = effective_color(form, registry, node, component, "fill", fill_default)
+            push_color(out, background)
+            push_color(out, foreground)
+            push_color(out, hover)
+            push_color(out, press)
+            push_color(out, fill)
+
+            text: sview = effective_text(form, registry, node, component, "text")
+            label: sview = effective_text(form, registry, node, component, "label")
+            placeholder: sview = effective_text(form, registry, node, component, "placeholder")
+            initial: sview = effective_text(form, registry, node, component, "initial")
+            return false if text.len > PreviewWire::MAX_TEXT_BYTES.i64() or label.len > PreviewWire::MAX_TEXT_BYTES.i64() or placeholder.len > PreviewWire::MAX_TEXT_BYTES.i64() or initial.len > PreviewWire::MAX_TEXT_BYTES.i64()
+            return false if out.count + id_text.len.usize() + text.len.usize() + label.len.usize() + placeholder.len.usize() + initial.len.usize() > PreviewWire::MAX_PAYLOAD_BYTES
+            return false if not push_view(out, text)
+            return false if not push_view(out, label)
+            return false if not push_view(out, placeholder)
+            return false if not push_view(out, initial)
+            return true
+
+    public:
+        const enum Issue of i32:
+            None = 0
+            UnsupportedForm = 1
+            TooManyNodes = 2
+            TooLarge = 3
+            InvalidNode = 4
+            InvalidViewport = 5
+
+        struct Result:
+            code: mutable Issue
+            revision: mutable u64
+            bytes: mutable darray[u8]
+
+        def encode(form: DesignForms::Form&, registry: DesignRegistry::Registry) -> Result:
+            empty: mutable Result = Result{code: Issue.UnsupportedForm, revision: form.revision.u64(), bytes: []}
+            if form.nodes.count == 0 or form.nodes.count > PreviewWire::MAX_NODES:
+                empty.code <- Issue.TooManyNodes
+                return empty
+            if form.viewport_width <= 0.0 or form.viewport_height <= 0.0 or form.viewport_width > MAX_VIEWPORT_Q10 or form.viewport_height > MAX_VIEWPORT_Q10:
+                empty.code <- Issue.InvalidViewport
+                return empty
+
+            sink: mutable DesignDiagnostics::Sink = DesignDiagnostics::empty_sink()
+            lowered: DesignLower::LoweredForm = DesignLower::lower_form(form, registry, &sink)
+            if not lowered.valid or lowered.operations.count > PreviewWire::MAX_NODES:
+                empty.code <- Issue.UnsupportedForm
+                return empty
+
+            out: mutable darray[u8] = []
+            out.push(PreviewWire::MAGIC_0)
+            out.push(PreviewWire::MAGIC_1)
+            out.push(PreviewWire::MAGIC_2)
+            out.push(PreviewWire::MAGIC_3)
+            push_u16(&out, PreviewWire::VERSION)
+            push_u16(&out, 0)
+            push_u64(&out, form.revision.u64())
+            push_u32(&out, q10(form.viewport_width, MAX_VIEWPORT_Q10).u32())
+            push_u32(&out, q10(form.viewport_height, MAX_VIEWPORT_Q10).u32())
+            push_u16(&out, lowered.operations.count.u16())
+            push_u16(&out, 0)
+
+            index: mutable i64 = 0
+            while index < lowered.operations.count.i64():
+                if not push_node(&out, form, registry, lowered.operations[index.usize()]):
+                    empty.code <- Issue.TooLarge if out.count >= PreviewWire::MAX_PAYLOAD_BYTES
+                    empty.code <- Issue.InvalidNode if empty.code == Issue.UnsupportedForm
+                    return empty
+                index <- index + 1
+
+            return Result{code: Issue.None, revision: form.revision.u64(), bytes: durable(out)}

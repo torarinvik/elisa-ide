@@ -1,0 +1,133 @@
+# Shell-side isolated form preview lifecycle.
+#
+# The document host returns a bounded binary form snapshot. A short-lived
+# AppKit worker renders it to PNG; the shell decodes that PNG into retained
+# RGBA bytes and uploads them through elisa-ui's SDL3 image resource bridge.
+# The UI thread only polls a running worker and uploads completed pixels.
+
+include "../platform/posix/posix_file.elisa"
+include "../platform/posix/posix_process.elisa"
+include "host_client.elisa"
+include "shell_state.elisa"
+
+const PREVIEW_INPUT_PATH: cstr = "build/elisa-ide-preview.bin"
+const PREVIEW_FRAME_PATH: cstr = "build/elisa-ide-preview.png"
+const PREVIEW_WORKER_PATH: cstr = "build/preview_worker"
+const PREVIEW_PIXEL_CAPACITY: usize = 4194304
+const PREVIEW_RESOURCE_OWNER: u32 = 0x454C4953
+
+global mutable preview_process: mutable PosixProcess::Process = PosixProcess::Process{handle: null}
+global mutable preview_pixels: mutable u8[PREVIEW_PIXEL_CAPACITY] = zeroed
+
+@link_name("designer_setenv")
+extern shell_preview_setenv(name: cstr, value: cstr) -> i64
+
+@link_name("designer_png_decode_rgba32")
+extern shell_preview_decode_png(path: cstr, output: mutable u8&, capacity: usize, width: mutable usize&, height: mutable usize&, row_stride: mutable usize&) -> i64 can[Blocking.IO]
+
+module ShellPreview:
+    private:
+        def set_message(shell: mutable Shell&, message: sview) -> void:
+            UiHandles::set_text(shell.preview_status, message, 11.0, shell_color(148, 158, 180))
+
+        def revision_of(snapshot: darray[u8]&) -> u64:
+            return 0 if snapshot.count < 16
+            revision: mutable u64 = 0
+            for shift in 0..<8:
+                revision <- revision | (snapshot[8 + shift].u64() << (shift * 8))
+            return revision
+
+        def decode_completed_frame(shell: mutable Shell&) -> bool can[Blocking.IO]:
+            width: mutable usize = 0
+            height: mutable usize = 0
+            row_stride: mutable usize = 0
+            decoded: i64 = shell_preview_decode_png(PREVIEW_FRAME_PATH, &preview_pixels[0], PREVIEW_PIXEL_CAPACITY, &width, &height, &row_stride)
+            if decoded != 1 or width == 0 or height == 0 or row_stride < width * 4:
+                return false
+            if not UiResources::resource_is_valid(shell.preview_resource):
+                return false
+            if UiResources::state(shell.preview_resource) == UiResources::State.Requested:
+                return false if not UiResources::set_state(shell.preview_resource, UiResources::State.Ready)
+            shell.preview_width <- width
+            shell.preview_height <- height
+            shell.preview_row_stride <- row_stride
+            shell.preview_image <- UiCore::image_ref(shell.preview_resource.slot, shell.preview_resource.generation)
+            UiHandles::set_image(shell.preview_canvas, shell.preview_image)
+            shell.preview_ready <- true
+            return true
+
+        def finish_worker(shell: mutable Shell&) -> void can[Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast]:
+            stdout: mutable darray[u8] = []
+            stderr: mutable darray[u8] = []
+            status: PosixProcess::Status = PosixProcess::status(&preview_process)
+            _ = PosixProcess::read_stdout(&preview_process, &stdout, 1048576)
+            _ = PosixProcess::read_stderr(&preview_process, &stderr, 1048576)
+            PosixProcess::dispose(&preview_process)
+            shell.preview_pending <- false
+            if not status.finished or status.exit_code != 0 or status.stdout_truncated:
+                shell.preview_revision <- 0
+                if stderr.count > 0:
+                    UiHandles::set_help(shell.preview_status, ShellBytes::view_of(&stderr))
+                set_message(shell, "Preview worker failed; edit the form or retry to render again")
+                return
+            if not decode_completed_frame(shell):
+                shell.preview_revision <- 0
+                set_message(shell, "Preview frame could not be decoded or uploaded")
+                return
+            set_message(shell, "Preview ready")
+
+    public:
+        def initialize(shell: mutable Shell&) -> void:
+            shell.preview_resource <- UiResources::request("elisa-ide-preview-frame", PREVIEW_RESOURCE_OWNER)
+            if not UiResources::resource_is_valid(shell.preview_resource):
+                set_message(shell, "Preview image resource could not be allocated")
+                return
+            shell.preview_image <- UiCore::image_ref(shell.preview_resource.slot, shell.preview_resource.generation)
+            UiHandles::set_image(shell.preview_canvas, shell.preview_image)
+            set_message(shell, "Waiting for form preview")
+
+        def refresh(shell: mutable Shell&, process: mutable PosixProcess::Process&) -> void can[Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast]:
+            return if not shell.host_running
+            snapshot: HostClient::HostReply = HostClient::request(process, 80, 0, 0)
+            if snapshot.result != 1:
+                set_message(shell, "This form cannot be rendered in the live preview")
+                return
+            revision: u64 = revision_of(snapshot.text)
+            return if revision == 0 or revision == shell.preview_revision
+            if shell.preview_pending:
+                _ = PosixProcess::cancel(&preview_process)
+                PosixProcess::dispose(&preview_process)
+                shell.preview_pending <- false
+            _ = PosixFile::remove(PREVIEW_INPUT_PATH)
+            _ = PosixFile::remove(PREVIEW_FRAME_PATH)
+            written: i64 = PosixFile::write_bytes_plain(PREVIEW_INPUT_PATH, snapshot.text)
+            if written != snapshot.text.count.i64():
+                set_message(shell, "Preview snapshot could not be written")
+                return
+            if shell_preview_setenv("ELISA_UI_PREVIEW_INPUT", PREVIEW_INPUT_PATH) != 0 or
+               shell_preview_setenv("ELISA_UI_SNAPSHOT", PREVIEW_FRAME_PATH) != 0 or
+               shell_preview_setenv("ELISA_UI_SMOKE_FRAMES", "1") != 0:
+                set_message(shell, "Preview worker environment could not be configured")
+                return
+            arguments: mutable darray[cstr] = []
+            arguments.push(PREVIEW_WORKER_PATH)
+            preview_process <- PosixProcess::start(&arguments)
+            if not PosixProcess::valid(&preview_process):
+                set_message(shell, "Preview worker could not be started")
+                return
+            shell.preview_revision <- revision
+            shell.preview_pending <- true
+            set_message(shell, "Rendering form preview…")
+
+        def poll_and_bind(shell: mutable Shell&) -> void can[Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast]:
+            if shell.preview_pending and PosixProcess::poll(&preview_process, 0):
+                finish_worker(shell)
+            return if not shell.preview_ready or not UiCore::image_ref_is_valid(shell.preview_image)
+            return if UiSdl3Draw::is_image_bound(shell.preview_image)
+            if not UiSdl3Draw::bind_image_rgba32(shell.preview_image, &preview_pixels[0], preview_row_stride * preview_height, preview_width, preview_height, preview_row_stride):
+                set_message(shell, "Preview frame is ready but could not be uploaded to SDL")
+
+        def stop() -> void can[Blocking.IO, Memory.Release]:
+            if PosixProcess::valid(&preview_process):
+                _ = PosixProcess::cancel(&preview_process)
+                PosixProcess::dispose(&preview_process)

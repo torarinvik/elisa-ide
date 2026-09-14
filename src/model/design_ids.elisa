@@ -1,0 +1,182 @@
+# Durable design identities.
+#
+# A `DesignId` is a compact inline byte string, not a pointer, handle slot,
+# index, or display name. It survives serialization, copying, and reordering.
+# The payload is held in three scalar words rather than a fixed byte array:
+# stage1 currently drops fixed-array members at several nested aggregate-copy
+# boundaries in larger host programs. Bytes are explicitly packed little-endian
+# within each word so parsing, text conversion, equality, and hashing all use
+# the same canonical byte sequence on every supported target.
+#
+# Canonical form: lowercase ASCII letters, digits, and hyphens; starts with a
+# letter; 1..MAX_ID_BYTES bytes. Generated IDs are deterministic
+# (`<prefix><base36 counter>`) so encoding the same document twice is
+# byte-identical.
+
+include "./design_limits.elisa"
+
+module DesignIds:
+    public:
+        struct DesignId:
+            word0: mutable u64
+            word1: mutable u64
+            word2: mutable u64
+            length: mutable i64
+
+        def empty() -> DesignId:
+            return DesignId{word0: 0, word1: 0, word2: 0, length: 0}
+
+        # Compiler-safe identity transfer for durable aggregate fields. Keep
+        # these scalar writes explicit: whole-struct copies have dropped ID
+        # members in the document host even after removing the byte array.
+        def copy_into(target: mutable DesignId&, source: DesignId&) -> void:
+            target.word0 <- source.word0
+            target.word1 <- source.word1
+            target.word2 <- source.word2
+            target.length <- source.length
+
+        def append_copy(target: mutable darray[DesignId]&, source: DesignId&) -> void:
+            target.push(empty())
+            copy_into(&target[target.count - 1.usize()], source)
+
+        def is_empty(id: DesignId) -> bool:
+            return id.length == 0
+
+        # Read and write one packed byte. `set_word_byte` replaces exactly one
+        # octet using subtraction/addition, avoiding representation-dependent
+        # pointer casts and preserving the other seven bytes in the word.
+        def word_byte(word: u64, offset: i64) -> u8:
+            return ((word >> (offset * 8)) & 255).u8()
+
+        def set_word_byte(word: mutable u64&, offset: i64, byte: u8) -> void:
+            shift: i64 = offset * 8
+            previous: u64 = ((word >> shift) & 255)
+            word <- word - (previous << shift) + (byte.u64() << shift)
+
+        def byte_at(id: DesignId&, index: i64) -> u8:
+            return 0 if index < 0 or index >= id.length or index >= DesignLimits::MAX_ID_BYTES.i64()
+            if index < 8:
+                return word_byte(id.word0, index)
+            if index < 16:
+                return word_byte(id.word1, index - 8)
+            return word_byte(id.word2, index - 16)
+
+        def set_byte(id: mutable DesignId&, index: i64, byte: u8) -> void:
+            return if index < 0 or index >= DesignLimits::MAX_ID_BYTES.i64()
+            if index < 8:
+                set_word_byte(&id.word0, index, byte)
+            elif index < 16:
+                set_word_byte(&id.word1, index - 8, byte)
+            else:
+                set_word_byte(&id.word2, index - 16, byte)
+
+        def is_letter(byte: u8) -> bool:
+            return (byte >= 97 and byte <= 122) or (byte >= 65 and byte <= 90)
+
+        def is_digit(byte: u8) -> bool:
+            return byte >= 48 and byte <= 57
+
+        def is_hyphen(byte: u8) -> bool:
+            return byte == 45
+
+        def canonical_byte(byte: u8) -> u8:
+            return byte + 32 if byte >= 65 and byte <= 90 else byte
+
+        # Parse and canonicalize. Returns an empty ID for anything invalid:
+        # empty text, over the byte budget, a non-letter first byte, or a byte
+        # outside the alphabet.
+        def from_text(text: sview) -> DesignId:
+            id: mutable DesignId = empty()
+            return id if text.len <= 0 or text.len.usize() > DesignLimits::MAX_ID_BYTES
+            first: u8 = text[0]
+            return id if not is_letter(first)
+            index: mutable i64 = 0
+            while index < text.len:
+                byte: u8 = canonical_byte(text[index])
+                return empty() if not (is_letter(byte) or is_digit(byte) or is_hyphen(byte))
+                set_byte(&id, index, byte)
+                index <- index + 1
+            id.length <- text.len
+            return id
+
+        # Copy the canonical bytes to caller-owned storage and return a view
+        # into that storage. The caller controls the view lifetime, while
+        # explicit unpacking keeps this API independent of target endianness.
+        def text(id: DesignId&, output: mutable u8[24]&) -> sview:
+            return "" if id.length <= 0 or id.length > DesignLimits::MAX_ID_BYTES.i64()
+            index: mutable i64 = 0
+            while index < id.length:
+                output[index.usize()] <- byte_at(id, index)
+                index <- index + 1
+            return sview(&output[0], 0, id.length)
+
+        def equal(left: DesignId, right: DesignId) -> bool:
+            return false if left.length != right.length
+            index: mutable i64 = 0
+            while index < left.length:
+                return false if byte_at(&left, index) != byte_at(&right, index)
+                index <- index + 1
+            return true
+
+        def hash(id: DesignId) -> u64:
+            value: mutable u64 = 14695981039346656037
+            index: mutable i64 = 0
+            while index < id.length:
+                value <- (value ^ byte_at(&id, index).u64()) * 1099511628211
+                index <- index + 1
+            return value
+
+        # Deterministic allocator. The prefix separates identity namespaces
+        # (n = node, f = form, p = project, c = component, a = asset, ...).
+        struct Allocator:
+            prefix: mutable u8
+            next: mutable u64
+
+        def allocator(prefix: u8) -> Allocator:
+            return Allocator{prefix: prefix, next: 1}
+
+        def base36(digit: u64) -> u8:
+            return 48 + digit.u8() if digit < 10 else 97 + (digit - 10).u8()
+
+        # Fills `id` in place, avoiding a by-value return across an ID storage
+        # boundary even though this representation consists only of scalars.
+        def alloc_into(id: mutable DesignId&, allocator: mutable Allocator&) -> void:
+            id.word0 <- 0
+            id.word1 <- 0
+            id.word2 <- 0
+            id.length <- 0
+            number: mutable u64 = allocator.next
+            allocator.next <- allocator.next + 1
+            digits: mutable u8[16] = zeroed
+            count: mutable i64 = 0
+            while number > 0:
+                digits[count.usize()] <- base36(number % 36)
+                count <- count + 1
+                number <- number / 36
+            set_byte(id, 0, allocator.prefix)
+            index: mutable i64 = 0
+            while index < count:
+                set_byte(id, index + 1, digits[(count - 1 - index).usize()])
+                index <- index + 1
+            id.length <- count + 1
+
+        def alloc(allocator: mutable Allocator&) -> DesignId:
+            id: mutable DesignId = empty()
+            alloc_into(&id, allocator)
+            return id
+
+        # True when `text` is a well-formed identifier usable as a generated
+        # Elisa symbol: lowercase letters, digits, underscores; starts with a
+        # lowercase letter; bounded. Reserved words are rejected by the
+        # registry/emitter layers that know the language surface.
+        def valid_symbol(text: sview) -> bool:
+            return false if text.len <= 0 or text.len.usize() > DesignLimits::MAX_SYMBOL_BYTES
+            first: u8 = text[0]
+            return false if first < 97 or first > 122
+            index: mutable i64 = 0
+            while index < text.len:
+                byte: u8 = text[index]
+                valid: bool = (byte >= 97 and byte <= 122) or (byte >= 48 and byte <= 57) or byte == 95
+                return false if not valid
+                index <- index + 1
+            return true

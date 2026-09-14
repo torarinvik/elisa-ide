@@ -1,0 +1,187 @@
+# Pure source-map records for deterministic generated Elisa files.
+#
+# Every span uses a half-open [start_byte, end_byte) range in UTF-8 *bytes*.
+# These are not Unicode scalar, grapheme, or line/column offsets. A map is
+# bound to the exact generated file by its byte length and FNV-1a hash; callers
+# must validate that pair before using an editor/compiler location.
+
+include "../model/design_ids.elisa"
+include "../model/design_text.elisa"
+include "../model/design_values.elisa"
+include "../model/fingerprint.elisa"
+
+include "../../compiler/elisacore_std/elisacore_runtime.elisa"
+include "../../compiler/elisacore_std/collections.elisa"
+
+module CodegenSourceMap:
+    private:
+        const MAX_SPANS: usize = 8192
+        global mutable source_map_arena: Arena = Arena{begin: null, end: null, end_index: 0, strategy: 0}
+
+        def valid_id_text(value: sview) -> bool:
+            return false if value.len <= 0 or value.len > 24
+            id: mutable DesignIds::DesignId = DesignIds::from_text(value)
+            return false if DesignIds::is_empty(id)
+            canonical_bytes: mutable u8[24] = zeroed
+            canonical: sview = DesignIds::text(&id, &canonical_bytes)
+            return DesignText::equal(value, canonical)
+
+        def valid_label(value: sview) -> bool:
+            return false if value.len <= 0 or value.len > 256
+            index: mutable i64 = 0
+            while index < value.len:
+                byte: u8 = value[index]
+                return false if byte < 32 or byte == 127
+                index <- index + 1
+            return true
+
+        def valid_origin(kind: OriginKind, form_id: sview, node_id: sview, member: sview) -> bool:
+            return false if not valid_id_text(form_id)
+            match kind:
+                OriginKind.Form:
+                    return node_id.len == 0 and member.len == 0
+                OriginKind.Node:
+                    return valid_id_text(node_id) and member.len == 0
+                OriginKind.Property:
+                    return valid_id_text(node_id) and valid_label(member)
+                OriginKind.Event:
+                    return valid_id_text(node_id) and valid_label(member)
+                OriginKind.Template:
+                    return (node_id.len == 0 or valid_id_text(node_id)) and valid_label(member)
+            return false
+
+        def result(ok: bool, code: Issue, span_index: i64) -> Validation:
+            return Validation{ok: ok, code: code, span_index: span_index}
+
+        def success() -> Validation:
+            return result(true, Issue.None, -1)
+
+        def lookup_result(ok: bool, found: bool, code: Issue, span_index: i64) -> Lookup:
+            return Lookup{ok: ok, found: found, code: code, span_index: span_index}
+
+    public:
+        const SUPPORTED_VERSION: i64 = 1
+
+        const enum OriginKind of i32:
+            Form = 0
+            Node = 1
+            Property = 2
+            Event = 3
+            Template = 4
+
+        const enum Issue of i32:
+            None = 0
+            UnsupportedVersion = 1
+            TooManySpans = 2
+            StaleGeneratedFile = 3
+            InvalidSpanRange = 4
+            InvalidOrigin = 5
+            InvalidByteOffset = 6
+
+        struct Span:
+            start_byte: mutable i64
+            end_byte: mutable i64
+            kind: mutable OriginKind
+            form_id: mutable DesignValues::StringRef
+            node_id: mutable DesignValues::StringRef
+            member: mutable DesignValues::StringRef
+
+        struct SourceMap:
+            version: mutable i64
+            generated_hash: mutable u64
+            generated_length: mutable i64
+            strings: mutable DesignValues::StringPool
+            spans: mutable darray[Span]
+
+        struct Validation:
+            ok: mutable bool
+            code: mutable Issue
+            # -1 means map/file metadata; otherwise identifies the bad span.
+            span_index: mutable i64
+
+        struct Lookup:
+            ok: mutable bool
+            found: mutable bool
+            code: mutable Issue
+            span_index: mutable i64
+
+        def empty(generated_bytes: sview) -> SourceMap:
+            return SourceMap{
+                version: SUPPORTED_VERSION,
+                generated_hash: Fingerprint::fnv1a64(generated_bytes),
+                generated_length: generated_bytes.len,
+                strings: DesignValues::empty_pool(),
+                spans: [],
+            }
+
+        # Adds one half-open span. Overlapping spans are allowed so a narrow
+        # property/event region can refine a containing node or form region.
+        # Lookup prefers the shortest matching span; equal-length ties retain
+        # insertion order.
+        def add_span(map: mutable SourceMap&, start_byte: i64, end_byte: i64, kind: OriginKind, form_id: sview, node_id: sview, member: sview) -> bool:
+            return false if map.version != SUPPORTED_VERSION or map.spans.count >= MAX_SPANS
+            return false if start_byte < 0 or end_byte <= start_byte or end_byte > map.generated_length
+            return false if not valid_origin(kind, form_id, node_id, member)
+            _ = arena_da_reserve(&source_map_arena, map.spans, map.spans.count + 1)
+            form_ref: DesignValues::StringRef = DesignValues::append(&map.strings.bytes, form_id)
+            node_ref: DesignValues::StringRef = DesignValues::append(&map.strings.bytes, node_id)
+            member_ref: DesignValues::StringRef = DesignValues::append(&map.strings.bytes, member)
+            map.spans.push(Span{
+                start_byte: start_byte,
+                end_byte: end_byte,
+                kind: kind,
+                form_id: form_ref,
+                node_id: node_ref,
+                member: member_ref,
+            })
+            return true
+
+        def validate(map: SourceMap&, generated_bytes: sview) -> Validation:
+            return result(false, Issue.UnsupportedVersion, -1) if map.version != SUPPORTED_VERSION
+            return result(false, Issue.StaleGeneratedFile, -1) if map.generated_length != generated_bytes.len or map.generated_hash != Fingerprint::fnv1a64(generated_bytes)
+            return result(false, Issue.TooManySpans, -1) if map.spans.count > MAX_SPANS
+            index: mutable i64 = 0
+            while index < map.spans.count.i64():
+                span: Span = map.spans[index.usize()]
+                return result(false, Issue.InvalidSpanRange, index) if span.start_byte < 0 or span.end_byte <= span.start_byte or span.end_byte > map.generated_length
+                form_text: sview = DesignValues::text_of(map.strings, span.form_id)
+                node_text: sview = DesignValues::text_of(map.strings, span.node_id)
+                member_text: sview = DesignValues::text_of(map.strings, span.member)
+                return result(false, Issue.InvalidOrigin, index) if not valid_origin(span.kind, form_text, node_text, member_text)
+                index <- index + 1
+            return success()
+
+        # Return the most-specific containing span for a generated UTF-8 byte
+        # offset. This validates the hash on every query to prevent navigation
+        # through a map from an earlier generated result.
+        def lookup(map: SourceMap&, generated_bytes: sview, byte_offset: i64) -> Lookup:
+            checked: Validation = validate(map, generated_bytes)
+            return lookup_result(false, false, checked.code, checked.span_index) if not checked.ok
+            return lookup_result(false, false, Issue.InvalidByteOffset, -1) if byte_offset < 0 or byte_offset >= map.generated_length
+            best_index: mutable i64 = -1
+            best_length: mutable i64 = 9223372036854775807
+            index: mutable i64 = 0
+            while index < map.spans.count.i64():
+                span: Span = map.spans[index.usize()]
+                span_length: i64 = span.end_byte - span.start_byte
+                if byte_offset >= span.start_byte and byte_offset < span.end_byte and span_length < best_length:
+                    best_index <- index
+                    best_length <- span_length
+                index <- index + 1
+            return lookup_result(true, best_index >= 0, Issue.None, best_index)
+
+        def kind_at(map: SourceMap&, span_index: i64) -> OriginKind:
+            return OriginKind.Form if span_index < 0 or span_index >= map.spans.count.i64()
+            return map.spans[span_index.usize()].kind
+
+        def form_id_at(map: SourceMap&, span_index: i64) -> sview:
+            return "" if span_index < 0 or span_index >= map.spans.count.i64()
+            return DesignValues::text_of(map.strings, map.spans[span_index.usize()].form_id)
+
+        def node_id_at(map: SourceMap&, span_index: i64) -> sview:
+            return "" if span_index < 0 or span_index >= map.spans.count.i64()
+            return DesignValues::text_of(map.strings, map.spans[span_index.usize()].node_id)
+
+        def member_at(map: SourceMap&, span_index: i64) -> sview:
+            return "" if span_index < 0 or span_index >= map.spans.count.i64()
+            return DesignValues::text_of(map.strings, map.spans[span_index.usize()].member)

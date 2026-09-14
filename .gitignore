@@ -1,0 +1,16 @@
+# Local implementation planning document.
+/IMPLEMENTATION_PLAN.md
+
+# Build products.
+/build/
+*.o
+
+# Local workspace state, caches, and crash-recovery data.
+/.elisa-ide/
+*.tmp
+
+# macOS.
+.DS_Store
+/docs/development
+/docs/adr
+compiler

@@ -1,0 +1,37 @@
+# Bounded row-window policy for shell panels whose model can outgrow the UI
+# widget budget. The shell realizes only one page of row widgets at a time.
+
+module ShellWindow:
+    public:
+        struct Window:
+            total: mutable i64
+            page_size: mutable i64
+            page: mutable i64
+            page_count: mutable i64
+            first: mutable i64
+            finish: mutable i64
+
+        def resolve(item_count: i64, requested_page: i64, requested_page_size: i64) -> Window:
+            total: mutable i64 = item_count
+            total <- 0 if total < 0
+            page_size: mutable i64 = requested_page_size
+            page_size <- 1 if page_size < 1
+            page_count: mutable i64 = 0 if total == 0 else (total + page_size - 1) / page_size
+            page: mutable i64 = requested_page
+            page <- 0 if page < 0 or page_count == 0
+            page <- page_count - 1 if page_count > 0 and page >= page_count
+            first: i64 = page * page_size
+            finish: mutable i64 = first + page_size
+            finish <- total if finish > total
+            return Window{total: total, page_size: page_size, page: page, page_count: page_count, first: first, finish: finish}
+
+        def logical_index(window: Window&, slot: i64) -> i64:
+            return -1 if slot < 0 or slot >= window.page_size
+            index: i64 = window.first + slot
+            return index if index < window.finish else -1
+
+        def has_previous(window: Window&) -> bool:
+            return window.page > 0
+
+        def has_next(window: Window&) -> bool:
+            return window.page + 1 < window.page_count

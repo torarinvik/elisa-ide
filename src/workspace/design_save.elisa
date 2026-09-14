@@ -1,0 +1,95 @@
+# Transactional single-file save.
+#
+# Policy: encode, verify the on-disk fingerprint still matches the version the
+# session loaded or last saved, write atomically through the POSIX adapter, and
+# report pre-commit failure without touching the previous file. A completed
+# rename with failed directory sync is reported as committed because the new
+# bytes are visible; the caller must not claim the old bytes remain present.
+
+include "../model/design_limits.elisa"
+include "../model/design_text.elisa"
+include "../model/design_form.elisa"
+include "../model/fingerprint.elisa"
+include "../schema/design_json_encode.elisa"
+include "../platform/posix/posix_file.elisa"
+
+error DesignSaveError:
+    EncodeFailed
+    ExternalChange(path: cstr)
+    DestinationExists(path: cstr)
+    DestinationUnavailable(path: cstr)
+    WriteFailed(path: cstr)
+
+module DesignSave:
+    public:
+        const READ_CAPACITY: usize = DesignLimits::MAX_INPUT_BYTES
+
+        # Save `form` to `path`. When `check_external` is true, the current
+        # file (if any) must hash to `expected`; otherwise the save is refused
+        # and the file is left untouched.
+        def save_form(path: cstr, form: DesignForms::Form&, expected: u64, check_external: bool) -> i64 error[DesignSaveError]:
+            encoded: darray[u8] = DesignEncode::encode_form(form)
+            if encoded.count == 0:
+                raise DesignSaveError.EncodeFailed
+            if check_external:
+                current: mutable darray[u8] = []
+                amount: i64 = PosixFile::read_bytes_result(&current, path, READ_CAPACITY)
+                if amount < 0:
+                    missing: bool = PosixFile::read_error_is_not_found(amount)
+                    # An expected nonzero fingerprint proves the session had a
+                    # destination before. Its disappearance is an external
+                    # change; other read errors are never treated as empty.
+                    if not missing or expected != 0:
+                        raise DesignSaveError.ExternalChange(path)
+                elif Fingerprint::fnv1a64(DesignText::view_of(current)) != expected:
+                    raise DesignSaveError.ExternalChange(path)
+            source: i64 error[FileReplaceError] = PosixFile::atomic_write(path, DesignText::view_of(encoded))
+            written: i64 = catch source:
+                value:
+                    value
+                FileReplaceError.CommittedButNotDurable:
+                    # Rename has committed, so the new bytes are visible at
+                    # `path` even though the directory sync could not confirm
+                    # crash durability. Report the commit as successful so the
+                    # caller never claims that the old bytes remain present.
+                    encoded.count.i64()
+                error e:
+                    -1
+            if written < 0:
+                raise DesignSaveError.WriteFailed(path)
+            return written
+
+        # Save a new standalone form without ever replacing a destination.
+        # The read is an early, informative refusal for both existing and
+        # unreadable entries; atomic_write_new repeats the no-replace rule at
+        # publication time to close races with another process.
+        def save_new_form(path: cstr, form: DesignForms::Form&) -> i64 error[DesignSaveError]:
+            encoded: darray[u8] = DesignEncode::encode_form(form)
+            if encoded.count == 0:
+                raise DesignSaveError.EncodeFailed
+            current: mutable darray[u8] = []
+            amount: i64 = PosixFile::read_bytes_result(&current, path, READ_CAPACITY)
+            if amount >= 0:
+                raise DesignSaveError.DestinationExists(path)
+            if not PosixFile::read_error_is_not_found(amount):
+                raise DesignSaveError.DestinationUnavailable(path)
+            source: i64 error[FileReplaceError] = PosixFile::atomic_write_new(path, DesignText::view_of(encoded))
+            written: i64 = catch source:
+                value:
+                    value
+                FileReplaceError.CommittedButNotDurable:
+                    encoded.count.i64()
+                error e:
+                    -1
+            if written < 0:
+                raise DesignSaveError.WriteFailed(path)
+            return written
+
+        # Fingerprint of the current file, or 0 when it cannot be read. An
+        # existing empty file has the normal FNV fingerprint of empty bytes;
+        # it must not share the missing-file sentinel.
+        def file_fingerprint(path: cstr) -> u64:
+            current: mutable darray[u8] = []
+            amount: i64 = PosixFile::read_bytes_result(&current, path, READ_CAPACITY)
+            return 0 if amount < 0
+            return Fingerprint::fnv1a64(DesignText::view_of(current))

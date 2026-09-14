@@ -1,0 +1,123 @@
+# M00 spike: filesystem read/write/atomic replace.
+#
+# Exercises the save transaction contract from the plan:
+#   * a base file is written and fingerprinted;
+#   * an external change is detected by fingerprint before any replace;
+#   * an existing staging temporary makes the save fail closed (previous file
+#     stays intact) instead of clobbering unknown state;
+#   * a successful atomic write publishes the new bytes;
+#   * repeated replace cycles keep the destination readable.
+#
+# Exit codes identify the failed step.
+
+include "../../src/platform/posix/posix_file.elisa"
+include "../../src/model/fingerprint.elisa"
+
+@link_name("designer_report_text")
+extern designer_report_text(text: cstr) -> void
+
+module AtomicReplaceSpike:
+    private:
+        const TARGET: cstr = "build/spikes/atomic_target.txt"
+        const BASE: cstr = "base-content"
+        const EXTERNAL: cstr = "external-edit"
+        const NEXT: cstr = "replacement-content"
+        const READ_CAPACITY: usize = 65536
+
+        def bytes_equal(bytes: darray[u8], expected: sview) -> bool:
+            return false if bytes.count != expected.len.usize()
+            for index in 0..<expected.len |bytes, expected|:
+                return false if bytes[index] != expected[index]
+            return true
+
+        def view_of(bytes: darray[u8]) -> sview:
+            return sview(&bytes[0], 0, bytes.count.i64())
+
+        def store_literal(path: cstr, text: sview) -> bool:
+            source: i64 error[FileReplaceError] = PosixFile::atomic_write(path, text)
+            written: i64 = catch source:
+                value:
+                    value
+                error e:
+                    -1
+            return written == text.len.i64()
+
+        # Returns the file contents, or an empty array when it cannot be read.
+        # The destination is a local here: `&reference_parameter` does not
+        # produce the same pointer as `&local`, so the read target must not be
+        # forwarded from another reference parameter.
+        def read_file(path: cstr) -> darray[u8]:
+            out: mutable darray[u8] = []
+            _ = PosixFile::read_bytes(&out, path, READ_CAPACITY)
+            return out
+
+    public:
+        def run() -> i64:
+            _ = PosixFile::remove_temp(TARGET)
+            _ = PosixFile::remove(TARGET)
+
+            # 1. Base write + fingerprint.
+            return 10 if not store_literal(TARGET, BASE)
+            base: darray[u8] = read_file(TARGET)
+            return 11 if base.count == 0
+            expected: u64 = Fingerprint::fnv1a64(view_of(base))
+            return 12 if not bytes_equal(base, BASE)
+
+            # 2. External edit: the fingerprint guard must refuse to replace.
+            return 13 if not store_literal(TARGET, EXTERNAL)
+            current: darray[u8] = read_file(TARGET)
+            return 14 if current.count == 0
+            guard: bool = Fingerprint::fnv1a64(view_of(current)) == expected
+            return 15 if guard
+
+            # 3. Stale temporary: atomic write fails closed, target untouched.
+            stale_temp: darray[u8] = PosixFile::temp_path(TARGET)
+            stale_temp_c: cstr = (&stale_temp[0]).cast[cstr] can Unsafe.PointerCast
+            return 16 if not store_literal(stale_temp_c, "stale")
+            # A namespaced error-union call is bound before `catch`; stage1
+            # declines `catch Module::function(...)` directly.
+            stale_source: i64 error[FileReplaceError] = PosixFile::atomic_write(TARGET, NEXT)
+            stale: i64 = catch stale_source:
+                value:
+                    1
+                error e:
+                    0
+            return 17 if stale != 0
+            after_stale: darray[u8] = read_file(TARGET)
+            return 18 if after_stale.count == 0
+            return 19 if not bytes_equal(after_stale, EXTERNAL)
+            return 20 if not PosixFile::remove_temp(TARGET)
+
+            # 4. Successful replacement.
+            published_source: i64 error[FileReplaceError] = PosixFile::atomic_write(TARGET, NEXT)
+            published: i64 = catch published_source:
+                value:
+                    value
+                error e:
+                    -1
+            return 21 if published != NEXT.len.i64()
+            replaced: darray[u8] = read_file(TARGET)
+            return 22 if replaced.count == 0
+            return 23 if not bytes_equal(replaced, NEXT)
+
+            # 5. Repeated replace cycles stay readable.
+            cycle: mutable i32 = 0
+            while cycle < 8:
+                cycle_source: i64 error[FileReplaceError] = PosixFile::atomic_write(TARGET, NEXT)
+                amount: i64 = catch cycle_source:
+                    value:
+                        value
+                    error e:
+                        -1
+                return 24 if amount != NEXT.len.i64()
+                reread: darray[u8] = read_file(TARGET)
+                return 25 if reread.count == 0
+                return 26 if not bytes_equal(reread, NEXT)
+                cycle <- cycle + 1
+
+            _ = PosixFile::remove(TARGET)
+            designer_report_text("spike atomic_file_replace: ok")
+            return 0
+
+def main() -> i64:
+    return AtomicReplaceSpike::run()

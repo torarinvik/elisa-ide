@@ -1,0 +1,346 @@
+# Isolated preview worker. With ELISA_UI_PREVIEW_INPUT set, this UI-only unit
+# consumes the bounded PreviewWire form written by the core host and builds
+# real Elisa-ui widgets. It intentionally imports no document model or
+# standard-library JSON/runtime unit (ADR-001); design IDs travel as bytes.
+
+include "../../src/preview/preview_wire.elisa"
+include "../../src/platform/posix/posix_file.elisa"
+
+@link_name("designer_report_rect")
+extern designer_report_rect(name: cstr, x: i64, y: i64, width: i64, height: i64) -> void
+@link_name("designer_report_i64")
+extern designer_report_i64(label: cstr, value: i64) -> void
+
+module PreviewWorkerApp:
+    private:
+        const NODE_CAPACITY: usize = PreviewWire::MAX_NODES
+        const STRING_CAPACITY: usize = PreviewWire::MAX_PAYLOAD_BYTES
+        const STRING_FIELD_COUNT: usize = 4
+        const NUMBER_FIELD_COUNT: usize = 7
+        const COLOR_FIELD_COUNT: usize = 5
+
+        const enum TextField of usize:
+            Caption = 0
+            Label = 1
+            Placeholder = 2
+            Initial = 3
+
+        const enum NumberField of usize:
+            Padding = 0
+            Spacing = 1
+            Grow = 2
+            MinimumWidth = 3
+            MinimumHeight = 4
+            Margin = 5
+            TextSize = 6
+
+        const enum ColorField of usize:
+            Background = 0
+            Foreground = 1
+            Hover = 2
+            Press = 3
+            Fill = 4
+
+        global mutable preview_loaded: bool = false
+        global mutable preview_revision: u64 = 0
+        global mutable preview_width: f32 = 400.0
+        global mutable preview_height: f32 = 300.0
+        global mutable preview_node_count: usize = 0
+        global mutable preview_text_used: usize = 0
+        global mutable preview_text_storage: u8[STRING_CAPACITY] = zeroed
+        global mutable preview_ids: u8[NODE_CAPACITY * PreviewWire::MAX_ID_BYTES] = zeroed
+        global mutable preview_id_lengths: u8[NODE_CAPACITY] = zeroed
+        global mutable preview_kinds: u8[NODE_CAPACITY] = zeroed
+        global mutable preview_parents: u16[NODE_CAPACITY] = zeroed
+        global mutable preview_flags: u16[NODE_CAPACITY] = zeroed
+        global mutable preview_axes: u8[NODE_CAPACITY] = zeroed
+        global mutable preview_cross: u8[NODE_CAPACITY] = zeroed
+        global mutable preview_main: u8[NODE_CAPACITY] = zeroed
+        global mutable preview_numbers: u32[NODE_CAPACITY * NUMBER_FIELD_COUNT] = zeroed
+        global mutable preview_colors: u8[NODE_CAPACITY * COLOR_FIELD_COUNT * 4] = zeroed
+        global mutable preview_text_offsets: u32[NODE_CAPACITY * STRING_FIELD_COUNT] = zeroed
+        global mutable preview_text_lengths: u16[NODE_CAPACITY * STRING_FIELD_COUNT] = zeroed
+        global mutable preview_handles: UiHandles::Handle[NODE_CAPACITY] = zeroed
+
+        global mutable root_panel: UiHandles::Handle = UiHandles::Handle{widget_id: UiFlat::NONE.u32(), tree_id: 0}
+        global mutable heading: UiHandles::Handle = UiHandles::Handle{widget_id: UiFlat::NONE.u32(), tree_id: 0}
+        global mutable action: UiHandles::Handle = UiHandles::Handle{widget_id: UiFlat::NONE.u32(), tree_id: 0}
+
+        def color(r: u8, g: u8, b: u8) -> UiCore::Color:
+            return UiCore::rgb(r, g, b)
+
+        def read_u16(bytes: darray[u8]&, offset: usize) -> u16:
+            return bytes[offset].u16() | (bytes[offset + 1].u16() << 8)
+
+        def read_u32(bytes: darray[u8]&, offset: usize) -> u32:
+            value: mutable u32 = 0
+            for shift in 0..<4:
+                value <- value | (bytes[offset + shift] .u32() << (shift * 8))
+            return value
+
+        def read_u64(bytes: darray[u8]&, offset: usize) -> u64:
+            value: mutable u64 = 0
+            for shift in 0..<8:
+                value <- value | (bytes[offset + shift].u64() << (shift * 8))
+            return value
+
+        def valid_id_byte(value: u8) -> bool:
+            return true if value >= 48 and value <= 57
+            return true if value >= 65 and value <= 90
+            return true if value >= 97 and value <= 122
+            return value == 45 or value == 95
+
+        def text_slot(node: usize, field: TextField) -> usize:
+            return node * STRING_FIELD_COUNT + field.usize()
+
+        def number_slot(node: usize, field: NumberField) -> usize:
+            return node * NUMBER_FIELD_COUNT + field.usize()
+
+        def color_slot(node: usize, field: ColorField) -> usize:
+            return (node * COLOR_FIELD_COUNT + field.usize()) * 4
+
+        def read_text(bytes: darray[u8]&, offset: mutable usize&, node: usize, field: TextField) -> bool:
+            return false if offset + 2 > bytes.count
+            length: usize = read_u16(bytes, offset).usize()
+            offset <- offset + 2
+            return false if length > PreviewWire::MAX_TEXT_BYTES
+            return false if offset + length > bytes.count
+            return false if preview_text_used + length > STRING_CAPACITY
+            source: sview = "" if length == 0 else sview(&bytes[offset], 0, length.i64())
+            return false if UiText::valid_utf8_prefix(source, length) != length
+            slot: usize = text_slot(node, field)
+            preview_text_offsets[slot] <- preview_text_used.u32()
+            preview_text_lengths[slot] <- length.u16()
+            for index in 0..<length:
+                preview_text_storage[preview_text_used + index] <- bytes[offset + index]
+            preview_text_used <- preview_text_used + length
+            offset <- offset + length
+            return true
+
+        def read_color(bytes: darray[u8]&, offset: mutable usize&, node: usize, field: ColorField) -> bool:
+            return false if offset + 4 > bytes.count
+            target: usize = color_slot(node, field)
+            for channel in 0..<4:
+                preview_colors[target + channel] <- bytes[offset + channel]
+            offset <- offset + 4
+            return true
+
+        def id_view(node: usize) -> sview:
+            length: usize = preview_id_lengths[node].usize()
+            return "" if length == 0
+            start: usize = node * PreviewWire::MAX_ID_BYTES
+            return sview(&preview_ids[start], 0, length.i64())
+
+        def text_view(node: usize, field: TextField) -> sview:
+            slot: usize = text_slot(node, field)
+            length: usize = preview_text_lengths[slot].usize()
+            return "" if length == 0
+            return sview(&preview_text_storage[preview_text_offsets[slot].usize()], 0, length.i64())
+
+        def number(node: usize, field: NumberField) -> f32:
+            return preview_numbers[number_slot(node, field)].f32() / 1024.0
+
+        def node_color(node: usize, field: ColorField) -> UiCore::Color:
+            offset: usize = color_slot(node, field)
+            return UiCore::Color{
+                r: preview_colors[offset],
+                g: preview_colors[offset + 1],
+                b: preview_colors[offset + 2],
+                a: preview_colors[offset + 3],
+            }
+
+        def node_axis(node: usize) -> UiConst::Axis:
+            return UiConst::Axis.Column if preview_axes[node] == 1 else UiConst::Axis.Row
+
+        def node_cross(node: usize) -> UiConst::CrossAlignment:
+            return UiConst::CrossAlignment.Start if preview_cross[node] == 0
+            return UiConst::CrossAlignment.Center if preview_cross[node] == 1
+            return UiConst::CrossAlignment.End if preview_cross[node] == 2
+            return UiConst::CrossAlignment.Stretch
+
+        def node_main(node: usize) -> UiConst::MainAlignment:
+            return UiConst::MainAlignment.Start if preview_main[node] == 0
+            return UiConst::MainAlignment.Center if preview_main[node] == 1
+            return UiConst::MainAlignment.End if preview_main[node] == 2
+            return UiConst::MainAlignment.SpaceBetween
+
+        def decode(bytes: darray[u8]&) -> bool:
+            return false if bytes.count < PreviewWire::HEADER_BYTES
+            return false if bytes[0] != PreviewWire::MAGIC_0 or bytes[1] != PreviewWire::MAGIC_1 or bytes[2] != PreviewWire::MAGIC_2 or bytes[3] != PreviewWire::MAGIC_3
+            return false if read_u16(bytes, 4) != PreviewWire::VERSION or read_u16(bytes, 6) != 0
+            revision: u64 = read_u64(bytes, 8)
+            width_q10: u32 = read_u32(bytes, 16)
+            height_q10: u32 = read_u32(bytes, 20)
+            count: usize = read_u16(bytes, 24).usize()
+            return false if read_u16(bytes, 26) != 0
+            return false if width_q10 == 0 or height_q10 == 0 or count == 0 or count > NODE_CAPACITY
+
+            offset: mutable usize = PreviewWire::HEADER_BYTES
+            preview_text_used <- 0
+            node: mutable usize = 0
+            while node < count:
+                return false if offset + 10 > bytes.count
+                id_length: usize = bytes[offset].usize()
+                kind: u8 = bytes[offset + 1]
+                parent: u16 = read_u16(bytes, offset + 2)
+                flags: u16 = read_u16(bytes, offset + 4)
+                axis: u8 = bytes[offset + 6]
+                cross: u8 = bytes[offset + 7]
+                main: u8 = bytes[offset + 8]
+                reserved: u8 = bytes[offset + 9]
+                offset <- offset + 10
+                return false if id_length == 0 or id_length > PreviewWire::MAX_ID_BYTES
+                return false if kind < PreviewWire::Component.Column.u8() or kind > PreviewWire::Component.TextField.u8()
+                return false if (node == 0 and parent != 65535) or (node > 0 and parent.usize() >= node)
+                return false if flags & 65528 != 0 or axis > 1 or cross > 3 or main > 3 or reserved != 0
+                return false if offset + id_length > bytes.count
+                id_start: usize = node * PreviewWire::MAX_ID_BYTES
+                for index in 0..<id_length:
+                    value: u8 = bytes[offset + index]
+                    return false if not valid_id_byte(value)
+                    preview_ids[id_start + index] <- value
+                preview_id_lengths[node] <- id_length.u8()
+                preview_kinds[node] <- kind
+                preview_parents[node] <- parent
+                preview_flags[node] <- flags
+                preview_axes[node] <- axis
+                preview_cross[node] <- cross
+                preview_main[node] <- main
+                offset <- offset + id_length
+
+                return false if offset + NUMBER_FIELD_COUNT * 4 > bytes.count
+                for field in 0..<NUMBER_FIELD_COUNT:
+                    value: u32 = read_u32(bytes, offset)
+                    return false if value > 102400000
+                    preview_numbers[node * NUMBER_FIELD_COUNT + field] <- value
+                    offset <- offset + 4
+                return false if not read_color(bytes, &offset, node, ColorField.Background)
+                return false if not read_color(bytes, &offset, node, ColorField.Foreground)
+                return false if not read_color(bytes, &offset, node, ColorField.Hover)
+                return false if not read_color(bytes, &offset, node, ColorField.Press)
+                return false if not read_color(bytes, &offset, node, ColorField.Fill)
+                return false if not read_text(bytes, &offset, node, TextField.Caption)
+                return false if not read_text(bytes, &offset, node, TextField.Label)
+                return false if not read_text(bytes, &offset, node, TextField.Placeholder)
+                return false if not read_text(bytes, &offset, node, TextField.Initial)
+                node <- node + 1
+
+            return false if offset != bytes.count
+            preview_revision <- revision
+            preview_width <- width_q10.f32() / 1024.0
+            preview_height <- height_q10.f32() / 1024.0
+            preview_node_count <- count
+            preview_loaded <- true
+            return true
+
+        def construct_node(index: usize) -> bool:
+            kind: u8 = preview_kinds[index]
+            parent_index: u16 = preview_parents[index]
+            parent: UiHandles::Handle = UiHandles::root_parent() if parent_index == 65535 else preview_handles[parent_index.usize()]
+            background: UiCore::Color = node_color(index, ColorField.Background)
+            foreground: UiCore::Color = node_color(index, ColorField.Foreground)
+            handle: mutable UiHandles::Handle = UiHandles::invalid()
+
+            if kind == PreviewWire::Component.Column.u8():
+                handle <- UiHandles::column(parent, number(index, NumberField.Padding), number(index, NumberField.Spacing), background)
+            elif kind == PreviewWire::Component.Row.u8():
+                handle <- UiHandles::row(parent, number(index, NumberField.Padding), number(index, NumberField.Spacing), background)
+            elif kind == PreviewWire::Component.Panel.u8():
+                handle <- UiHandles::panel(parent, node_axis(index), number(index, NumberField.Padding), number(index, NumberField.Spacing), background)
+            elif kind == PreviewWire::Component.Label.u8():
+                handle <- UiHandles::label(parent, text_view(index, TextField.Caption), number(index, NumberField.TextSize), foreground)
+            elif kind == PreviewWire::Component.Button.u8():
+                handle <- UiHandles::button(parent, number(index, NumberField.MinimumWidth), number(index, NumberField.MinimumHeight), background, node_color(index, ColorField.Hover), node_color(index, ColorField.Press))
+                UiHandles::set_text(handle, text_view(index, TextField.Caption), number(index, NumberField.TextSize), foreground)
+                UiHandles::set_enabled(handle, preview_flags[index] & 2 != 0)
+            else:
+                handle <- UiHandles::text_field(parent, text_view(index, TextField.Label), text_view(index, TextField.Placeholder), text_view(index, TextField.Initial), number(index, NumberField.MinimumWidth), number(index, NumberField.MinimumHeight), number(index, NumberField.TextSize), foreground, background)
+                UiHandles::set_secure(handle, preview_flags[index] & 4 != 0)
+
+            return false if not UiHandles::is_valid(handle)
+            preview_handles[index] <- handle
+            UiHandles::set_grow(handle, number(index, NumberField.Grow))
+            UiHandles::set_min_size(handle, number(index, NumberField.MinimumWidth), number(index, NumberField.MinimumHeight))
+            UiHandles::set_margin(handle, number(index, NumberField.Margin))
+            UiHandles::set_visible(handle, preview_flags[index] & 1 != 0)
+            if kind == PreviewWire::Component.Column.u8() or kind == PreviewWire::Component.Row.u8() or kind == PreviewWire::Component.Panel.u8():
+                UiHandles::set_cross_alignment(handle, node_cross(index))
+                UiHandles::set_main_alignment(handle, node_main(index))
+            return true
+
+        def emit_geometry() -> void:
+            for index in 0..<preview_node_count:
+                handle: UiHandles::Handle = preview_handles[index]
+                if UiHandles::widget(handle) is widget:
+                    id_buffer: mutable u8[PreviewWire::MAX_ID_BYTES + 1] = zeroed
+                    start: usize = index * PreviewWire::MAX_ID_BYTES
+                    for byte_index in 0..<preview_id_lengths[index].usize():
+                        id_buffer[byte_index] <- preview_ids[start + byte_index]
+                    id_buffer[preview_id_lengths[index].usize()] <- 0
+                    id_text: cstr = (&id_buffer[0]).cast[cstr] can Unsafe.PointerCast
+                    designer_report_rect(id_text, widget.x.i64(), widget.y.i64(), widget.width.i64(), widget.height.i64())
+                    
+        def build_preview() -> bool:
+            UiHandles::reset()
+            for index in 0..<preview_node_count:
+                return false if not construct_node(index)
+            UiHandles::layout(preview_width, preview_height)
+            emit_geometry()
+            designer_report_i64("preview_revision=", preview_revision.i64())
+            return true
+
+        def build_demo() -> void:
+            UiHandles::reset()
+            root_panel <- UiHandles::column(UiHandles::root_parent(), 16.0, 10.0, color(24, 27, 33))
+            heading <- UiHandles::label(root_panel, "Preview form", 20.0, color(238, 241, 248))
+            action <- UiHandles::button(root_panel, 140.0, 36.0, color(64, 112, 224), color(84, 136, 244), color(48, 90, 190))
+            UiHandles::set_text(action, "Run", 15.0, color(255, 255, 255))
+            UiHandles::layout(UiCore::viewport_width(), UiCore::viewport_height())
+            if UiHandles::widget(root_panel) is root_widget:
+                designer_report_rect("root", root_widget.x.i64(), root_widget.y.i64(), root_widget.width.i64(), root_widget.height.i64())
+            if UiHandles::widget(heading) is heading_widget:
+                designer_report_rect("heading", heading_widget.x.i64(), heading_widget.y.i64(), heading_widget.width.i64(), heading_widget.height.i64())
+            if UiHandles::widget(action) is action_widget:
+                designer_report_rect("action", action_widget.x.i64(), action_widget.y.i64(), action_widget.width.i64(), action_widget.height.i64())
+
+    public:
+        def load_preview(bytes: darray[u8]&) -> bool:
+            return decode(bytes)
+
+        def has_preview() -> bool:
+            return preview_loaded
+
+        def viewport_width() -> f32:
+            return preview_width
+
+        def viewport_height() -> f32:
+            return preview_height
+
+        def init() -> void:
+            if preview_loaded:
+                _ = build_preview()
+            else:
+                build_demo()
+
+        def frame() -> void:
+            UiCore::clear(color(12, 14, 20))
+            UiHandles::paint()
+
+# The application half of the elisa-ui contract.
+def app_init() -> void:
+    PreviewWorkerApp::init()
+
+def app_widget_event(widget: usize, event: i32) -> void:
+    return
+
+def app_event(event: UiCore::Event) -> void:
+    return
+
+def app_text_input(text: sview) -> void:
+    return
+
+def app_text_editing(text: sview, selected_start: i32, selected_length: i32) -> void:
+    return
+
+def app_frame() -> void:
+    PreviewWorkerApp::frame()

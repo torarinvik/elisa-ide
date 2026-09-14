@@ -1,0 +1,178 @@
+# Deterministic generated application composition root for one emitted view.
+#
+# The view emitter owns a module only. This emitter owns the single framework
+# callback set and SDL3 entrypoint that connect that module to a runnable app.
+# User handlers are included from an explicit caller-supplied path and remain
+# ordinary module functions; generated view code routes into those functions.
+
+include "../model/design_ids.elisa"
+include "../model/design_text.elisa"
+include "../model/design_values.elisa"
+include "../validation/design_diagnostics.elisa"
+include "./elisa_emit.elisa"
+
+include "../../compiler/elisacore_std/elisacore_runtime.elisa"
+include "../../compiler/elisacore_std/collections.elisa"
+
+module ElisaAppEmit:
+    private:
+        def push_char(out: mutable darray[u8]&, value: u8) -> void:
+            out.push(value)
+
+        def push_text(out: mutable darray[u8]&, value: sview) -> void:
+            DesignText::push_view(out, value)
+
+        def push_cstr(out: mutable darray[u8]&, value: cstr) -> void:
+            DesignText::push_cstr(out, value)
+
+        def push_integer(out: mutable darray[u8]&, value: i64) -> void:
+            DesignText::push_i64(out, value)
+
+        def hex_digit(value: u8) -> u8:
+            return 48 + value if value < 10 else 87 + value
+
+        def valid_include_path(path: sview) -> bool:
+            return false if path.len == 0
+            index: mutable i64 = 0
+            while index < path.len:
+                byte: u8 = path[index]
+                return false if byte < 32 or byte == 127
+                index <- index + 1
+            return true
+
+        # Include paths and the title are source string literals. Escape the
+        # same syntax-sensitive bytes as the view emitter, retaining UTF-8 for
+        # ordinary non-ASCII text.
+        def push_quoted(out: mutable darray[u8]&, value: sview) -> void:
+            push_char(out, 34)
+            index: mutable i64 = 0
+            while index < value.len:
+                byte: u8 = value[index]
+                if byte == 34:
+                    push_text(out, "\\\"")
+                elif byte == 92:
+                    push_text(out, "\\\\")
+                elif byte == 9:
+                    push_text(out, "\\t")
+                elif byte == 10:
+                    push_text(out, "\\n")
+                elif byte == 13:
+                    push_text(out, "\\r")
+                elif byte < 32 or byte == 127:
+                    push_text(out, "\\u00")
+                    push_char(out, hex_digit(byte / 16))
+                    push_char(out, hex_digit(byte % 16))
+                else:
+                    push_char(out, byte)
+                index <- index + 1
+            push_char(out, 34)
+
+        def valid_config(config: AppConfig) -> bool:
+            return false if not DesignIds::valid_symbol(config.view_module)
+            return false if not valid_include_path(config.framework_include) or not valid_include_path(config.view_include) or not valid_include_path(config.handlers_include)
+            return false if config.window_title.len == 0
+            # Match UiSdl3's own maximum window extent and i32 API boundary so
+            # emitted integer literals always have the constructor's type.
+            return false if config.window_width <= 0 or config.window_width > 16777216 or config.window_height <= 0 or config.window_height > 16777216 or config.max_frames < 0
+            return true
+
+        def push_include(out: mutable darray[u8]&, path: sview) -> void:
+            push_text(out, "include ")
+            push_quoted(out, path)
+            push_char(out, 10)
+
+        def push_color(out: mutable darray[u8]&, color: DesignValues::ColorValue) -> void:
+            push_text(out, "UiCore::Color{r: ")
+            push_integer(out, color.r.i64())
+            push_text(out, ", g: ")
+            push_integer(out, color.g.i64())
+            push_text(out, ", b: ")
+            push_integer(out, color.b.i64())
+            push_text(out, ", a: ")
+            push_integer(out, color.a.i64())
+            push_char(out, 125)
+
+    public:
+        struct AppConfig:
+            framework_include: mutable sview
+            view_include: mutable sview
+            view_module: mutable sview
+            # Required explicit include for the module that owns generated
+            # handler symbols. Keep it separate from the generated view file.
+            handlers_include: mutable sview
+            window_title: mutable sview
+            window_width: mutable i64
+            window_height: mutable i64
+            max_frames: mutable i64
+            clear_color: mutable DesignValues::ColorValue
+
+        struct Emission:
+            source: mutable darray[u8]
+            valid: mutable bool
+
+        def emit_sdl3_application(view: ElisaEmit::Emission, config: AppConfig, sink: mutable DesignDiagnostics::Sink&) -> Emission:
+            empty: mutable Emission = Emission{source: [], valid: false}
+            if not view.valid or view.source.count == 0:
+                _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.UnsupportedTarget, "generation.application", "application emission requires a successful generated view module")
+                return empty
+            if not valid_config(config):
+                _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.UnsupportedTarget, "generation.application", "SDL3 application configuration needs a module name, explicit includes, title, positive viewport, and non-negative frame limit")
+                return empty
+
+            # Do not emit an include for a caller-named module that does not
+            # match the module actually produced by the view emitter.
+            expected_header: mutable darray[u8] = []
+            push_text(&expected_header, "module ")
+            push_text(&expected_header, config.view_module)
+            push_text(&expected_header, ":")
+            if not DesignText::has_text(DesignText::view_of(view.source), DesignText::view_of(expected_header)):
+                _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.UnsupportedTarget, "generation.application.viewModule", "configured view module name does not match the emitted source")
+                return empty
+
+            out: mutable darray[u8] = []
+            push_text(&out, "# Generated by Elisa IDE. Do not edit; regenerate from the form and application settings.\n")
+            push_include(&out, config.framework_include)
+            push_include(&out, config.view_include)
+            push_include(&out, config.handlers_include)
+            push_text(&out, "\n# This file is the one owner of the framework application exports.\n")
+            push_text(&out, "global mutable _elisa_designer_view_ready: bool = false\n\n")
+
+            push_text(&out, "def app_init() -> void:\n")
+            push_text(&out, "    _elisa_designer_view_ready <- ")
+            push_text(&out, config.view_module)
+            push_text(&out, "::build()\n\n")
+
+            push_text(&out, "def app_widget_event(widget: usize, event: i32) -> void:\n")
+            push_text(&out, "    return if not _elisa_designer_view_ready\n")
+            push_text(&out, "    ")
+            push_text(&out, config.view_module)
+            push_text(&out, "::dispatch_widget_event(widget, event)\n\n")
+
+            push_text(&out, "def app_event(event: UiCore::Event) -> void:\n")
+            push_text(&out, "    UiHandles::handle(event) if _elisa_designer_view_ready\n\n")
+
+            push_text(&out, "def app_text_input(text: sview) -> void:\n")
+            push_text(&out, "    UiHandles::insert_text(text) if _elisa_designer_view_ready\n\n")
+
+            push_text(&out, "def app_text_editing(text: sview, selected_start: i32, selected_length: i32) -> void:\n")
+            push_text(&out, "    UiHandles::update_marked_text_utf8_characters(text, selected_start, selected_length) if _elisa_designer_view_ready\n\n")
+
+            push_text(&out, "def app_frame() -> void:\n")
+            push_text(&out, "    UiCore::clear(")
+            push_color(&out, config.clear_color)
+            push_text(&out, ")\n")
+            push_text(&out, "    return if not _elisa_designer_view_ready\n")
+            push_text(&out, "    UiHandles::layout(UiCore::viewport_width(), UiCore::viewport_height())\n")
+            push_text(&out, "    UiHandles::paint()\n\n")
+
+            push_text(&out, "def main() -> i64:\n")
+            push_text(&out, "    return UiSdl3::run(")
+            push_quoted(&out, config.window_title)
+            push_text(&out, ", ")
+            push_integer(&out, config.window_width)
+            push_text(&out, ", ")
+            push_integer(&out, config.window_height)
+            push_text(&out, ", ")
+            push_integer(&out, config.max_frames)
+            push_text(&out, ")\n")
+            return Emission{source: out, valid: true}

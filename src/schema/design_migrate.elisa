@@ -1,0 +1,115 @@
+# Sequential schema migrations.
+#
+# Each migration is a named transformation from N to N+1 that preserves node
+# IDs and references. It runs before the model is built, on the JSON DOM, so a
+# document written by an older designer opens with its semantics intact and a
+# diagnostic naming what changed. Migrations never run the GUI and never
+# downgrade by dropping unknown data.
+
+include "../model/design_limits.elisa"
+include "../model/design_text.elisa"
+include "../validation/design_diagnostics.elisa"
+
+include "../../compiler/elisacore_std/elisacore_runtime.elisa"
+include "../../compiler/elisacore_std/collections.elisa"
+include "../../compiler/elisacore_std/elisacore_json.elisa"
+
+module DesignMigrate:
+    private:
+        def member_key(value: JsonValue, index: i64) -> sview:
+            key: sview = catch json_key_at(value, index):
+                value:
+                    value
+                error e:
+                    ""
+            return key
+
+        def member_value(value: JsonValue, index: i64) -> JsonValue:
+            member: JsonValue = catch json_value_at(value, index):
+                value:
+                    value
+                error e:
+                    JsonValue.Null
+            return member
+
+        def has_member(value: JsonValue, key: sview) -> bool:
+            return json_index_of(value, key) >= 0
+
+        def version_of(value: JsonValue) -> i64:
+            member: JsonValue = catch json_get(value, "schemaVersion"):
+                value:
+                    value
+                error e:
+                    JsonValue.Null
+            return 0 if not json_is_number(member)
+            number: f64 = catch json_as_number(member):
+                value:
+                    value
+                error e:
+                    0.0
+            return number.i64()
+
+        # 0 -> 1: the form display name field is `name`, not `title`.
+        def migrate_form_0_to_1(arena: mutable Arena&, root: JsonValue, sink: mutable DesignDiagnostics::Sink&) -> JsonValue:
+            members: mutable darray[JsonMember] = []
+            has_name: bool = has_member(root, "name")
+            count: i64 = json_object_len(root)
+            index: mutable i64 = 0
+            while index < count:
+                key: sview = member_key(root, index)
+                if DesignText::equal(key, "schemaVersion"):
+                    members.push(json_member(arena, key, json_number(1.0)))
+                elif DesignText::equal(key, "title"):
+                    if not has_name:
+                        members.push(json_member(arena, "name", member_value(root, index)))
+                else:
+                    members.push(json_member(arena, key, member_value(root, index)))
+                index <- index + 1
+            _ = DesignDiagnostics::report_warning(sink, DesignDiagnostics::Code.MigrationApplied, "", "migrated form schema 0 -> 1: title renamed to name")
+            return json_object_from(arena, members)
+
+        # 0 -> 1: the project application identity field is `applicationId`.
+        def migrate_project_0_to_1(arena: mutable Arena&, root: JsonValue, sink: mutable DesignDiagnostics::Sink&) -> JsonValue:
+            members: mutable darray[JsonMember] = []
+            has_application: bool = has_member(root, "applicationId")
+            count: i64 = json_object_len(root)
+            index: mutable i64 = 0
+            while index < count:
+                key: sview = member_key(root, index)
+                if DesignText::equal(key, "schemaVersion"):
+                    members.push(json_member(arena, key, json_number(1.0)))
+                elif DesignText::equal(key, "appId"):
+                    if not has_application:
+                        members.push(json_member(arena, "applicationId", member_value(root, index)))
+                else:
+                    members.push(json_member(arena, key, member_value(root, index)))
+                index <- index + 1
+            _ = DesignDiagnostics::report_warning(sink, DesignDiagnostics::Code.MigrationApplied, "", "migrated project schema 0 -> 1: appId renamed to applicationId")
+            return json_object_from(arena, members)
+
+    public:
+        # Returns the newest readable DOM for `root`, or Null when the version
+        # is newer than this build. The returned value lives in `arena`.
+        def migrate_form(arena: mutable Arena&, root: JsonValue, sink: mutable DesignDiagnostics::Sink&) -> JsonValue:
+            version: i64 = version_of(root)
+            if version > DesignLimits::SCHEMA_VERSION:
+                _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.UnsupportedSchemaVersion, "schemaVersion", "document was written by a newer schema version")
+                return JsonValue.Null
+            if version < DesignLimits::OLDEST_READABLE_VERSION:
+                _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.UnsupportedSchemaVersion, "schemaVersion", "document schema is older than this build can read")
+                return JsonValue.Null
+            if version == 0:
+                return migrate_form_0_to_1(arena, root, sink)
+            return root
+
+        def migrate_project(arena: mutable Arena&, root: JsonValue, sink: mutable DesignDiagnostics::Sink&) -> JsonValue:
+            version: i64 = version_of(root)
+            if version > DesignLimits::SCHEMA_VERSION:
+                _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.UnsupportedSchemaVersion, "schemaVersion", "document was written by a newer schema version")
+                return JsonValue.Null
+            if version < DesignLimits::OLDEST_READABLE_VERSION:
+                _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.UnsupportedSchemaVersion, "schemaVersion", "document was written by a schema older than this build can read")
+                return JsonValue.Null
+            if version == 0:
+                return migrate_project_0_to_1(arena, root, sink)
+            return root

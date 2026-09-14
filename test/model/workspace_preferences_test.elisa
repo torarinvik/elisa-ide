@@ -1,0 +1,131 @@
+# Local editor preferences have a bounded, strict JSON codec and stable
+# canonical output. This test stays in the portable core.
+
+include "../../src/workspace/workspace_preferences.elisa"
+include "test_support.elisa"
+
+module WorkspacePreferencesTest:
+    private:
+        def append_text(target: mutable darray[u8]&, text: sview) -> void:
+            DesignText::push_view(target, text)
+
+        def make_recent_overflow_document() -> darray[u8]:
+            out: mutable darray[u8] = []
+            append_text(&out, "{\"format\":\"elisa-ide-workspace\",\"version\":1,\"recentFiles\":[")
+            index: mutable i64 = 0
+            while index < 24:
+                append_text(&out, ",") if index > 0
+                append_text(&out, "\"/tmp/form")
+                DesignText::push_i64(&out, index)
+                append_text(&out, ".elisa\"")
+                index <- index + 1
+            append_text(&out, "]}")
+            return out
+
+        def make_overlong_path_document() -> darray[u8]:
+            out: mutable darray[u8] = []
+            append_text(&out, "{\"format\":\"elisa-ide-workspace\",\"version\":1,\"recentFiles\":[\"")
+            index: mutable i64 = 0
+            while index < 4097:
+                out.push(97)
+                index <- index + 1
+            append_text(&out, "\"]}")
+            return out
+
+        def numbered_path(index: i64) -> darray[u8]:
+            path: mutable darray[u8] = []
+            append_text(&path, "/tmp/mru-")
+            DesignText::push_i64(&path, index)
+            append_text(&path, ".elisaform.json")
+            return path
+
+        def is_default(preferences: WorkspacePreferences::Preferences) -> bool:
+            return preferences.schema_version == WorkspacePreferences::VERSION and preferences.recent_files.count == 0 and preferences.theme == WorkspacePreferences::Theme.System and preferences.left_pane_ratio == WorkspacePreferences::DEFAULT_LEFT_PANE_RATIO and preferences.right_pane_ratio == WorkspacePreferences::DEFAULT_RIGHT_PANE_RATIO and preferences.bottom_pane_ratio == WorkspacePreferences::DEFAULT_BOTTOM_PANE_RATIO
+
+    public:
+        def run() -> i64:
+            canonical: sview = "{\"format\":\"elisa-ide-workspace\",\"version\":1,\"recentFiles\":[\"/Users/me/Elisa/app.elisaform.json\",\"/Users/me/Elisa/other.elisaform.json\"],\"theme\":\"dark\",\"panes\":{\"left\":0.2,\"right\":0.31,\"bottom\":0.25}}"
+            decode_sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
+            preferences: mutable WorkspacePreferences::Preferences = WorkspacePreferences::decode(canonical, &decode_sink)
+            TestSupport::check("recent file paths decode in order", preferences.recent_files.count == 2 and DesignText::equal(WorkspacePreferences::recent_path(preferences, 0), "/Users/me/Elisa/app.elisaform.json") and DesignText::equal(WorkspacePreferences::recent_path(preferences, 1), "/Users/me/Elisa/other.elisaform.json"))
+            TestSupport::check("theme and pane ratios decode", preferences.theme == WorkspacePreferences::Theme.Dark and preferences.left_pane_ratio == 0.2 and preferences.right_pane_ratio == 0.31 and preferences.bottom_pane_ratio == 0.25)
+            TestSupport::check("valid preferences decode without diagnostics", decode_sink.error_count == 0 and decode_sink.warning_count == 0)
+
+            mru: mutable WorkspacePreferences::Preferences = WorkspacePreferences::empty()
+            TestSupport::check("remembering a first file succeeds", WorkspacePreferences::remember_file(&mru, "/tmp/first.elisaform.json"))
+            TestSupport::check("remembering another file succeeds", WorkspacePreferences::remember_file(&mru, "/tmp/second.elisaform.json"))
+            TestSupport::check("remembering a duplicate moves it to the front without duplication", WorkspacePreferences::remember_file(&mru, "/tmp/first.elisaform.json") and mru.recent_files.count == 2 and DesignText::equal(WorkspacePreferences::recent_path(mru, 0), "/tmp/first.elisaform.json") and DesignText::equal(WorkspacePreferences::recent_path(mru, 1), "/tmp/second.elisaform.json"))
+            TestSupport::check("recent-file API rejects control bytes", not WorkspacePreferences::remember_file(&mru, "/tmp/bad\npath"))
+            bounded_mru: mutable WorkspacePreferences::Preferences = WorkspacePreferences::empty()
+            mru_index: mutable i64 = 0
+            while mru_index < 25:
+                path: darray[u8] = numbered_path(mru_index)
+                _ = WorkspacePreferences::remember_file(&bounded_mru, TestSupport::view_of(path))
+                mru_index <- mru_index + 1
+            oldest_kept: darray[u8] = numbered_path(5)
+            newest: darray[u8] = numbered_path(24)
+            TestSupport::check("MRU operation evicts only the oldest file at capacity", bounded_mru.recent_files.count == WorkspacePreferences::MAX_RECENT_FILES and DesignText::equal(WorkspacePreferences::recent_path(bounded_mru, 0), TestSupport::view_of(newest)) and DesignText::equal(WorkspacePreferences::recent_path(bounded_mru, 19), TestSupport::view_of(oldest_kept)))
+
+            encode_sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
+            encoded: darray[u8] = WorkspacePreferences::encode(preferences, &encode_sink)
+            encoded_again: darray[u8] = WorkspacePreferences::encode(preferences, &encode_sink)
+            TestSupport::check("encoding succeeds", encoded.count > 0 and encode_sink.error_count == 0)
+            TestSupport::check("encoding is deterministic byte for byte", DesignText::equal(TestSupport::view_of(encoded), TestSupport::view_of(encoded_again)))
+            round_trip_sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
+            round_trip: WorkspacePreferences::Preferences = WorkspacePreferences::decode(TestSupport::view_of(encoded), &round_trip_sink)
+            TestSupport::check("encode/decode preserves local preference values", round_trip.theme == preferences.theme and round_trip.recent_files.count == preferences.recent_files.count and round_trip.left_pane_ratio == preferences.left_pane_ratio and round_trip.right_pane_ratio == preferences.right_pane_ratio and round_trip.bottom_pane_ratio == preferences.bottom_pane_ratio and DesignText::equal(WorkspacePreferences::recent_path(round_trip, 0), WorkspacePreferences::recent_path(preferences, 0)))
+
+            quoted: mutable WorkspacePreferences::Preferences = WorkspacePreferences::empty()
+            quoted.recent_files.push(DesignValues::append(quoted.strings.bytes, "/Users/me/A \"quoted\" form.elisaform.json"))
+            quoted_sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
+            quoted_json: darray[u8] = WorkspacePreferences::encode(quoted, &quoted_sink)
+            quoted_round_trip: WorkspacePreferences::Preferences = WorkspacePreferences::decode(TestSupport::view_of(quoted_json), &quoted_sink)
+            TestSupport::check("JSON string escaping round-trips recent paths", DesignText::equal(WorkspacePreferences::recent_path(quoted_round_trip, 0), "/Users/me/A \"quoted\" form.elisaform.json"))
+
+            missing_fields_sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
+            missing_fields: WorkspacePreferences::Preferences = WorkspacePreferences::decode("{\"format\":\"elisa-ide-workspace\",\"version\":1}", &missing_fields_sink)
+            TestSupport::check("missing optional fields use stable defaults", is_default(missing_fields) and missing_fields_sink.error_count == 0)
+
+            malformed_sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
+            malformed: WorkspacePreferences::Preferences = WorkspacePreferences::decode("{not-json", &malformed_sink)
+            TestSupport::check("malformed JSON returns complete defaults with an error", is_default(malformed) and malformed_sink.error_count > 0)
+            duplicate_sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
+            duplicate: WorkspacePreferences::Preferences = WorkspacePreferences::decode("{\"format\":\"elisa-ide-workspace\",\"version\":1,\"theme\":\"dark\",\"theme\":\"light\"}", &duplicate_sink)
+            TestSupport::check("duplicate object keys reject the file and use defaults", is_default(duplicate) and duplicate_sink.error_count > 0)
+            version_sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
+            wrong_version: WorkspacePreferences::Preferences = WorkspacePreferences::decode("{\"format\":\"elisa-ide-workspace\",\"version\":99}", &version_sink)
+            TestSupport::check("unsupported preferences version returns defaults", is_default(wrong_version) and version_sink.error_count > 0)
+            version_type_sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
+            wrong_version_type: WorkspacePreferences::Preferences = WorkspacePreferences::decode("{\"format\":\"elisa-ide-workspace\",\"version\":\"1\"}", &version_type_sink)
+            TestSupport::check("non-numeric version returns defaults", is_default(wrong_version_type) and version_type_sink.error_count > 0)
+            format_sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
+            wrong_format: WorkspacePreferences::Preferences = WorkspacePreferences::decode("{\"format\":\"some-other-file\",\"version\":1}", &format_sink)
+            TestSupport::check("unrecognized preferences format returns defaults", is_default(wrong_format) and format_sink.error_count > 0)
+
+            invalid_fields_sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
+            invalid_fields: WorkspacePreferences::Preferences = WorkspacePreferences::decode("{\"format\":\"elisa-ide-workspace\",\"version\":1,\"theme\":\"ultraviolet\",\"recentFiles\":[\"/tmp/a\",17,\"/tmp/a\",\"\"],\"panes\":{\"left\":0.01,\"right\":\"wide\",\"bottom\":0.4}}", &invalid_fields_sink)
+            TestSupport::check("invalid individual values fall back without discarding valid settings", invalid_fields.theme == WorkspacePreferences::Theme.System and invalid_fields.left_pane_ratio == WorkspacePreferences::DEFAULT_LEFT_PANE_RATIO and invalid_fields.right_pane_ratio == WorkspacePreferences::DEFAULT_RIGHT_PANE_RATIO and invalid_fields.bottom_pane_ratio == 0.4 and invalid_fields.recent_files.count == 1 and DesignText::equal(WorkspacePreferences::recent_path(invalid_fields, 0), "/tmp/a"))
+            TestSupport::check("field fallbacks are reported", invalid_fields_sink.warning_count >= 5)
+            bad_panes_sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
+            bad_panes: WorkspacePreferences::Preferences = WorkspacePreferences::decode("{\"format\":\"elisa-ide-workspace\",\"version\":1,\"panes\":[]}", &bad_panes_sink)
+            TestSupport::check("pane object type failure restores all shell defaults", bad_panes.left_pane_ratio == WorkspacePreferences::DEFAULT_LEFT_PANE_RATIO and bad_panes.right_pane_ratio == WorkspacePreferences::DEFAULT_RIGHT_PANE_RATIO and bad_panes.bottom_pane_ratio == WorkspacePreferences::DEFAULT_BOTTOM_PANE_RATIO and bad_panes_sink.warning_count == 1)
+
+            too_many_bytes: darray[u8] = make_recent_overflow_document()
+            too_many_sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
+            bounded_recent: WorkspacePreferences::Preferences = WorkspacePreferences::decode(TestSupport::view_of(too_many_bytes), &too_many_sink)
+            TestSupport::check("recent file list is capped at its defined maximum", bounded_recent.recent_files.count == 20 and too_many_sink.warning_count > 0)
+            overlong_bytes: darray[u8] = make_overlong_path_document()
+            overlong_sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
+            overlong: WorkspacePreferences::Preferences = WorkspacePreferences::decode(TestSupport::view_of(overlong_bytes), &overlong_sink)
+            TestSupport::check("overlong recent path is ignored with a warning", overlong.recent_files.count == 0 and overlong_sink.warning_count > 0)
+
+            invalid_model: mutable WorkspacePreferences::Preferences = WorkspacePreferences::empty()
+            invalid_model.right_pane_ratio <- 0.9
+            invalid_encode_sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
+            invalid_encoded: darray[u8] = WorkspacePreferences::encode(invalid_model, &invalid_encode_sink)
+            TestSupport::check("encoder rejects out-of-range in-memory state", invalid_encoded.count == 0 and invalid_encode_sink.error_count > 0)
+
+            return TestSupport::report("workspace_preferences")
+
+def main() -> i64:
+    return WorkspacePreferencesTest::run()

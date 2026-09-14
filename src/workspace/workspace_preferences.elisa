@@ -1,0 +1,358 @@
+# Local, per-user designer preferences. These values are deliberately separate
+# from project manifests and form documents: recent paths and editor layout do
+# not change generated application semantics.
+
+include "../model/design_limits.elisa"
+include "../model/design_text.elisa"
+include "../model/design_values.elisa"
+include "../validation/design_diagnostics.elisa"
+
+include "../../compiler/elisacore_std/elisacore_runtime.elisa"
+include "../../compiler/elisacore_std/collections.elisa"
+include "../../compiler/elisacore_std/elisacore_json.elisa"
+
+module WorkspacePreferences:
+    private:
+        const MAX_PREFERENCES_BYTES: usize = 1048576
+        const RECENT_FILE_LIMIT: usize = 20
+        const RECENT_PATH_BYTE_LIMIT: i64 = 4096
+        # Match ShellLayout::clamp_ratio so persisted dimensions survive a
+        # reload without the shell silently changing them.
+        const MIN_PANE_RATIO: f64 = 0.08
+        const MAX_PANE_RATIO: f64 = 0.45
+
+        global mutable preferences_arena: Arena = Arena{begin: null, end: null, end_index: 0, strategy: 0}
+        global mutable preferences_output_arena: Arena = Arena{begin: null, end: null, end_index: 0, strategy: 0}
+
+        def reserve_recent(target: mutable darray[DesignValues::StringRef]&, capacity: usize) -> void:
+            _ = arena_da_reserve(&preferences_arena, target, capacity)
+
+        def valid_string_ref(pool: DesignValues::StringPool&, ref: DesignValues::StringRef) -> bool:
+            return false if ref.offset > pool.bytes.count
+            return ref.length <= pool.bytes.count - ref.offset
+
+        def empty_arena() -> Arena:
+            return Arena{begin: null, end: null, end_index: 0, strategy: 0}
+
+        def durable(bytes: darray[u8]) -> darray[u8]:
+            result: mutable darray[u8] = []
+            _ = arena_da_reserve(&preferences_output_arena, &result, bytes.count + 1)
+            index: mutable i64 = 0
+            while index < bytes.count.i64():
+                result.push(bytes[index.usize()])
+                index <- index + 1
+            return result
+
+        def member_index(value: JsonValue, key: sview) -> i64:
+            return json_index_of(value, key)
+
+        def member_at(value: JsonValue, key: sview) -> JsonValue:
+            return JsonValue.Null if member_index(value, key) < 0
+            result: JsonValue = catch json_get(value, key):
+                value:
+                    value
+                error e:
+                    JsonValue.Null
+            return result
+
+        def member_key(value: JsonValue, index: i64) -> sview:
+            key: sview = catch json_key_at(value, index):
+                value:
+                    value
+                error e:
+                    ""
+            return key
+
+        def member_value(value: JsonValue, index: i64) -> JsonValue:
+            child: JsonValue = catch json_value_at(value, index):
+                value:
+                    value
+                error e:
+                    JsonValue.Null
+            return child
+
+        def array_value(value: JsonValue, index: i64) -> JsonValue:
+            child: JsonValue = catch json_at(value, index):
+                value:
+                    value
+                error e:
+                    JsonValue.Null
+            return child
+
+        def string_value(value: JsonValue) -> sview:
+            result: sview = catch json_as_string(value):
+                value:
+                    value
+                error e:
+                    ""
+            return result
+
+        def number_value(value: JsonValue) -> f64:
+            result: f64 = catch json_as_number(value):
+                value:
+                    value
+                error e:
+                    0.0
+            return result
+
+        def duplicate_keys_present(value: JsonValue) -> bool:
+            match json_kind(value):
+                JsonKind.OBJECT:
+                    count: mutable i64 = json_object_len(value)
+                    index: mutable i64 = 0
+                    while index < count:
+                        key: sview = member_key(value, index)
+                        earlier: mutable i64 = 0
+                        while earlier < index:
+                            return true if DesignText::equal(member_key(value, earlier), key)
+                            earlier <- earlier + 1
+                        return true if duplicate_keys_present(member_value(value, index))
+                        index <- index + 1
+                JsonKind.ARRAY:
+                    count: mutable i64 = json_array_len(value)
+                    index: mutable i64 = 0
+                    while index < count:
+                        return true if duplicate_keys_present(array_value(value, index))
+                        index <- index + 1
+                _:
+                    pass
+            return false
+
+        def report_warning(sink: mutable DesignDiagnostics::Sink&, code: DesignDiagnostics::Code, path: sview, message: sview) -> void:
+            _ = DesignDiagnostics::report_warning(sink, code, path, message)
+
+        def valid_recent_path(path: sview) -> bool:
+            return false if path.len <= 0 or path.len > RECENT_PATH_BYTE_LIMIT
+            index: mutable i64 = 0
+            while index < path.len:
+                byte: u8 = path[index]
+                # NUL cannot be represented by the host path APIs; controls are
+                # excluded so a recent-file row cannot inject terminal/UI text.
+                return false if byte == 0 or byte < 32 or byte == 127
+                index <- index + 1
+            return true
+
+        def recent_index(preferences: Preferences&, candidate: sview) -> i64:
+            index: mutable i64 = 0
+            while index < preferences.recent_files.count.i64():
+                existing: sview = DesignValues::text_of(preferences.strings, preferences.recent_files[index.usize()])
+                return index if DesignText::equal(existing, candidate)
+                index <- index + 1
+            return -1
+
+        def recent_contains(preferences: Preferences&, candidate: sview) -> bool:
+            return recent_index(preferences, candidate) >= 0
+
+        def decode_theme(value: JsonValue, has_value: bool, fallback: Theme, sink: mutable DesignDiagnostics::Sink&) -> Theme:
+            return fallback if not has_value
+            if json_kind(value) != JsonKind.STRING:
+                report_warning(sink, DesignDiagnostics::Code.InvalidPropertyType, "theme", "theme must be a string; the default theme is used")
+                return fallback
+            raw: sview = string_value(value)
+            if DesignText::equal(raw, "system"):
+                return Theme.System
+            if DesignText::equal(raw, "light"):
+                return Theme.Light
+            if DesignText::equal(raw, "dark"):
+                return Theme.Dark
+            report_warning(sink, DesignDiagnostics::Code.InvalidPropertyType, "theme", "unknown theme key; the default theme is used")
+            return fallback
+
+        def decode_ratio(panes: JsonValue, key: sview, fallback: f64, sink: mutable DesignDiagnostics::Sink&) -> f64:
+            return fallback if member_index(panes, key) < 0
+            raw: JsonValue = member_at(panes, key)
+            if not json_is_number(raw):
+                report_warning(sink, DesignDiagnostics::Code.InvalidPropertyType, key, "pane ratio must be a number; the default ratio is used")
+                return fallback
+            value: f64 = number_value(raw)
+            if value != value or value > 1.7976931348623157e308 or value < -1.7976931348623157e308 or value < MIN_PANE_RATIO or value > MAX_PANE_RATIO:
+                report_warning(sink, DesignDiagnostics::Code.PropertyOutOfRange, key, "pane ratio is outside the supported range; the default ratio is used")
+                return fallback
+            return value
+
+        def decode_recent(preferences: mutable Preferences&, root: JsonValue, sink: mutable DesignDiagnostics::Sink&) -> void:
+            return if member_index(root, "recentFiles") < 0
+            raw: JsonValue = member_at(root, "recentFiles")
+            if json_kind(raw) != JsonKind.ARRAY:
+                report_warning(sink, DesignDiagnostics::Code.InvalidPropertyType, "recentFiles", "recentFiles must be an array; recent files are cleared")
+                return
+            count: i64 = json_array_len(raw)
+            if count > RECENT_FILE_LIMIT.i64():
+                report_warning(sink, DesignDiagnostics::Code.TruncatedValue, "recentFiles", "recent file list exceeds its limit; entries after the first twenty were ignored")
+            index: mutable i64 = 0
+            while index < count and index < RECENT_FILE_LIMIT.i64():
+                item: JsonValue = array_value(raw, index)
+                if json_kind(item) != JsonKind.STRING:
+                    report_warning(sink, DesignDiagnostics::Code.InvalidPropertyType, "recentFiles", "non-string recent path was ignored")
+                else:
+                    path: sview = string_value(item)
+                    if not valid_recent_path(path):
+                        report_warning(sink, DesignDiagnostics::Code.InvalidReference, "recentFiles", "invalid or overlong recent path was ignored")
+                    elif recent_contains(preferences, path):
+                        report_warning(sink, DesignDiagnostics::Code.InvalidReference, "recentFiles", "duplicate recent path was ignored")
+                    else:
+                        reserve_recent(&preferences.recent_files, preferences.recent_files.count + 1)
+                        preferences.recent_files.push(DesignValues::append(preferences.strings.bytes, path))
+                index <- index + 1
+
+        def push_number_member(arena: mutable Arena&, members: mutable darray[JsonMember]&, key: sview, value: f64) -> void:
+            members.push(json_member(arena, key, json_number(value)))
+
+        def push_text_member(arena: mutable Arena&, members: mutable darray[JsonMember]&, key: sview, value: sview) -> void:
+            members.push(json_member(arena, key, json_string(arena, value)))
+
+        def theme_key(theme: Theme) -> sview:
+            if theme == Theme.System:
+                return "system"
+            if theme == Theme.Light:
+                return "light"
+            return "dark"
+
+        def theme_is_valid(theme: Theme) -> bool:
+            return theme == Theme.System or theme == Theme.Light or theme == Theme.Dark
+
+        def model_is_valid(preferences: Preferences) -> bool:
+            return false if preferences.schema_version != VERSION
+            return false if preferences.recent_files.count > RECENT_FILE_LIMIT
+            return false if preferences.left_pane_ratio != preferences.left_pane_ratio or preferences.left_pane_ratio < MIN_PANE_RATIO or preferences.left_pane_ratio > MAX_PANE_RATIO
+            return false if preferences.right_pane_ratio != preferences.right_pane_ratio or preferences.right_pane_ratio < MIN_PANE_RATIO or preferences.right_pane_ratio > MAX_PANE_RATIO
+            return false if preferences.bottom_pane_ratio != preferences.bottom_pane_ratio or preferences.bottom_pane_ratio < MIN_PANE_RATIO or preferences.bottom_pane_ratio > MAX_PANE_RATIO
+            return false if not theme_is_valid(preferences.theme)
+            index: mutable i64 = 0
+            while index < preferences.recent_files.count.i64():
+                ref: DesignValues::StringRef = preferences.recent_files[index.usize()]
+                return false if not valid_string_ref(preferences.strings, ref)
+                path: sview = DesignValues::text_of(preferences.strings, ref)
+                return false if not valid_recent_path(path) or recent_contains_before(preferences, path, index)
+                index <- index + 1
+            return true
+
+        def recent_contains_before(preferences: Preferences&, candidate: sview, end: i64) -> bool:
+            index: mutable i64 = 0
+            while index < end:
+                return true if DesignText::equal(DesignValues::text_of(preferences.strings, preferences.recent_files[index.usize()]), candidate)
+                index <- index + 1
+            return false
+
+    public:
+        const VERSION: i64 = 1
+        const MAX_RECENT_FILES: usize = 20
+        const MAX_RECENT_PATH_BYTES: i64 = 4096
+        const MIN_SUPPORTED_PANE_RATIO: f64 = 0.08
+        const MAX_SUPPORTED_PANE_RATIO: f64 = 0.45
+        const DEFAULT_LEFT_PANE_RATIO: f64 = 0.22
+        const DEFAULT_RIGHT_PANE_RATIO: f64 = 0.25
+        const DEFAULT_BOTTOM_PANE_RATIO: f64 = 0.20
+
+        const enum Theme of i32:
+            System = 0
+            Light = 1
+            Dark = 2
+
+        struct Preferences:
+            schema_version: mutable i64
+            recent_files: mutable darray[DesignValues::StringRef]
+            theme: mutable Theme
+            left_pane_ratio: mutable f64
+            right_pane_ratio: mutable f64
+            bottom_pane_ratio: mutable f64
+            strings: mutable DesignValues::StringPool
+
+        def empty() -> Preferences:
+            return Preferences{
+                schema_version: VERSION,
+                recent_files: [],
+                theme: Theme.System,
+                left_pane_ratio: DEFAULT_LEFT_PANE_RATIO,
+                right_pane_ratio: DEFAULT_RIGHT_PANE_RATIO,
+                bottom_pane_ratio: DEFAULT_BOTTOM_PANE_RATIO,
+                strings: DesignValues::empty_pool(),
+            }
+
+        def recent_path(preferences: Preferences&, index: i64) -> sview:
+            return "" if index < 0 or index >= preferences.recent_files.count.i64()
+            ref: DesignValues::StringRef = preferences.recent_files[index.usize()]
+            return "" if not valid_string_ref(preferences.strings, ref)
+            return DesignValues::text_of(preferences.strings, ref)
+
+        # Move a path to the front of the bounded MRU list. A duplicate is
+        # moved rather than copied; the oldest entry drops off at capacity.
+        def remember_file(preferences: mutable Preferences&, path: sview) -> bool:
+            return false if not model_is_valid(preferences)
+            return false if not valid_recent_path(path)
+            found: mutable i64 = recent_index(preferences, path)
+            if found < 0:
+                if preferences.recent_files.count < RECENT_FILE_LIMIT:
+                    reserve_recent(&preferences.recent_files, preferences.recent_files.count + 1)
+                    preferences.recent_files.push(DesignValues::no_text())
+                    found <- preferences.recent_files.count.i64() - 1
+                else:
+                    found <- preferences.recent_files.count.i64() - 1
+            index: mutable i64 = found
+            while index > 0:
+                preferences.recent_files[index.usize()] <- preferences.recent_files[(index - 1).usize()]
+                index <- index - 1
+            preferences.recent_files[0.usize()] <- DesignValues::append(preferences.strings.bytes, path)
+            return true
+
+        def decode(text: sview, sink: mutable DesignDiagnostics::Sink&) -> Preferences:
+            preferences: mutable Preferences = empty()
+            if text.len.usize() > MAX_PREFERENCES_BYTES:
+                _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.InputTooLarge, "", "workspace preferences exceed the input byte limit; defaults are used")
+                return preferences
+
+            arena: mutable Arena = empty_arena()
+            parsed: JsonParseResult = json_parse_checked(&arena, text)
+            if parsed.code != JsonErrorCode.OK:
+                _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.MalformedJson, "", "workspace preferences are not valid JSON; defaults are used")
+                return preferences
+            if json_kind(parsed.value) != JsonKind.OBJECT:
+                _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.InvalidPropertyType, "", "workspace preferences must be a JSON object; defaults are used")
+                return preferences
+            if duplicate_keys_present(parsed.value):
+                _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.DuplicateKey, "", "workspace preferences contain duplicate keys; defaults are used")
+                return preferences
+
+            format_index: i64 = member_index(parsed.value, "format")
+            if format_index < 0 or not DesignText::equal(string_value(member_at(parsed.value, "format")), "elisa-ide-workspace"):
+                _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.InvalidReference, "format", "workspace preferences have an unknown format; defaults are used")
+                return preferences
+            version_index: i64 = member_index(parsed.value, "version")
+            version_value: JsonValue = member_at(parsed.value, "version")
+            if version_index < 0 or not json_is_number(version_value) or number_value(version_value) != VERSION.f64():
+                _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.UnsupportedSchemaVersion, "version", "workspace preferences version is unsupported; defaults are used")
+                return preferences
+
+            preferences.theme <- decode_theme(member_at(parsed.value, "theme"), member_index(parsed.value, "theme") >= 0, Theme.System, sink)
+            panes: mutable JsonValue = member_at(parsed.value, "panes")
+            if member_index(parsed.value, "panes") >= 0 and json_kind(panes) != JsonKind.OBJECT:
+                report_warning(sink, DesignDiagnostics::Code.InvalidPropertyType, "panes", "panes must be an object; all pane ratios use their defaults")
+                panes <- JsonValue.Null
+            preferences.left_pane_ratio <- decode_ratio(panes, "left", DEFAULT_LEFT_PANE_RATIO, sink)
+            preferences.right_pane_ratio <- decode_ratio(panes, "right", DEFAULT_RIGHT_PANE_RATIO, sink)
+            preferences.bottom_pane_ratio <- decode_ratio(panes, "bottom", DEFAULT_BOTTOM_PANE_RATIO, sink)
+            decode_recent(&preferences, parsed.value, sink)
+            return preferences
+
+        def encode(preferences: Preferences, sink: mutable DesignDiagnostics::Sink&) -> darray[u8]:
+            if not model_is_valid(preferences):
+                _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.PropertyOutOfRange, "workspace", "workspace preference state is invalid or exceeds its supported bounds")
+                return []
+
+            arena: mutable Arena = empty_arena()
+            members: mutable darray[JsonMember] = []
+            push_text_member(&arena, &members, "format", "elisa-ide-workspace")
+            push_number_member(&arena, &members, "version", preferences.schema_version.f64())
+            recent: mutable darray[JsonValue] = []
+            index: mutable i64 = 0
+            while index < preferences.recent_files.count.i64():
+                recent.push(json_string(&arena, recent_path(preferences, index)))
+                index <- index + 1
+            members.push(json_member(&arena, "recentFiles", json_array_from(&arena, recent)))
+            push_text_member(&arena, &members, "theme", theme_key(preferences.theme))
+            panes: mutable darray[JsonMember] = []
+            push_number_member(&arena, &panes, "left", preferences.left_pane_ratio)
+            push_number_member(&arena, &panes, "right", preferences.right_pane_ratio)
+            push_number_member(&arena, &panes, "bottom", preferences.bottom_pane_ratio)
+            members.push(json_member(&arena, "panes", json_object_from(&arena, panes)))
+            return durable(json_write(&arena, json_object_from(&arena, members)))

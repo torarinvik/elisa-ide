@@ -1,0 +1,254 @@
+# Versioned, bounded binary framing for designer/preview-worker messages.
+#
+# The decoder accepts exactly one complete frame; stream read loops must keep
+# collecting bytes until the header's declared length is present. It rejects
+# partial, oversized, stale-version, malformed, and trailing-byte inputs before
+# exposing the payload view. Payload bytes borrow the input frame's lifetime.
+
+include "../model/fingerprint.elisa"
+
+include "../../compiler/elisacore_std/elisacore_runtime.elisa"
+include "../../compiler/elisacore_std/collections.elisa"
+
+module PreviewProtocol:
+    private:
+        const HEADER_BYTES: i64 = 64
+        const MAX_PAYLOAD_BYTES: i64 = 4194304
+        global mutable protocol_arena: Arena = Arena{begin: null, end: null, end_index: 0, strategy: 0}
+
+        def reserve_bytes(bytes: mutable darray[u8]&, capacity: usize) -> void:
+            _ = arena_da_reserve(&protocol_arena, bytes, capacity)
+
+        def push_u16(out: mutable darray[u8]&, value: u16) -> void:
+            out.push((value & 255).u8())
+            out.push((value >> 8).u8())
+
+        def push_u32(out: mutable darray[u8]&, value: u32) -> void:
+            for shift in 0..<4:
+                out.push(((value >> (shift * 8)) & 255).u8())
+
+        def push_u64(out: mutable darray[u8]&, value: u64) -> void:
+            for shift in 0..<8:
+                out.push(((value >> (shift * 8)) & 255).u8())
+
+        def read_u16(bytes: sview, offset: i64) -> u16:
+            return bytes[offset].u16() | (bytes[offset + 1].u16() << 8)
+
+        def read_u32(bytes: sview, offset: i64) -> u32:
+            value: mutable u32 = 0
+            for shift in 0..<4:
+                value <- value | (bytes[offset + shift].u32() << (shift * 8))
+            return value
+
+        def read_u64(bytes: sview, offset: i64) -> u64:
+            value: mutable u64 = 0
+            for shift in 0..<8:
+                value <- value | (bytes[offset + shift].u64() << (shift * 8))
+            return value
+
+        def kind_is_valid(kind: MessageKind) -> bool:
+            return kind.u16() >= MessageKind.Hello.u16() and kind.u16() <= MessageKind.Stopped.u16()
+
+        def message_kind_from_u16(raw: u16) -> MessageKind:
+            if raw == 1:
+                return MessageKind.Hello
+            if raw == 2:
+                return MessageKind.Ready
+            if raw == 3:
+                return MessageKind.LoadForm
+            if raw == 4:
+                return MessageKind.SetViewport
+            if raw == 5:
+                return MessageKind.RenderRequest
+            if raw == 6:
+                return MessageKind.FrameReady
+            if raw == 7:
+                return MessageKind.GeometrySnapshot
+            if raw == 8:
+                return MessageKind.Diagnostic
+            if raw == 9:
+                return MessageKind.Input
+            if raw == 10:
+                return MessageKind.SetMode
+            if raw == 11:
+                return MessageKind.ResetState
+            if raw == 12:
+                return MessageKind.Ping
+            if raw == 13:
+                return MessageKind.Pong
+            if raw == 14:
+                return MessageKind.Shutdown
+            return MessageKind.Stopped
+
+        def frame_is_valid(frame: FrameData) -> Issue:
+            return Issue.InvalidVersion if frame.version != VERSION
+            return Issue.UnknownMessage if not kind_is_valid(frame.kind)
+            return Issue.InvalidSession if frame.session_nonce == 0 or frame.worker_generation == 0
+            return Issue.InvalidRequestId if frame.request_id == 0
+            return Issue.PayloadTooLarge if frame.payload.len < 0 or frame.payload.len > MAX_PAYLOAD_BYTES
+            return Issue.None
+
+        def magic_matches(bytes: sview) -> bool:
+            return bytes[0] == 69 and bytes[1] == 76 and bytes[2] == 80 and bytes[3] == 86
+
+        def header_magic(out: mutable darray[u8]&) -> void:
+            out.push(69)
+            out.push(76)
+            out.push(80)
+            out.push(86)
+
+        def empty_view() -> FrameView:
+            return FrameView{
+                version: 0,
+                kind: MessageKind.Hello,
+                flags: 0,
+                session_nonce: 0,
+                worker_generation: 0,
+                request_id: 0,
+                response_to: 0,
+                document_revision: 0,
+                content_hash: 0,
+                payload: "",
+            }
+
+    public:
+        const VERSION: u16 = 1
+        const FRAME_HEADER_BYTES: i64 = HEADER_BYTES
+        const MAX_FRAME_PAYLOAD_BYTES: i64 = MAX_PAYLOAD_BYTES
+
+        const enum MessageKind of u16:
+            Hello = 1
+            Ready = 2
+            LoadForm = 3
+            SetViewport = 4
+            RenderRequest = 5
+            FrameReady = 6
+            GeometrySnapshot = 7
+            Diagnostic = 8
+            Input = 9
+            SetMode = 10
+            ResetState = 11
+            Ping = 12
+            Pong = 13
+            Shutdown = 14
+            Stopped = 15
+
+        const enum Issue of i32:
+            None = 0
+            TruncatedHeader = 1
+            InvalidMagic = 2
+            InvalidVersion = 3
+            UnknownMessage = 4
+            InvalidSession = 5
+            InvalidRequestId = 6
+            ReservedBitsSet = 7
+            PayloadTooLarge = 8
+            TruncatedPayload = 9
+            TrailingBytes = 10
+
+        struct FrameData:
+            version: mutable u16
+            kind: mutable MessageKind
+            flags: mutable u16
+            session_nonce: mutable u64
+            worker_generation: mutable u64
+            request_id: mutable u64
+            response_to: mutable u64
+            document_revision: mutable u64
+            content_hash: mutable u64
+            payload: mutable sview
+
+        struct FrameView:
+            version: mutable u16
+            kind: mutable MessageKind
+            flags: mutable u16
+            session_nonce: mutable u64
+            worker_generation: mutable u64
+            request_id: mutable u64
+            response_to: mutable u64
+            document_revision: mutable u64
+            content_hash: mutable u64
+            # View into the exact input bytes passed to decode_frame.
+            payload: mutable sview
+
+        struct EncodeResult:
+            code: mutable Issue
+            bytes: mutable darray[u8]
+
+        struct DecodeResult:
+            code: mutable Issue
+            frame: mutable FrameView
+
+        def encode_frame(frame: FrameData) -> EncodeResult:
+            issue: Issue = frame_is_valid(frame)
+            return EncodeResult{code: issue, bytes: []} if issue != Issue.None
+            return EncodeResult{code: Issue.ReservedBitsSet, bytes: []} if frame.flags != 0
+
+            out: mutable darray[u8] = []
+            reserve_bytes(&out, (HEADER_BYTES + frame.payload.len).usize())
+            header_magic(&out)
+            push_u16(&out, frame.version)
+            push_u16(&out, frame.kind.u16())
+            push_u16(&out, frame.flags)
+            push_u16(&out, 0)
+            push_u64(&out, frame.session_nonce)
+            push_u64(&out, frame.worker_generation)
+            push_u64(&out, frame.request_id)
+            push_u64(&out, frame.response_to)
+            push_u64(&out, frame.document_revision)
+            push_u64(&out, frame.content_hash)
+            push_u32(&out, frame.payload.len.u32())
+            index: mutable i64 = 0
+            while index < frame.payload.len:
+                out.push(frame.payload[index])
+                index <- index + 1
+            return EncodeResult{code: Issue.None, bytes: out}
+
+        # `bytes` must contain exactly one frame. A stream adapter can inspect
+        # the declared length as soon as the first 64 bytes have arrived and
+        # call this only after collecting that exact number of bytes.
+        def decode_frame(bytes: sview) -> DecodeResult:
+            invalid: mutable DecodeResult = DecodeResult{code: Issue.TruncatedHeader, frame: empty_view()}
+            return invalid if bytes.len < HEADER_BYTES
+            invalid.code <- Issue.InvalidMagic
+            return invalid if not magic_matches(bytes)
+
+            version: u16 = read_u16(bytes, 4)
+            invalid.code <- Issue.InvalidVersion
+            return invalid if version != VERSION
+            raw_kind: u16 = read_u16(bytes, 6)
+            invalid.code <- Issue.UnknownMessage
+            return invalid if raw_kind < MessageKind.Hello.u16() or raw_kind > MessageKind.Stopped.u16()
+            flags: u16 = read_u16(bytes, 8)
+            invalid.code <- Issue.ReservedBitsSet
+            return invalid if flags != 0 or read_u16(bytes, 10) != 0
+
+            payload_length: u32 = read_u32(bytes, 60)
+            invalid.code <- Issue.PayloadTooLarge
+            return invalid if payload_length.i64() > MAX_PAYLOAD_BYTES
+            expected_length: i64 = HEADER_BYTES + payload_length.i64()
+            invalid.code <- Issue.TruncatedPayload
+            return invalid if bytes.len < expected_length
+            invalid.code <- Issue.TrailingBytes
+            return invalid if bytes.len > expected_length
+
+            frame: mutable FrameView = empty_view()
+            frame.version <- version
+            frame.kind <- message_kind_from_u16(raw_kind)
+            frame.flags <- flags
+            frame.session_nonce <- read_u64(bytes, 12)
+            frame.worker_generation <- read_u64(bytes, 20)
+            frame.request_id <- read_u64(bytes, 28)
+            frame.response_to <- read_u64(bytes, 36)
+            frame.document_revision <- read_u64(bytes, 44)
+            frame.content_hash <- read_u64(bytes, 52)
+            # The transport is binary, so `sview(pointer, ...)` is not suitable:
+            # that overload measures a C string and stops at the first zero byte.
+            # Start with the counted byte-buffer view, then slice the payload.
+            frame.payload <- string_view_slice(bytes_view(bytes), HEADER_BYTES, expected_length)
+
+            invalid.code <- Issue.InvalidSession
+            return invalid if frame.session_nonce == 0 or frame.worker_generation == 0
+            invalid.code <- Issue.InvalidRequestId
+            return invalid if frame.request_id == 0
+            return DecodeResult{code: Issue.None, frame: frame}

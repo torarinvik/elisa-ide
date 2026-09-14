@@ -1,0 +1,54 @@
+# UI-side host client test (M03 shell transport gate).
+#
+# Builds the framework unit that owns HostClient, starts one long-lived
+# document host in signal mode, and checks the make-a-form / insert / select
+# flow end to end. Built and run by scripts/run_tests.sh.
+
+include "../../framework/src/platform/sdl3/ui_sdl3_flat.elisa"
+include "../../src/shell/host_client.elisa"
+
+@link_name("designer_report_i64")
+extern report_i64(label: cstr, value: i64) -> void
+
+def app_init() -> void:
+    return
+def app_event(event: UiCore::Event) -> void:
+    return
+def app_text_input(text: sview) -> void:
+    return
+def app_text_editing(text: sview, selected_start: i32, selected_length: i32) -> void:
+    return
+def app_frame() -> void:
+    return
+def app_widget_event(widget: usize, event: i32) -> void:
+    return
+
+def main() -> i64:
+    failures: mutable i64 = 0
+    _ = PosixFile::remove("build/host_reply.bin")
+    process: mutable PosixProcess::Process = HostClient::start("build/document_host")
+    if PosixProcess::valid(process) == false:
+        return 1
+
+    if HostClient::request(&process, 1, 0, 0).result != 1:
+        failures <- failures + 1
+    if HostClient::request(&process, 10, 0, 0).result != 1:
+        failures <- failures + 1
+    if HostClient::request(&process, 21, 0, 0).result != 6:
+        failures <- failures + 1
+    if HostClient::request(&process, 30, 4, 0).result < 0:
+        failures <- failures + 1
+    if HostClient::request(&process, 20, 0, 0).result != 2:
+        failures <- failures + 1
+    if HostClient::request(&process, 23, 0, 0).result != 2:
+        failures <- failures + 1
+    selection: HostClient::HostReply = HostClient::request(&process, 54, 0, 0)
+    if selection.text.count != 6:
+        failures <- failures + 1
+
+    HostClient::stop(&process)
+    if failures == 0:
+        report_i64("ok ui_host_client failures=", 0)
+        return 0
+    report_i64("ui_host_client failures=", failures)
+    return 1

@@ -1,0 +1,190 @@
+# M00 spike: isolated preview worker and shell-handle survival.
+#
+# Proves the plan's preview-isolation requirement before any large shell work:
+#   * a separate worker process renders a real elisa-ui form off-screen;
+#   * the parent receives a frame image and correlated geometry;
+#   * the worker's `UiHandles::reset()` and rebuild cannot invalidate the
+#     parent's retained tree, selection state, or bounds;
+#   * the worker exits and is reaped; no child is left running.
+#
+# Exit codes identify the failed step.
+
+include "../../framework/src/platform/sdl3/ui_sdl3_flat.elisa"
+include "../../src/platform/posix/posix_file.elisa"
+include "../../src/platform/posix/posix_process.elisa"
+
+@link_name("designer_setenv")
+extern designer_setenv(name: cstr, value: cstr) -> i64
+@link_name("designer_report_text")
+extern designer_report_text(text: cstr) -> void
+@link_name("designer_report_i64")
+extern designer_report_i64(label: cstr, value: i64) -> void
+
+def app_init() -> void:
+    return
+
+def app_event(event: UiCore::Event) -> void:
+    return
+
+def app_text_input(text: sview) -> void:
+    return
+
+def app_text_editing(text: sview, selected_start: i32, selected_length: i32) -> void:
+    return
+
+def app_frame() -> void:
+    return
+
+def app_widget_event(widget: usize, event: i32) -> void:
+    return
+
+module PreviewIsolationSpike:
+    private:
+        const WORKER: cstr = "build/preview_worker"
+        const FRAME: cstr = "build/spikes/preview_frame.png"
+        const FRAME_CAPACITY: usize = 8388608
+        const CAPTURE_CAPACITY: usize = 65536
+
+        global mutable shell_root: UiHandles::Handle = UiHandles::Handle{widget_id: UiFlat::NONE.u32(), tree_id: 0}
+        global mutable shell_before_x: f32 = 0.0
+        global mutable shell_before_y: f32 = 0.0
+        global mutable shell_before_width: f32 = 0.0
+        global mutable shell_before_height: f32 = 0.0
+
+        def color(r: u8, g: u8, b: u8) -> UiCore::Color:
+            return UiCore::rgb(r, g, b)
+
+        def index_of(bytes: darray[u8], text: sview, from: usize) -> i64:
+            return -1 if text.len == 0 or bytes.count < text.len.usize()
+            start: mutable usize = from
+            while start + text.len.usize() <= bytes.count:
+                matched: mutable bool = true
+                for offset in 0..<text.len |bytes, text, matched, start|:
+                    if bytes[start + offset] != text[offset]:
+                        matched <- false
+                        break
+                if matched:
+                    return start.i64()
+                start <- start + 1
+            return -1
+
+        def parse_field(bytes: darray[u8], position: mutable usize&) -> i64:
+            while position < bytes.count and bytes[position] == 32:
+                position <- position + 1
+            value: mutable i64 = 0
+            while position < bytes.count:
+                byte: u8 = bytes[position]
+                break if byte < 48 or byte > 57
+                value <- value * 10 + (byte.u8() - 48).i64()
+                position <- position + 1
+            return value
+
+        # The `want`-th integer (0-based) after `marker` in the captured
+        # geometry text; -1 when the marker or field is absent.
+        def rect_field(bytes: darray[u8], marker: sview, want: i32) -> i64:
+            found: i64 = index_of(bytes, marker, 0)
+            return -1 if found < 0
+            position: mutable usize = (found + marker.len).usize()
+            value: mutable i64 = -1
+            field: mutable i32 = 0
+            while field <= want:
+                value <- parse_field(bytes, &position)
+                field <- field + 1
+            return value
+
+        def png_signature(bytes: darray[u8]) -> bool:
+            return false if bytes.count < 8
+            return bytes[0] == 137 and bytes[1] == 80 and bytes[2] == 78 and bytes[3] == 71 and bytes[4] == 13 and bytes[5] == 10 and bytes[6] == 26 and bytes[7] == 10
+
+        def build_shell() -> void:
+            UiHandles::reset()
+            shell_root <- UiHandles::column(UiHandles::root_parent(), 8.0, 6.0, color(20, 22, 28))
+            toolbar: UiHandles::Handle = UiHandles::row(shell_root, 2.0, 4.0, color(30, 33, 40))
+            _ = UiHandles::button(toolbar, 72.0, 24.0, color(50, 55, 66), color(60, 66, 80), color(40, 44, 54))
+            panel: UiHandles::Handle = UiHandles::panel(shell_root, UiConst::Axis.Column, 6.0, 4.0, color(28, 31, 38))
+            UiHandles::set_grow(panel, 1.0)
+            _ = UiHandles::label(panel, "Design surface", 15.0, color(220, 225, 235))
+            UiHandles::layout(800.0, 600.0)
+            if UiHandles::widget(shell_root) is widget:
+                shell_before_x <- widget.x
+                shell_before_y <- widget.y
+                shell_before_width <- widget.width
+                shell_before_height <- widget.height
+
+        def shell_intact() -> bool:
+            if not UiHandles::is_valid(shell_root):
+                return false
+            if UiHandles::widget(shell_root) is widget:
+                return widget.x == shell_before_x and widget.y == shell_before_y and widget.width == shell_before_width and widget.height == shell_before_height
+            return false
+
+        def wait_finish(process: PosixProcess::Process, budget_ms: i64) -> bool:
+            elapsed: mutable i64 = 0
+            while elapsed < budget_ms:
+                if PosixProcess::poll(&process, 20):
+                    return true
+                elapsed <- elapsed + 20
+            return false
+
+        # Run the worker once and verify its artifacts. Returns 0 on success,
+        # or a nonzero step code.
+        def run_worker_once() -> i64:
+            _ = PosixFile::remove(FRAME)
+            arguments: mutable darray[cstr] = []
+            arguments.push(WORKER)
+            worker: mutable PosixProcess::Process = PosixProcess::start(&arguments)
+            return 30 if not PosixProcess::valid(&worker)
+            if not wait_finish(worker, 60000):
+                PosixProcess::dispose(&worker)
+                return 31
+            captured: mutable darray[u8] = []
+            _ = PosixProcess::read_stdout(&worker, &captured, CAPTURE_CAPACITY)
+            worker_status: PosixProcess::Status = PosixProcess::status(&worker)
+            PosixProcess::dispose(&worker)
+            return 32 if worker_status.exit_code != 0
+            return 33 if not worker_status.finished
+
+            # Correlated geometry: all three design nodes resolved with a
+            # positive extent.
+            return 34 if index_of(captured, sview("rect root ", 0, -1), 0) < 0
+            return 35 if index_of(captured, sview("rect heading ", 0, -1), 0) < 0
+            return 36 if index_of(captured, sview("rect action ", 0, -1), 0) < 0
+            action_width: i64 = rect_field(captured, sview("rect action ", 0, -1), 2)
+            action_height: i64 = rect_field(captured, sview("rect action ", 0, -1), 3)
+            return 37 if action_width <= 0 or action_height <= 0
+
+            # Frame image: a real PNG, not an empty file.
+            frame: mutable darray[u8] = []
+            frame_length: usize = PosixFile::read_bytes(&frame, FRAME, FRAME_CAPACITY)
+            return 38 if frame_length < 1000
+            return 39 if not png_signature(frame)
+            return 0
+
+    public:
+        def run() -> i64:
+            build_shell()
+            return 10 if not shell_intact()
+
+            _ = designer_setenv("ELISA_UI_SMOKE_FRAMES", "1")
+            _ = designer_setenv("ELISA_UI_SNAPSHOT", FRAME)
+
+            first: i64 = run_worker_once()
+            return first if first != 0
+
+            # The worker reset and rebuilt its own tree; the parent's tree,
+            # bounds, and lifetime must be untouched.
+            return 11 if not shell_intact()
+            designer_report_i64("preview.worker_exit=", 0)
+
+            # A second run proves the worker can be restarted and rebuilt
+            # without any state carried over from the first.
+            second: i64 = run_worker_once()
+            return second if second != 0
+            return 12 if not shell_intact()
+
+            _ = PosixFile::remove(FRAME)
+            designer_report_text("spike preview_isolation: ok")
+            return 0
+
+def main() -> i64:
+    return PreviewIsolationSpike::run()

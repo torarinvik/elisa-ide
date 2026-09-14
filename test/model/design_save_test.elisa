@@ -1,0 +1,263 @@
+# Save and recovery tests.
+#
+# Covers the M02 acceptance: atomic save, external-change refusal that keeps
+# the previous file, recovery snapshot round trip, and an injected write
+# failure that leaves the destination untouched.
+
+include "../../compiler/elisacore_std/elisacore_runtime.elisa"
+include "../../compiler/elisacore_std/collections.elisa"
+include "../../compiler/elisacore_std/elisacore_fileio.elisa"
+include "../../src/schema/design_json_decode.elisa"
+include "../../src/commands/design_history.elisa"
+include "../../src/workspace/design_save.elisa"
+include "../../src/workspace/design_recovery.elisa"
+include "test_support.elisa"
+
+@link_name("designer_test_fail_next_directory_sync")
+extern fail_next_directory_sync_for_test() -> void
+@link_name("designer_test_directory_sync_failure_count")
+extern directory_sync_failure_count_for_test() -> i64
+@link_name("designer_test_set_file_mode")
+extern set_file_mode_for_test(path: cstr, mode: i64) -> i64
+
+module DesignSaveTest:
+    private:
+        const TARGET: cstr = "build/spikes/m02-save.elisaform.json"
+        const SAVE_AS_TARGET: cstr = "build/spikes/m02-save-as.elisaform.json"
+        const RECOVERY_DIR: cstr = "build/spikes/m02-recovery"
+
+        def load_settings(registry: DesignRegistry::Registry&, sink: mutable DesignDiagnostics::Sink&) -> DesignForms::Form:
+            bytes: darray[u8] = TestSupport::read_fixture("test/fixtures/settings-form.elisaform.json")
+            return DesignDecode::decode_form(TestSupport::view_of(bytes), registry, sink)
+
+        def file_contains(path: cstr, needle: sview) -> bool:
+            bytes: mutable darray[u8] = []
+            amount: usize = PosixFile::read_bytes(&bytes, path, DesignLimits::MAX_INPUT_BYTES)
+            return false if amount == 0
+            return TestSupport::text_contains(TestSupport::view_of(bytes), needle)
+
+    public:
+        def run() -> i64:
+            registry: DesignRegistry::Registry = DesignRegistry::build_builtin()
+            sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
+            form: mutable DesignForms::Form = load_settings(registry, &sink)
+            _ = PosixFile::remove_temp(TARGET)
+            _ = PosixFile::remove(TARGET)
+
+            # --- first save ---------------------------------------------------
+            first_source: i64 error[DesignSaveError] = DesignSave::save_form(TARGET, form, 0, false)
+            first: i64 = catch first_source:
+                value:
+                    value
+                error e:
+                    -1
+            TestSupport::check("first save writes bytes", first > 0)
+            loaded_fingerprint: mutable u64 = DesignSave::file_fingerprint(TARGET)
+            TestSupport::check("saved file has a fingerprint", loaded_fingerprint != 0)
+            TestSupport::check("saved file contains the form", file_contains(TARGET, "node-save"))
+
+            # A new-form Save As publishes only to an absent destination. A
+            # second attempt must not replace the first version's bytes.
+            _ = PosixFile::remove_temp(SAVE_AS_TARGET)
+            _ = PosixFile::remove(SAVE_AS_TARGET)
+            save_as_source: i64 error[DesignSaveError] = DesignSave::save_new_form(SAVE_AS_TARGET, form)
+            save_as_written: i64 = catch save_as_source:
+                value:
+                    value
+                error e:
+                    -1
+            TestSupport::check("Save As creates an absent destination", save_as_written > 0)
+            save_as_fingerprint: u64 = DesignSave::file_fingerprint(SAVE_AS_TARGET)
+            TestSupport::check("Save As destination has a fingerprint", save_as_fingerprint != 0)
+            save_as_again_source: i64 error[DesignSaveError] = DesignSave::save_new_form(SAVE_AS_TARGET, form)
+            save_as_again: i64 = catch save_as_again_source:
+                value:
+                    value
+                error e:
+                    -1
+            TestSupport::check("Save As refuses an existing destination", save_as_again < 0)
+            TestSupport::check("refused Save As leaves destination unchanged",
+                               DesignSave::file_fingerprint(SAVE_AS_TARGET) == save_as_fingerprint)
+
+            # A destination that disappears after opening must not be mistaken
+            # for an intentionally absent new-file target.
+            _ = PosixFile::remove(TARGET)
+            missing_source: i64 error[DesignSaveError] = DesignSave::save_form(TARGET, form, loaded_fingerprint, true)
+            missing_refused: i64 = catch missing_source:
+                value:
+                    value
+                error e:
+                    -1
+            TestSupport::check("missing expected destination refuses the save", missing_refused < 0)
+            missing_bytes: mutable darray[u8] = []
+            missing_status: i64 = PosixFile::read_bytes_result(&missing_bytes, TARGET, DesignSave::READ_CAPACITY)
+            TestSupport::check("missing destination stays missing", missing_status < 0 and PosixFile::read_error_is_not_found(missing_status))
+
+            # Empty is readable content, not the missing-file sentinel.
+            empty_source: i64 error[FileReplaceError] = PosixFile::atomic_write(TARGET, "")
+            empty_written: i64 = catch empty_source:
+                value:
+                    value
+                error e:
+                    -1
+            empty_fingerprint: u64 = DesignSave::file_fingerprint(TARGET)
+            TestSupport::check("empty destination is readable and fingerprinted", empty_written == 0 and empty_fingerprint != 0)
+            empty_save_source: i64 error[DesignSaveError] = DesignSave::save_form(TARGET, form, empty_fingerprint, true)
+            empty_saved: i64 = catch empty_save_source:
+                value:
+                    value
+                error e:
+                    -1
+            TestSupport::check("unchanged empty destination can be replaced", empty_saved > 0)
+
+            # A genuinely new document has expected fingerprint zero and may
+            # create a missing destination explicitly.
+            _ = PosixFile::remove(TARGET)
+            restore_source: i64 error[DesignSaveError] = DesignSave::save_form(TARGET, form, 0, true)
+            restored: i64 = catch restore_source:
+                value:
+                    value
+                error e:
+                    -1
+            TestSupport::check("zero fingerprint can create a missing destination", restored > 0)
+            loaded_fingerprint <- DesignSave::file_fingerprint(TARGET)
+
+            # --- dirty tracking ----------------------------------------------
+            history: mutable DesignHistory::History = DesignHistory::empty_history(1024 * 1024)
+            DesignHistory::mark_saved(form, &history)
+            TestSupport::check("clean after mark_saved", not DesignHistory::is_dirty(form, history))
+            ids: mutable darray[DesignIds::DesignId] = []
+            ids.push(DesignIds::from_text("node-save"))
+            edit: DesignCommand::Prepared = DesignCommand::prepare_set_property(form, ids, "text", DesignValues::text(DesignValues::append(&form.strings.bytes, "Save now")), &sink)
+            _ = DesignHistory::apply(&history, &form, &edit)
+            TestSupport::check("edit makes the form dirty", DesignHistory::is_dirty(form, history))
+
+            # --- external change refused -------------------------------------
+            external_bytes: darray[u8] = DesignText::copy_of("{}\n")
+            external_source: i64 error[FileReplaceError] = PosixFile::atomic_write(TARGET, DesignText::view_of(external_bytes))
+            _ = catch external_source:
+                value:
+                    value
+                error e:
+                    -1
+            refused_source: i64 error[DesignSaveError] = DesignSave::save_form(TARGET, form, loaded_fingerprint, true)
+            refused: i64 = catch refused_source:
+                value:
+                    0
+                error e:
+                    -1
+            TestSupport::check("external change refuses the save", refused < 0)
+            TestSupport::check("refused save leaves the external file", file_contains(TARGET, "{}"))
+            TestSupport::check("form stays dirty after refusal", DesignHistory::is_dirty(form, history))
+
+            # --- save after acknowledging the external file -------------------
+            acknowledged: i64 error[DesignSaveError] = DesignSave::save_form(TARGET, form, DesignSave::file_fingerprint(TARGET), true)
+            saved: i64 = catch acknowledged:
+                value:
+                    value
+                error e:
+                    -1
+            TestSupport::check("save with the current fingerprint succeeds", saved > 0)
+            DesignHistory::mark_saved(form, &history)
+            TestSupport::check("clean after the successful save", not DesignHistory::is_dirty(form, history))
+
+            # If an existing file cannot be read, do not replace it just
+            # because its parent directory is writable.
+            protected_fingerprint: u64 = DesignSave::file_fingerprint(TARGET)
+            mode_status: i64 = set_file_mode_for_test(TARGET, 0)
+            TestSupport::check("unreadable destination permission applied", mode_status == 0)
+            unreadable_bytes: mutable darray[u8] = []
+            unreadable_status: i64 = PosixFile::read_bytes_result(&unreadable_bytes, TARGET, DesignSave::READ_CAPACITY)
+            TestSupport::check("destination is unreadable", unreadable_status < 0 and not PosixFile::read_error_is_not_found(unreadable_status))
+            unreadable_source: i64 error[DesignSaveError] = DesignSave::save_form(TARGET, form, protected_fingerprint, true)
+            unreadable_refused: i64 = catch unreadable_source:
+                value:
+                    value
+                error e:
+                    -1
+            unreadable_save_as_source: i64 error[DesignSaveError] = DesignSave::save_new_form(TARGET, form)
+            unreadable_save_as_refused: i64 = catch unreadable_save_as_source:
+                value:
+                    value
+                error e:
+                    -1
+            _ = set_file_mode_for_test(TARGET, 420)
+            TestSupport::check("unreadable destination refuses the save", unreadable_refused < 0)
+            TestSupport::check("unreadable destination refuses Save As", unreadable_save_as_refused < 0)
+            TestSupport::check("unreadable destination bytes remain", file_contains(TARGET, "Save now"))
+
+            # A directory fsync failure occurs after rename has published the
+            # new bytes. It must be distinguished from pre-commit failure so
+            # callers do not report that the old contents remain on disk.
+            raw_before_sync: i64 = directory_sync_failure_count_for_test()
+            fail_next_directory_sync_for_test()
+            raw_sync_source: i64 error[FileReplaceError] = PosixFile::atomic_write(TARGET, "Published before directory sync failure")
+            raw_sync_result: i64 = catch raw_sync_source:
+                value:
+                    1
+                FileReplaceError.CommittedButNotDurable:
+                    2
+                error e:
+                    -1
+            TestSupport::check("atomic replace distinguishes post-rename sync failure", raw_sync_result == 2)
+            TestSupport::check("raw directory sync fault was injected", directory_sync_failure_count_for_test() == raw_before_sync + 1)
+            TestSupport::check("post-rename sync failure leaves replacement visible", file_contains(TARGET, "Published before directory sync failure"))
+
+            post_commit_edit: DesignCommand::Prepared = DesignCommand::prepare_set_property(
+                form,
+                ids,
+                "text",
+                DesignValues::text(DesignValues::append(&form.strings.bytes, "Saved before directory sync failure")),
+                &sink,
+            )
+            _ = DesignHistory::apply(&history, &form, &post_commit_edit)
+            failures_before_sync: i64 = directory_sync_failure_count_for_test()
+            fail_next_directory_sync_for_test()
+            post_commit_source: i64 error[DesignSaveError] = DesignSave::save_form(TARGET, form, DesignSave::file_fingerprint(TARGET), true)
+            post_commit_written: i64 = catch post_commit_source:
+                value:
+                    value
+                error e:
+                    -1
+            TestSupport::check("directory sync fault was injected", directory_sync_failure_count_for_test() == failures_before_sync + 1)
+            TestSupport::check("directory sync failure preserves committed result", post_commit_written > 0)
+            TestSupport::check("directory sync failure leaves new bytes at destination", file_contains(TARGET, "Saved before directory sync failure"))
+            DesignHistory::mark_saved(form, &history)
+            TestSupport::check("committed save is clean after directory sync failure", not DesignHistory::is_dirty(form, history))
+
+            # --- injected write failure --------------------------------------
+            stale_temp: darray[u8] = PosixFile::temp_path(TARGET)
+            stale_temp_c: cstr = (&stale_temp[0]).cast[cstr] can Unsafe.PointerCast
+            stale_written: i64 = catch write_entire_file(stale_temp_c, "stale"):
+                value:
+                    value
+                error e:
+                    -1
+            TestSupport::check("stale temp created", stale_written >= 0)
+            failed_source: i64 error[DesignSaveError] = DesignSave::save_form(TARGET, form, DesignSave::file_fingerprint(TARGET), true)
+            failed: i64 = catch failed_source:
+                value:
+                    0
+                error e:
+                    -1
+            TestSupport::check("write failure is reported", failed < 0)
+            TestSupport::check("destination survives the failure", file_contains(TARGET, "Saved before directory sync failure"))
+            _ = PosixFile::remove_temp(TARGET)
+
+            # --- recovery snapshot -------------------------------------------
+            TestSupport::check("no snapshot yet", not DesignRecovery::has_snapshot(RECOVERY_DIR, form.id))
+            TestSupport::check("snapshot writes", DesignRecovery::write_snapshot(RECOVERY_DIR, form))
+            TestSupport::check("snapshot exists", DesignRecovery::has_snapshot(RECOVERY_DIR, form.id))
+            recovered: DesignForms::Form = DesignRecovery::read_snapshot(RECOVERY_DIR, form.id, registry, &sink)
+            TestSupport::check("recovered form has the same id", DesignIds::equal(recovered.id, form.id))
+            TestSupport::check("recovered form has the same node count", recovered.nodes.count == form.nodes.count)
+            TestSupport::check("recovered form keeps the edited caption", TestSupport::text_contains(DesignText::view_of(DesignEncode::encode_form(recovered)), "Saved before directory sync failure"))
+            TestSupport::check("snapshot removal works", DesignRecovery::remove_snapshot(RECOVERY_DIR, form.id))
+            TestSupport::check("snapshot is gone", not DesignRecovery::has_snapshot(RECOVERY_DIR, form.id))
+
+            _ = PosixFile::remove(TARGET)
+            _ = PosixFile::remove(SAVE_AS_TARGET)
+            return TestSupport::report("design_save")
+
+def main() -> i64:
+    return DesignSaveTest::run()

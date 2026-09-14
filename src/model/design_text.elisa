@@ -1,0 +1,86 @@
+# Small byte-text helpers shared by the model, schema, and validation layers.
+#
+# The standard library provides containers and views; these helpers keep path
+# and message construction in one place so diagnostics and JSON paths agree.
+
+include "../../compiler/elisacore_std/elisacore_runtime.elisa"
+include "../../compiler/elisacore_std/collections.elisa"
+
+module DesignText:
+    private:
+        global mutable text_arena: Arena = Arena{begin: null, end: null, end_index: 0, strategy: 0}
+
+    public:
+        def push_char(buffer: mutable darray[u8]&, byte: u8) -> void:
+            buffer.push(byte)
+
+        def push_view(buffer: mutable darray[u8]&, text: sview) -> void:
+            _ = arena_da_reserve(&text_arena, buffer, buffer.count + text.len.usize() + 1)
+            index: mutable i64 = 0
+            while index < text.len:
+                buffer.push(text[index])
+                index <- index + 1
+
+        def push_cstr(buffer: mutable darray[u8]&, text: cstr) -> void:
+            length: mutable i64 = 0
+            while length < 65536:
+                break if text[length.usize()] == 0
+                length <- length + 1
+            index: mutable i64 = 0
+            while index < length:
+                buffer.push(text[index.usize()])
+                index <- index + 1
+
+        def push_i64(buffer: mutable darray[u8]&, value: i64) -> void:
+            if value < 0:
+                buffer.push(45)
+                push_i64(buffer, -value)
+                return
+            if value >= 10:
+                push_i64(buffer, value / 10)
+            buffer.push(48 + (value % 10).u8())
+
+        def copy_of(text: sview) -> darray[u8]:
+            copied: mutable darray[u8] = []
+            _ = arena_da_reserve(&text_arena, &copied, text.len.usize() + 1)
+            push_view(&copied, text)
+            return copied
+
+        def view_of(buffer: darray[u8]) -> sview:
+            return "" if buffer.count == 0
+            return sview(&buffer[0], 0, buffer.count.i64())
+
+        def equal(left: sview, right: sview) -> bool:
+            return false if left.len != right.len
+            index: mutable i64 = 0
+            while index < left.len:
+                return false if left[index] != right[index]
+                index <- index + 1
+            return true
+
+        def has_text(haystack: sview, needle: sview) -> bool:
+            return false if needle.len == 0 or haystack.len < needle.len
+            start: mutable i64 = 0
+            while start + needle.len <= haystack.len:
+                matched: mutable bool = true
+                offset: mutable i64 = 0
+                while offset < needle.len:
+                    if haystack[start + offset] != needle[offset]:
+                        matched <- false
+                        break
+                    offset <- offset + 1
+                if matched:
+                    return true
+                start <- start + 1
+            return false
+
+        # Build `prefix[index]suffix`, the JSON-path shape diagnostics use.
+        def indexed_path(prefix: sview, index: i64, suffix: sview) -> darray[u8]:
+            path: mutable darray[u8] = []
+            _ = arena_da_reserve(&text_arena, &path, prefix.len.usize() + suffix.len.usize() + 32)
+            push_view(&path, prefix)
+            push_char(&path, 91)
+            push_i64(&path, index)
+            push_char(&path, 93)
+            push_view(&path, suffix)
+            return path

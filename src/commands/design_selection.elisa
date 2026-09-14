@@ -1,0 +1,88 @@
+# Ordered selection with one primary selection.
+#
+# Selection stores durable IDs only, so it survives document edits, preview
+# restarts, and handle rebuilds. Pruning after a command drops IDs that no
+# longer exist and repairs the primary deterministically.
+
+include "../model/design_ids.elisa"
+include "../model/design_form.elisa"
+include "../commands/design_ops.elisa"
+include "../model/design_store.elisa"
+
+module DesignSelection:
+    public:
+        struct Selection:
+            ids: mutable darray[DesignIds::DesignId]
+            primary: mutable DesignIds::DesignId
+
+        def empty() -> Selection:
+            return Selection{ids: [], primary: DesignIds::empty()}
+
+        def holds(selection: Selection&, id: DesignIds::DesignId) -> bool:
+            index: mutable i64 = 0
+            while index < selection.ids.count.i64():
+                if DesignIds::equal(selection.ids[index.usize()], id):
+                    return true
+                index <- index + 1
+            return false
+
+        def clear_all(selection: mutable Selection&) -> void:
+            selection.ids.resize(0)
+            selection.primary <- DesignIds::empty()
+
+        def select_only(selection: mutable Selection&, id: DesignIds::DesignId) -> void:
+            selection.ids.resize(0)
+            selection.primary <- DesignIds::empty()
+            DesignStore::ensure_ids(&selection.ids, 1)
+            DesignIds::append_copy(&selection.ids, &id)
+            DesignIds::copy_into(&selection.primary, &id)
+
+        def include_id(selection: mutable Selection&, id: DesignIds::DesignId) -> void:
+            if not holds(selection, id):
+                DesignStore::ensure_ids(&selection.ids, selection.ids.count + 1)
+                DesignIds::append_copy(&selection.ids, &id)
+            DesignIds::copy_into(&selection.primary, &id)
+
+        def exclude_id(selection: mutable Selection&, id: DesignIds::DesignId) -> void:
+            write: mutable i64 = 0
+            read: mutable i64 = 0
+            while read < selection.ids.count.i64():
+                if not DesignIds::equal(selection.ids[read.usize()], id):
+                    DesignIds::copy_into(&selection.ids[write.usize()], &selection.ids[read.usize()])
+                    write <- write + 1
+                read <- read + 1
+            selection.ids.resize(write.usize())
+            if DesignIds::equal(selection.primary, id):
+                selection.primary <- DesignIds::empty()
+                if selection.ids.count > 0:
+                    DesignIds::copy_into(&selection.primary, &selection.ids[selection.ids.count - 1.usize()])
+
+        def toggle_id(selection: mutable Selection&, id: DesignIds::DesignId) -> void:
+            if holds(selection, id):
+                exclude_id(selection, id)
+            else:
+                include_id(selection, id)
+
+        def selected_count(selection: Selection&) -> i64:
+            return selection.ids.count.i64()
+
+        # Drop IDs that no longer resolve and repair the primary: keep it when
+        # it survives, otherwise take the last remaining ID.
+        def prune(selection: mutable Selection&, form: DesignForms::Form&) -> void:
+            write: mutable i64 = 0
+            read: mutable i64 = 0
+            while read < selection.ids.count.i64():
+                if DesignForms::find_node(form, selection.ids[read.usize()]) >= 0:
+                    DesignIds::copy_into(&selection.ids[write.usize()], &selection.ids[read.usize()])
+                    write <- write + 1
+                read <- read + 1
+            selection.ids.resize(write.usize())
+            if DesignIds::is_empty(selection.primary) or DesignForms::find_node(form, selection.primary) < 0:
+                selection.primary <- DesignIds::empty()
+                if selection.ids.count > 0:
+                    DesignIds::copy_into(&selection.primary, &selection.ids[selection.ids.count - 1.usize()])
+
+        # Whole-subtree operations act on topmost roots; descendants do not
+        # move or delete twice.
+        def roots(selection: Selection&, form: DesignForms::Form&) -> darray[DesignIds::DesignId]:
+            return DesignOps::topmost_roots(form, selection.ids)

@@ -1,0 +1,60 @@
+# Project manifest: identity, form membership, source roots, generation
+# settings, and target profiles. Local workspace state (recent files, window
+# positions, compiler paths) is deliberately not part of this record.
+
+include "./design_limits.elisa"
+include "./design_ids.elisa"
+include "./design_values.elisa"
+
+module DesignProjects:
+    public:
+        struct FormRef:
+            id: mutable DesignIds::DesignId
+            path: mutable DesignValues::StringRef
+
+        struct TargetRef:
+            id: mutable DesignIds::DesignId
+            backend: mutable DesignValues::StringRef
+            renderer: mutable DesignValues::StringRef
+
+        struct Project:
+            id: mutable DesignIds::DesignId
+            name: mutable DesignValues::StringRef
+            application_id: mutable DesignValues::StringRef
+            schema_version: mutable i64
+            forms: mutable darray[FormRef]
+            entry_form: mutable DesignIds::DesignId
+            source_roots: mutable darray[DesignValues::StringRef]
+            generation_namespace: mutable DesignValues::StringRef
+            generation_output_root: mutable DesignValues::StringRef
+            targets: mutable darray[TargetRef]
+            strings: mutable DesignValues::StringPool
+            extensions: mutable darray[u8]
+
+        def empty_project() -> Project:
+            return Project{
+                id: DesignIds::empty(),
+                name: DesignValues::no_text(),
+                application_id: DesignValues::no_text(),
+                schema_version: DesignLimits::SCHEMA_VERSION,
+                forms: [],
+                entry_form: DesignIds::empty(),
+                source_roots: [],
+                generation_namespace: DesignValues::no_text(),
+                generation_output_root: DesignValues::no_text(),
+                targets: [],
+                strings: DesignValues::empty_pool(),
+                extensions: [],
+            }
+
+        def form_ref_index(project: Project&, id: DesignIds::DesignId) -> i64:
+            index: mutable i64 = 0
+            while index < project.forms.count.i64():
+                return index if DesignIds::equal(project.forms[index.usize()].id, id)
+                index <- index + 1
+            return -1
+
+        def form_path(project: Project&, id: DesignIds::DesignId) -> sview:
+            index: i64 = form_ref_index(project, id)
+            return "" if index < 0
+            return DesignValues::text_of(project.strings, project.forms[index.usize()].path)

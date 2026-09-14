@@ -1,0 +1,25 @@
+{
+  "format": "elisa-ide-form",
+  "schemaVersion": 0,
+  "id": "form-legacy",
+  "title": "Legacy form",
+  "moduleSymbol": "legacy_view",
+  "viewport": {
+    "width": 320,
+    "height": 200
+  },
+  "root": "node-root",
+  "nodes": [
+    {
+      "id": "node-root",
+      "type": "elisa.ui.label",
+      "name": "Legacy root",
+      "symbol": "legacy_label",
+      "properties": {
+        "text": "Legacy"
+      },
+      "children": [],
+      "events": {}
+    }
+  ]
+}

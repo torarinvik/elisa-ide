@@ -1,0 +1,158 @@
+# Typed property values.
+#
+# A property is a tagged value, never an unvalidated string. Text lives in a
+# document-owned byte pool as an (offset, length) reference, so a decoded value
+# never borrows a parser buffer and never contains a native pointer. Absence is
+# the absence of the property, distinct from explicit zero, false, or empty
+# text; the registry resolves the effective default.
+
+include "./design_limits.elisa"
+include "./design_ids.elisa"
+
+include "../../compiler/elisacore_std/elisacore_runtime.elisa"
+include "../../compiler/elisacore_std/collections.elisa"
+
+module DesignValues:
+    private:
+        # String pools are process-lifetime document storage.
+        global mutable string_arena: Arena = Arena{begin: null, end: null, end_index: 0, strategy: 0}
+
+    public:
+        const enum ValueTag of i32:
+            Bool = 0
+            Integer = 1
+            Scalar = 2
+            Text = 3
+            EnumKey = 4
+            Color = 5
+            Length = 6
+            NodeRef = 7
+            # A property this build does not understand, preserved as its raw
+            # JSON text so a newer designer can round-trip it.
+            Unsupported = 8
+
+        struct StringRef:
+            offset: mutable usize
+            length: mutable usize
+
+        struct ColorValue:
+            r: mutable u8
+            g: mutable u8
+            b: mutable u8
+            a: mutable u8
+
+        struct DesignValue:
+            tag: mutable ValueTag
+            bool_value: mutable bool
+            int_value: mutable i64
+            scalar_value: mutable f64
+            color_value: mutable ColorValue
+            # Text, enum keys, node references, and preserved raw JSON all live
+            # in the owning document's string pool; there is no inline buffer
+            # and no pointer.
+            text_ref: mutable StringRef
+
+        def string_ref(offset: usize, length: usize) -> StringRef:
+            return StringRef{offset: offset, length: length}
+
+        def no_text() -> StringRef:
+            return StringRef{offset: 0, length: 0}
+
+        def boolean(value: bool) -> DesignValue:
+            return DesignValue{tag: ValueTag.Bool, bool_value: value, int_value: 0, scalar_value: 0.0, color_value: ColorValue{r: 0, g: 0, b: 0, a: 255}, text_ref: no_text()}
+
+        def integer(value: i64) -> DesignValue:
+            return DesignValue{tag: ValueTag.Integer, bool_value: false, int_value: value, scalar_value: 0.0, color_value: ColorValue{r: 0, g: 0, b: 0, a: 255}, text_ref: no_text()}
+
+        def scalar(value: f64) -> DesignValue:
+            return DesignValue{tag: ValueTag.Scalar, bool_value: false, int_value: 0, scalar_value: value, color_value: ColorValue{r: 0, g: 0, b: 0, a: 255}, text_ref: no_text()}
+
+        def length(value: f64) -> DesignValue:
+            return DesignValue{tag: ValueTag.Length, bool_value: false, int_value: 0, scalar_value: value, color_value: ColorValue{r: 0, g: 0, b: 0, a: 255}, text_ref: no_text()}
+
+        def text(ref: StringRef) -> DesignValue:
+            return DesignValue{tag: ValueTag.Text, bool_value: false, int_value: 0, scalar_value: 0.0, color_value: ColorValue{r: 0, g: 0, b: 0, a: 255}, text_ref: ref}
+
+        def enum_key(ref: StringRef) -> DesignValue:
+            return DesignValue{tag: ValueTag.EnumKey, bool_value: false, int_value: 0, scalar_value: 0.0, color_value: ColorValue{r: 0, g: 0, b: 0, a: 255}, text_ref: ref}
+
+        def color(r: u8, g: u8, b: u8, a: u8) -> DesignValue:
+            return DesignValue{tag: ValueTag.Color, bool_value: false, int_value: 0, scalar_value: 0.0, color_value: ColorValue{r: r, g: g, b: b, a: a}, text_ref: no_text()}
+
+        def color_value(value: ColorValue) -> DesignValue:
+            return color(value.r, value.g, value.b, value.a)
+
+        def node_ref(ref: StringRef) -> DesignValue:
+            return DesignValue{tag: ValueTag.NodeRef, bool_value: false, int_value: 0, scalar_value: 0.0, color_value: ColorValue{r: 0, g: 0, b: 0, a: 255}, text_ref: ref}
+
+        def unsupported(ref: StringRef) -> DesignValue:
+            return DesignValue{tag: ValueTag.Unsupported, bool_value: false, int_value: 0, scalar_value: 0.0, color_value: ColorValue{r: 0, g: 0, b: 0, a: 255}, text_ref: ref}
+
+        # Semantic equality for round-trip tests. Tags must match; text and
+        # references compare by content, scalars by exact bits.
+        def equal(left: DesignValue&, right: DesignValue&) -> bool:
+            return false if left.tag != right.tag
+            match left.tag:
+                ValueTag.Bool:
+                    return left.bool_value == right.bool_value
+                ValueTag.Integer:
+                    return left.int_value == right.int_value
+                ValueTag.Scalar:
+                    return left.scalar_value == right.scalar_value
+                ValueTag.Length:
+                    return left.scalar_value == right.scalar_value
+                ValueTag.Color:
+                    return left.color_value.r == right.color_value.r and left.color_value.g == right.color_value.g and left.color_value.b == right.color_value.b and left.color_value.a == right.color_value.a
+                ValueTag.Text:
+                    return left.text_ref.offset == right.text_ref.offset and left.text_ref.length == right.text_ref.length
+                ValueTag.EnumKey:
+                    return left.text_ref.offset == right.text_ref.offset and left.text_ref.length == right.text_ref.length
+                ValueTag.NodeRef:
+                    return left.text_ref.offset == right.text_ref.offset and left.text_ref.length == right.text_ref.length
+                ValueTag.Unsupported:
+                    return left.text_ref.offset == right.text_ref.offset and left.text_ref.length == right.text_ref.length
+            return false
+
+        # A document-owned UTF-8 pool. Offsets are indexes, never pointers, so
+        # a form stays copyable and serializable.
+        struct StringPool:
+            bytes: mutable darray[u8]
+
+        def empty_pool() -> StringPool:
+            return StringPool{bytes: []}
+
+        def append(strings: mutable darray[u8]&, value: sview) -> StringRef:
+            return string_ref(0, 0) if value.len <= 0
+            _ = arena_da_reserve(&string_arena, strings, strings.count + value.len.usize() + 1)
+            start: usize = strings.count
+            index: mutable i64 = 0
+            while index < value.len:
+                strings.push(value[index])
+                index <- index + 1
+            return string_ref(start, value.len.usize())
+
+        def append_cstr(strings: mutable darray[u8]&, value: cstr) -> StringRef:
+            length: mutable i64 = 0
+            while length < 4096:
+                break if value[length.usize()] == 0
+                length <- length + 1
+            return string_ref(0, 0) if length == 0
+            _ = arena_da_reserve(&string_arena, strings, strings.count + length.usize() + 1)
+            start: usize = strings.count
+            index: mutable i64 = 0
+            while index < length:
+                strings.push(value[index.usize()])
+                index <- index + 1
+            return string_ref(start, length.usize())
+
+        def text_of(pool: StringPool&, ref: StringRef) -> sview:
+            return "" if ref.length == 0
+            return sview(&pool.bytes[ref.offset], 0, ref.length.i64())
+
+        def equal_ref(pool: StringPool&, ref: StringRef, expected: sview) -> bool:
+            return false if ref.length != expected.len.usize()
+            index: mutable usize = 0
+            while index < ref.length:
+                return false if pool.bytes[ref.offset + index] != expected[index.i64()]
+                index <- index + 1
+            return true

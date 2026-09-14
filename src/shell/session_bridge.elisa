@@ -1,0 +1,115 @@
+# Session bridge for the UI compilation unit.
+#
+# The editor shell is a UI unit (elisa-ui framework only); the document model,
+# registry, commands, and persistence are core units. They cannot share one
+# compilation unit (ADR-001). This file declares the core session's public
+# functions as externs bound to their `@link_name` symbols, so the shell can
+# read projections and issue commands without including the core source.
+#
+# Only integers, booleans, and `sview`/`sview` results cross this boundary.
+# An `sview` is valid only until the next session call that mutates a
+# projection; the shell copies what it needs into retained widget text before
+# returning to the frame loop.
+
+include "../../framework/src/platform/sdl3/ui_sdl3_flat.elisa"
+
+@link_name("designer_session_init")
+extern session_init() -> void
+@link_name("designer_session_open_project")
+extern session_open_project(path: sview) -> bool
+@link_name("designer_session_new_document")
+extern session_new_document(project_display: sview, form_display: sview) -> bool
+@link_name("designer_session_can_open")
+extern session_can_open() -> bool
+
+@link_name("designer_session_hierarchy_count")
+extern session_hierarchy_count() -> i64
+@link_name("designer_session_hierarchy_id")
+extern session_hierarchy_id(row: i64) -> i64
+@link_name("designer_session_hierarchy_depth_at")
+extern session_hierarchy_depth_at(row: i64) -> i32
+@link_name("designer_session_hierarchy_label")
+extern session_hierarchy_label(row: i64) -> sview
+@link_name("designer_session_hierarchy_type")
+extern session_hierarchy_type(row: i64) -> sview
+@link_name("designer_session_hierarchy_selected")
+extern session_hierarchy_selected(row: i64) -> bool
+@link_name("designer_session_hierarchy_is_root")
+extern session_hierarchy_is_root(row: i64) -> bool
+@link_name("designer_session_select_hierarchy_row")
+extern session_select_hierarchy_row(row: i64) -> bool
+
+@link_name("designer_session_palette_count")
+extern session_palette_count() -> i64
+@link_name("designer_session_palette_key")
+extern session_palette_key(index: i64) -> sview
+@link_name("designer_session_palette_display")
+extern session_palette_display(index: i64) -> sview
+@link_name("designer_session_insert_component")
+extern session_insert_component(palette_index: i64) -> i64
+
+@link_name("designer_session_delete_selection")
+extern session_delete_selection() -> bool
+@link_name("designer_session_duplicate_selection")
+extern session_duplicate_selection() -> bool
+@link_name("designer_session_reorder_selection")
+extern session_reorder_selection(forward: bool) -> bool
+@link_name("designer_session_undo")
+extern session_undo() -> bool
+@link_name("designer_session_redo")
+extern session_redo() -> bool
+@link_name("designer_session_can_undo")
+extern session_can_undo() -> bool
+@link_name("designer_session_can_redo")
+extern session_can_redo() -> bool
+@link_name("designer_session_undo_label")
+extern session_undo_label() -> sview
+@link_name("designer_session_is_dirty")
+extern session_is_dirty() -> bool
+@link_name("designer_session_save")
+extern session_save() -> bool
+
+@link_name("designer_session_inspector_count")
+extern session_inspector_count() -> i64
+@link_name("designer_session_inspector_label")
+extern session_inspector_label(row: i64) -> sview
+@link_name("designer_session_inspector_value")
+extern session_inspector_value(row: i64) -> sview
+@link_name("designer_session_inspector_tag")
+extern session_inspector_tag(row: i64) -> i32
+@link_name("designer_session_set_inspector_text")
+extern session_set_inspector_text(row: i64, text: sview) -> bool
+@link_name("designer_session_toggle_inspector")
+extern session_toggle_inspector(row: i64) -> bool
+@link_name("designer_session_cycle_inspector")
+extern session_cycle_inspector(row: i64) -> bool
+
+@link_name("designer_session_problems_count_value")
+extern session_problems_count_value() -> i64
+@link_name("designer_session_problem_label")
+extern session_problem_label(index: i64) -> sview
+@link_name("designer_session_problem_message")
+extern session_problem_message(index: i64) -> sview
+@link_name("designer_session_problem_path")
+extern session_problem_path(index: i64) -> sview
+@link_name("designer_session_problem_is_error")
+extern session_problem_is_error(index: i64) -> bool
+
+@link_name("designer_session_status")
+extern session_status() -> sview
+@link_name("designer_session_title")
+extern session_title() -> sview
+@link_name("designer_session_form_title")
+extern session_form_title() -> sview
+@link_name("designer_session_selection_name")
+extern session_selection_name() -> sview
+@link_name("designer_session_selection_type")
+extern session_selection_type() -> sview
+@link_name("designer_session_selection_count")
+extern session_selection_count() -> i64
+@link_name("designer_session_node_count")
+extern session_node_count() -> i64
+@link_name("designer_session_select_all")
+extern session_select_all() -> bool
+@link_name("designer_session_projection_epoch_value")
+extern session_projection_epoch_value() -> i64
