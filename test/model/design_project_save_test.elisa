@@ -1,0 +1,72 @@
+# Transactional creation of a new project directory.
+
+include "../../compiler/elisacore_std/elisacore_runtime.elisa"
+include "../../compiler/elisacore_std/collections.elisa"
+include "../../compiler/elisacore_std/elisacore_fileio.elisa"
+include "../../src/schema/design_json_decode.elisa"
+include "../../src/workspace/design_save.elisa"
+include "test_support.elisa"
+
+module DesignProjectSaveTest:
+    private:
+        const ROOT: cstr = "build/project save transaction test"
+        const FORMS: cstr = "build/project save transaction test/forms"
+        const FORM: cstr = "build/project save transaction test/forms/settings.elisaform.json"
+        const MANIFEST: cstr = "build/project save transaction test/settings.elisaproject.json"
+        const ROLLBACK_ROOT: cstr = "build/project save rollback test"
+        const ROLLBACK_FORMS: cstr = "build/project save rollback test/forms"
+        const ROLLBACK_FORM: cstr = "build/project save rollback test/forms/settings.elisaform.json"
+
+        def read_settings(registry: DesignRegistry::Registry&, sink: mutable DesignDiagnostics::Sink&) -> DesignForms::Form:
+            bytes: darray[u8] = TestSupport::read_fixture("test/fixtures/settings-form.elisaform.json")
+            return DesignDecode::decode_form(TestSupport::view_of(bytes), registry, sink)
+
+        def read_project(sink: mutable DesignDiagnostics::Sink&) -> DesignProjects::Project:
+            bytes: darray[u8] = TestSupport::read_fixture("test/fixtures/settings-project.elisaproject.json")
+            return DesignDecode::decode_project(TestSupport::view_of(bytes), sink)
+
+    public:
+        def run() -> i64:
+            registry: DesignRegistry::Registry = DesignRegistry::build_builtin()
+            sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
+            form: mutable DesignForms::Form = read_settings(registry, &sink)
+            project: mutable DesignProjects::Project = read_project(&sink)
+
+            # Remove only known artifacts from a prior completed test run.
+            _ = PosixFile::remove(MANIFEST)
+            _ = PosixFile::remove(FORM)
+            _ = PosixFile::remove_directory_if_empty(FORMS)
+            _ = PosixFile::remove_directory_if_empty(ROOT)
+
+            created: bool = DesignSave::save_new_project(ROOT, FORMS, FORM, MANIFEST, project, form)
+            TestSupport::check("project creation publishes form and manifest", created)
+            created_form_bytes: darray[u8] = TestSupport::read_fixture(FORM)
+            created_manifest_bytes: darray[u8] = TestSupport::read_fixture(MANIFEST)
+            TestSupport::check("created project form contains fixture content", TestSupport::text_contains(TestSupport::view_of(created_form_bytes), "node-save"))
+            TestSupport::check("created project manifest contains project format", TestSupport::text_contains(TestSupport::view_of(created_manifest_bytes), "elisa-ide-project"))
+
+            form_fingerprint: u64 = DesignSave::file_fingerprint(FORM)
+            manifest_fingerprint: u64 = DesignSave::file_fingerprint(MANIFEST)
+            duplicate: bool = DesignSave::save_new_project(ROOT, FORMS, FORM, MANIFEST, project, form)
+            TestSupport::check("existing project root is refused", not duplicate)
+            TestSupport::check("refused duplicate preserves the existing form", DesignSave::file_fingerprint(FORM) == form_fingerprint)
+            TestSupport::check("refused duplicate preserves the existing manifest", DesignSave::file_fingerprint(MANIFEST) == manifest_fingerprint)
+
+            # Force the manifest no-replace operation to collide with the form
+            # just published in this transaction. Rollback should remove that
+            # owned form and both empty directories, then leave the path free.
+            rollback: bool = DesignSave::save_new_project(ROLLBACK_ROOT, ROLLBACK_FORMS, ROLLBACK_FORM, ROLLBACK_FORM, project, form)
+            TestSupport::check("manifest collision fails project creation", not rollback)
+            rollback_root_recreated: bool = PosixFile::create_directory_new(ROLLBACK_ROOT)
+            TestSupport::check("failed transaction removes its empty root", rollback_root_recreated)
+            if rollback_root_recreated:
+                _ = PosixFile::remove_directory_if_empty(ROLLBACK_ROOT)
+
+            _ = PosixFile::remove(MANIFEST)
+            _ = PosixFile::remove(FORM)
+            _ = PosixFile::remove_directory_if_empty(FORMS)
+            _ = PosixFile::remove_directory_if_empty(ROOT)
+            return TestSupport::report("design_project_save")
+
+def main() -> i64:
+    return DesignProjectSaveTest::run()

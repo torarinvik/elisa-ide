@@ -1,0 +1,13 @@
+{
+  "format": "elisa-ide-project",
+  "schemaVersion": 1,
+  "projectId": "project-primitives",
+  "name": "Primitive Controls",
+  "applicationId": "org.example.primitives",
+  "framework": {"dependency": "elisa-ui"},
+  "forms": [{"id": "form-primitives", "path": "forms/primitives-form.elisaform.json"}],
+  "entryForm": "form-primitives",
+  "source": {"roots": []},
+  "generation": {"namespace": "PrimitivesExample", "outputRoot": "generated"},
+  "targets": [{"id": "desktop", "backend": "sdl3", "renderer": "flat"}]
+}

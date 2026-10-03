@@ -50,10 +50,31 @@ module DesignCommandTest:
             TestSupport::check("settings fixture read", settings_bytes.count > 0)
             DesignDecode::decode_form_into(&form, TestSupport::view_of(settings_bytes), registry, &sink)
             id_text_storage: mutable u8[24] = zeroed
-            TestSupport::check("settings form loads", form.nodes.count == 8)
-            return TestSupport::report("design_command") if form.nodes.count != 8
+            TestSupport::check("settings form loads", form.nodes.count == 18)
+            return TestSupport::report("design_command") if form.nodes.count != 18
 
             original: DesignForms::Form = DesignClone::clone_form(form)
+            metadata_form: mutable DesignForms::Form = DesignClone::clone_form(form)
+            metadata_history: mutable DesignHistory::History = DesignHistory::empty_history(8 * 1024 * 1024)
+            DesignHistory::mark_saved(metadata_form, &metadata_history)
+            save_node: DesignIds::DesignId = DesignIds::from_text("node-save")
+            save_index: i64 = DesignForms::find_node(metadata_form, save_node)
+            original_name: sview = DesignValues::text_of(metadata_form.strings, metadata_form.nodes[save_index.usize()].name)
+            original_symbol: sview = DesignValues::text_of(metadata_form.strings, metadata_form.nodes[save_index.usize()].symbol)
+            renamed_name: DesignCommand::Prepared = DesignCommand::prepare_rename_display_name(metadata_form, save_node, "Save settings", &sink)
+            TestSupport::check("display name rename prepares", renamed_name.valid)
+            TestSupport::check("display name rename commits through history", DesignHistory::apply(&metadata_history, &metadata_form, &renamed_name))
+            TestSupport::check("display name rename preserves its distinct field", DesignText::equal(DesignValues::text_of(metadata_form.strings, metadata_form.nodes[save_index.usize()].name), "Save settings") and DesignText::equal(DesignValues::text_of(metadata_form.strings, metadata_form.nodes[save_index.usize()].symbol), original_symbol))
+            renamed_symbol: DesignCommand::Prepared = DesignCommand::prepare_rename_symbol(metadata_form, save_node, "save_settings", &sink)
+            TestSupport::check("generated symbol rename prepares", renamed_symbol.valid)
+            TestSupport::check("generated symbol rename commits through history", DesignHistory::apply(&metadata_history, &metadata_form, &renamed_symbol))
+            TestSupport::check("symbol rename preserves the display name", DesignText::equal(DesignValues::text_of(metadata_form.strings, metadata_form.nodes[save_index.usize()].name), "Save settings") and DesignText::equal(DesignValues::text_of(metadata_form.strings, metadata_form.nodes[save_index.usize()].symbol), "save_settings"))
+            _ = DesignHistory::undo(&metadata_history, &metadata_form)
+            _ = DesignHistory::undo(&metadata_history, &metadata_form)
+            TestSupport::check("undo restores both original metadata fields", DesignText::equal(DesignValues::text_of(metadata_form.strings, metadata_form.nodes[save_index.usize()].name), original_name) and DesignText::equal(DesignValues::text_of(metadata_form.strings, metadata_form.nodes[save_index.usize()].symbol), original_symbol) and not DesignHistory::is_dirty(metadata_form, metadata_history))
+            _ = DesignHistory::redo(&metadata_history, &metadata_form)
+            _ = DesignHistory::redo(&metadata_history, &metadata_form)
+            TestSupport::check("redo restores both independently renamed metadata fields", DesignText::equal(DesignValues::text_of(metadata_form.strings, metadata_form.nodes[save_index.usize()].name), "Save settings") and DesignText::equal(DesignValues::text_of(metadata_form.strings, metadata_form.nodes[save_index.usize()].symbol), "save_settings"))
             allocator: mutable DesignIds::Allocator = DesignIds::allocator(110)
             history: mutable DesignHistory::History = DesignHistory::empty_history(64 * 1024 * 1024)
             DesignHistory::mark_saved(form, &history)
@@ -229,14 +250,35 @@ module DesignCommandTest:
             heading_index: i64 = DesignForms::find_node(event_probe, DesignIds::from_text("node-heading"))
             DesignNodes::ensure_events(&event_probe.nodes[heading_index.usize()].events, event_probe.nodes[heading_index.usize()].events.count + 1)
             event_probe.nodes[heading_index.usize()].events.push(DesignNodes::EventConnection{
-                event_key: DesignValues::append(event_probe.strings.bytes, "click"),
-                handler: DesignValues::append(event_probe.strings.bytes, "profile_row"),
+                event_key: DesignValues::append(&event_probe.strings.bytes, "click"),
+                handler: DesignValues::append(&event_probe.strings.bytes, "profile_row"),
             })
             event_delete_sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
             event_delete: DesignCommand::Prepared = DesignCommand::prepare_delete(event_probe, one_of(profile), &event_delete_sink)
             TestSupport::check("delete treats event handler symbols as external source names", event_delete.valid)
             event_heading_index: i64 = DesignForms::find_node(event_delete.after, DesignIds::from_text("node-heading"))
             TestSupport::check_text("deleting another node preserves the event handler", DesignValues::text_of(event_delete.after.strings, event_delete.after.nodes[event_heading_index.usize()].events[0.usize()].handler), "profile_row")
+
+            event_form: mutable DesignForms::Form = DesignClone::clone_form(form)
+            event_history: mutable DesignHistory::History = DesignHistory::empty_history(64 * 1024 * 1024)
+            reset_id: DesignIds::DesignId = DesignIds::from_text("node-reset")
+            event_sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
+            connect: DesignCommand::Prepared = DesignCommand::prepare_set_event_handler(event_form, registry, one_of(reset_id), "click", "reset_clicked", &event_sink)
+            TestSupport::check("event connection prepares for a registered event", connect.valid)
+            _ = DesignHistory::apply(&event_history, &event_form, &connect)
+            reset_index: i64 = DesignForms::find_node(event_form, reset_id)
+            click_index: i64 = DesignNodes::event_index(event_form.nodes[reset_index.usize()], event_form.strings, "click")
+            TestSupport::check_text("event connection stores the handler", DesignValues::text_of(event_form.strings, event_form.nodes[reset_index.usize()].events[click_index.usize()].handler), "reset_clicked")
+            disconnect: DesignCommand::Prepared = DesignCommand::prepare_set_event_handler(event_form, registry, one_of(reset_id), "click", "", &event_sink)
+            TestSupport::check("event disconnect prepares", disconnect.valid)
+            _ = DesignHistory::apply(&event_history, &event_form, &disconnect)
+            TestSupport::check("event disconnect removes the connection", DesignNodes::event_index(event_form.nodes[reset_index.usize()], event_form.strings, "click") < 0)
+            _ = DesignHistory::undo(&event_history, &event_form)
+            TestSupport::check("undo restores the event connection", DesignNodes::event_index(event_form.nodes[reset_index.usize()], event_form.strings, "click") >= 0)
+            _ = DesignHistory::redo(&event_history, &event_form)
+            TestSupport::check("redo restores the disconnected event", DesignNodes::event_index(event_form.nodes[reset_index.usize()], event_form.strings, "click") < 0)
+            invalid_event: DesignCommand::Prepared = DesignCommand::prepare_set_event_handler(event_form, registry, one_of(reset_id), "missing", "handler", &event_sink)
+            TestSupport::check("unknown event is rejected", not invalid_event.valid)
 
             # --- selection ---------------------------------------------------
             selection: mutable DesignSelection::Selection = DesignSelection::empty()

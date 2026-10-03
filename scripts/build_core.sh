@@ -10,7 +10,9 @@
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-STAGE1="${ELISA_UI_STAGE1:-$ROOT/../wasm-sdk-compiler}"
+STAGE1_DEFAULT="$ROOT/compiler"
+[[ -d "$STAGE1_DEFAULT" ]] || STAGE1_DEFAULT="$ROOT/../Elisa-compiler"
+STAGE1="${ELISA_UI_STAGE1:-$STAGE1_DEFAULT}"
 RUNTIME="$STAGE1/build/runtime/elisacore_runtime.o"
 ENTRY="$1"
 NAME="$2"
@@ -24,7 +26,7 @@ fi
 [[ -f "$ENTRY" ]] || { echo "build_core: no entry source at $ENTRY" >&2; exit 2; }
 
 mkdir -p "$ROOT/build"
-bash "$ROOT/scripts/doctor.sh" --json > "$ROOT/build/provenance-core-$NAME.json"
+bash "$ROOT/scripts/doctor.sh" --core --json > "$ROOT/build/provenance-core-$NAME.json"
 SHIM_SOURCE="$ROOT/src/platform/posix/designer_posix.c"
 SHIM_OBJECT="$ROOT/build/designer_posix.o"
 if [[ -f "$SHIM_SOURCE" ]]; then
@@ -34,4 +36,6 @@ bash "$STAGE1/scripts/elisac_stage1.sh" -O0 -o "$ROOT/build/$NAME.o" "$ENTRY"
 LINK_INPUTS=("$ROOT/build/$NAME.o" "$RUNTIME")
 [[ -f "$SHIM_OBJECT" ]] && LINK_INPUTS+=("$SHIM_OBJECT")
 clang -Wl,-dead_strip -o "$ROOT/build/$NAME" "${LINK_INPUTS[@]}"
+python3 "$ROOT/scripts/compiler_provenance.py" verify \
+    "$ROOT/build/provenance-core-$NAME.json" "$STAGE1"
 echo "built $ROOT/build/$NAME"

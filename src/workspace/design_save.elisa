@@ -9,6 +9,7 @@
 include "../model/design_limits.elisa"
 include "../model/design_text.elisa"
 include "../model/design_form.elisa"
+include "../model/design_project.elisa"
 include "../model/fingerprint.elisa"
 include "../schema/design_json_encode.elisa"
 include "../platform/posix/posix_file.elisa"
@@ -84,6 +85,68 @@ module DesignSave:
             if written < 0:
                 raise DesignSaveError.WriteFailed(path)
             return written
+
+        # Create a new project as one visible transaction. The manifest is
+        # published last, after its referenced form is complete. The caller
+        # supplies the root, forms directory, and both file paths so layout
+        # policy stays with the project wizard. Only directories created by
+        # this call are eligible for empty-directory rollback.
+        def save_new_project(
+            root_path: cstr,
+            forms_path: cstr,
+            form_path: cstr,
+            manifest_path: cstr,
+            project: DesignProjects::Project&,
+            form: DesignForms::Form&,
+        ) -> bool:
+            can Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast:
+                # Finish both encodings before creating any on-disk state.
+                encoded_form: darray[u8] = DesignEncode::encode_form(form)
+                encoded_project: darray[u8] = DesignEncode::encode_project(project)
+                if encoded_form.count == 0 or encoded_project.count == 0:
+                    return false
+
+                if not PosixFile::create_directory_new(root_path):
+                    return false
+
+                if not PosixFile::create_directory_new(forms_path):
+                    _ = PosixFile::remove_directory_if_empty(root_path)
+                    return false
+
+                form_source: i64 error[FileReplaceError] = PosixFile::atomic_write_new(form_path, DesignText::view_of(encoded_form))
+                form_written: i64 = catch form_source:
+                    value:
+                        value
+                    FileReplaceError.CommittedButNotDurable:
+                        encoded_form.count.i64()
+                    error e:
+                        -1
+                if form_written < 0:
+                    _ = PosixFile::remove_directory_if_empty(forms_path)
+                    _ = PosixFile::remove_directory_if_empty(root_path)
+                    return false
+
+                # At this point the no-replace publish succeeded. A later
+                # manifest failure may remove only this path, which this call
+                # knows it created.
+                manifest_source: i64 error[FileReplaceError] = PosixFile::atomic_write_new(manifest_path, DesignText::view_of(encoded_project))
+                manifest_written: i64 = catch manifest_source:
+                    value:
+                        value
+                    FileReplaceError.CommittedButNotDurable:
+                        encoded_project.count.i64()
+                    error e:
+                        -1
+                if manifest_written >= 0:
+                    return true
+
+                # Roll back in reverse order. Empty-directory removal is
+                # intentionally best-effort: if an external file appeared,
+                # rmdir fails and leaves that content intact.
+                _ = PosixFile::remove(form_path)
+                _ = PosixFile::remove_directory_if_empty(forms_path)
+                _ = PosixFile::remove_directory_if_empty(root_path)
+                return false
 
         # Fingerprint of the current file, or 0 when it cannot be read. An
         # existing empty file has the normal FNV fingerprint of empty bytes;

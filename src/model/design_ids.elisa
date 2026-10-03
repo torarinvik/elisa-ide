@@ -102,13 +102,13 @@ module DesignIds:
         # Copy the canonical bytes to caller-owned storage and return a view
         # into that storage. The caller controls the view lifetime, while
         # explicit unpacking keeps this API independent of target endianness.
-        def text(id: DesignId&, output: mutable u8[24]&) -> sview:
+        def text[@r](id: DesignId&, output: mutable u8[24]& @r) -> sview @r can[Unsafe.PointerCast]:
             return "" if id.length <= 0 or id.length > DesignLimits::MAX_ID_BYTES.i64()
             index: mutable i64 = 0
             while index < id.length:
                 output[index.usize()] <- byte_at(id, index)
                 index <- index + 1
-            return sview(&output[0], 0, id.length)
+            return unsafe_sview_bounded_bytes(&output[0], id.length.usize())
 
         def equal(left: DesignId, right: DesignId) -> bool:
             return false if left.length != right.length

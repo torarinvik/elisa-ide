@@ -1,0 +1,36 @@
+# Build-job policy is independent of process launch and stays deterministic.
+
+include "../../compiler/elisacore_std/elisacore_runtime.elisa"
+include "../../compiler/elisacore_std/collections.elisa"
+include "../../src/model/design_text.elisa"
+include "../../src/build/build_job.elisa"
+include "../model/test_support.elisa"
+
+module BuildJobTest:
+    public:
+        def run() -> i64:
+            job: mutable BuildJob::Job = BuildJob::empty()
+            TestSupport::check("new build job is idle", job.state == BuildJob::State.Idle and not BuildJob::is_running(job))
+            TestSupport::check("zero revision cannot start", not BuildJob::begin(&job, 0))
+            TestSupport::check("revision starts one job", BuildJob::begin(&job, 7) and BuildJob::is_running(job) and job.input_revision == 7)
+            TestSupport::check("second start is refused while running", not BuildJob::begin(&job, 8))
+            BuildJob::append_output(&job, "compiler: compiling\n")
+            TestSupport::check("captured output is retained", DesignText::equal(BuildJob::output_view(&job), "compiler: compiling\n"))
+            TestSupport::check("stale completion is refused", not BuildJob::finish(&job, 6, 0) and BuildJob::is_running(job))
+            TestSupport::check("matching success completes", BuildJob::finish(&job, 7, 0) and job.state == BuildJob::State.Succeeded and job.exit_code == 0)
+            TestSupport::check("completed revision accepts its result identity", BuildJob::accepts_result(job, 7) and not BuildJob::accepts_result(job, 8))
+            TestSupport::check("completed job can start a newer revision", BuildJob::begin(&job, 8) and job.state == BuildJob::State.Running and job.output.count == 0)
+            TestSupport::check("cancel request is recorded", BuildJob::request_cancel(&job) and job.cancel_requested)
+            TestSupport::check("cancelled completion is terminal", BuildJob::finish(&job, 8, 0) and job.state == BuildJob::State.Cancelled)
+            TestSupport::check("failure records a nonzero exit", BuildJob::begin(&job, 9) and BuildJob::finish(&job, 9, 17) and job.state == BuildJob::State.Failed and job.exit_code == 17)
+            huge: mutable darray[u8] = []
+            for index in 0..<BuildJob::MAX_OUTPUT_BYTES.i64() + 32:
+                huge.push(120)
+            BuildJob::begin(&job, 10)
+            BuildJob::append_output(&job, TestSupport::view_of(huge))
+            TestSupport::check("build output is bounded and marked truncated", job.output.count == BuildJob::MAX_OUTPUT_BYTES and job.output_truncated)
+            TestSupport::check("state labels are stable", DesignText::equal(BuildJob::state_label(job.state), "running"))
+            return TestSupport::report("build_job")
+
+def main() -> i64:
+    return BuildJobTest::run()

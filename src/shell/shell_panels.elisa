@@ -3,7 +3,6 @@
 # Each panel is a bounded column of retained label/button rows rebuilt from
 # host projections. All state is in the `Shell` record passed by reference.
 
-include "../../framework/src/platform/sdl3/ui_sdl3_flat.elisa"
 include "host_client.elisa"
 include "shell_state.elisa"
 include "shell_window.elisa"
@@ -97,12 +96,30 @@ def build_palette(shell: mutable Shell&, parent: UiHandles::Handle) -> void:
         shell.palette_count <- shell.palette_count + 1
         index <- index + 1
     _ = UiHandles::label(parent, "Hierarchy", 13.0, shell_color(148, 158, 180))
+    # Keep the hit target above the horizontal scrollbar track. At 22px high,
+    # Elisa-ui's scrollbar overlays the vertically centered button row.
+    shell.hierarchy_breadcrumb <- UiHandles::scroll(parent, UiConst::Axis.Row, 0.0, 32.0, shell_color(28, 31, 38))
+    UiHandles::set_grow(shell.hierarchy_breadcrumb, 0.0)
+    index <- 0
+    while index < MAX_HIERARCHY_BREADCRUMB_SEGMENTS:
+        segment: UiHandles::Handle = UiHandles::button(shell.hierarchy_breadcrumb, 58.0, 20.0, shell_color(38, 44, 58), panel_hover_color(shell.dark), panel_press_color(shell.dark))
+        UiHandles::set_cross_alignment(segment, UiConst::CrossAlignment.Start)
+        UiHandles::set_text(segment, "", 10.0, shell_color(190, 202, 224))
+        UiHandles::set_help(segment, "Select this ancestor in the form hierarchy")
+        UiHandles::set_visible(segment, false)
+        shell.hierarchy_breadcrumb_segments[index.usize()] <- segment
+        if index < MAX_HIERARCHY_BREADCRUMB_SEGMENTS - 1:
+            separator: UiHandles::Handle = UiHandles::label(shell.hierarchy_breadcrumb, ">", 10.0, shell_color(110, 120, 140))
+            UiHandles::set_visible(separator, false)
+            shell.hierarchy_breadcrumb_separators[index.usize()] <- separator
+        index <- index + 1
     shell.hierarchy_list <- UiHandles::scroll(parent, UiConst::Axis.Column, 0.0, 150.0, shell_color(28, 31, 38))
     UiHandles::set_grow(shell.hierarchy_list, 1.3)
     shell.hierarchy_count <- 0
     index <- 0
     while index < MAX_HIERARCHY_ROWS:
         row: UiHandles::Handle = UiHandles::button(shell.hierarchy_list, 150.0, 20.0, shell_color(31, 36, 48), panel_hover_color(shell.dark), panel_press_color(shell.dark))
+        UiHandles::set_help(row, "Click to select; Shift-click for a range; Control-click or Command-click to add or remove this item")
         UiHandles::set_grow(row, 0.0)
         shell.hierarchy_rows[index.usize()] <- row
         shell.hierarchy_count <- shell.hierarchy_count + 1
@@ -113,6 +130,22 @@ def build_palette(shell: mutable Shell&, parent: UiHandles::Handle) -> void:
     shell.hierarchy_page_label <- UiHandles::label(navigation, "0 of 0", 11.0, shell_color(148, 158, 180))
     UiHandles::set_grow(shell.hierarchy_page_label, 1.0)
     shell.hierarchy_next_button <- nav_button(navigation, shell.dark, "Next", "Show the next hierarchy page")
+
+def build_files(shell: mutable Shell&, parent: UiHandles::Handle) -> void:
+    _ = UiHandles::label(parent, "Project files", 13.0, shell_color(148, 158, 180))
+    shell.file_list <- UiHandles::scroll(parent, UiConst::Axis.Column, 0.0, 78.0, shell_color(28, 31, 38))
+    UiHandles::set_grow(shell.file_list, 0.45)
+    shell.file_count <- 0
+    index: mutable i32 = 0
+    while index < MAX_FILE_ROWS:
+        row: UiHandles::Handle = UiHandles::button(shell.file_list, 150.0, 20.0, shell_color(31, 36, 48), panel_hover_color(shell.dark), panel_press_color(shell.dark))
+        UiHandles::set_cross_alignment(row, UiConst::CrossAlignment.Start)
+        UiHandles::set_text(row, "", 11.0, shell_color(198, 208, 228))
+        UiHandles::set_help(row, "Read-only project-relative file; opening a workspace never executes it")
+        UiHandles::set_visible(row, false)
+        shell.file_rows[index.usize()] <- row
+        shell.file_count <- shell.file_count + 1
+        index <- index + 1
 
 def build_inspector(shell: mutable Shell&, parent: UiHandles::Handle) -> void:
     _ = UiHandles::label(parent, "Properties", 13.0, shell_color(148, 158, 180))
@@ -131,15 +164,43 @@ def build_inspector(shell: mutable Shell&, parent: UiHandles::Handle) -> void:
         action: UiHandles::Handle = UiHandles::button(row, 110.0, 24.0, shell_color(42, 47, 58), panel_hover_color(shell.dark), panel_press_color(shell.dark))
         UiHandles::set_grow(action, 2.0)
         UiHandles::set_visible(action, false)
-        readonly: UiHandles::Handle = UiHandles::label(row, "", 12.0, shell_color(148, 158, 180))
-        UiHandles::set_grow(readonly, 2.0)
-        UiHandles::set_visible(readonly, false)
         shell.inspector_rows[index.usize()] <- name
         shell.inspector_editors[index.usize()] <- editor
         shell.inspector_action_buttons[index.usize()] <- action
-        shell.inspector_readonly_values[index.usize()] <- readonly
         shell.inspector_tags[index.usize()] <- -1
         shell.inspector_count <- shell.inspector_count + 1
+        index <- index + 1
+
+def build_events(shell: mutable Shell&, parent: UiHandles::Handle) -> void:
+    header: UiHandles::Handle = UiHandles::row(parent, 2.0, 4.0, shell_color(28, 31, 38))
+    UiHandles::set_grow(header, 0.0)
+    title: UiHandles::Handle = UiHandles::label(header, "Events", 13.0, shell_color(148, 158, 180))
+    UiHandles::set_grow(title, 1.0)
+    shell.event_handler_source_button <- UiHandles::button(header, 100.0, 22.0, shell_color(42, 47, 58), panel_hover_color(shell.dark), panel_press_color(shell.dark))
+    UiHandles::set_text(shell.event_handler_source_button, "Open Handlers", 10.0, shell_color(220, 226, 240))
+    UiHandles::set_help(shell.event_handler_source_button, "Create missing event-handler stubs for the active form or open the existing project handler file")
+    UiHandles::set_grow(shell.event_handler_source_button, 0.0)
+    shell.events_list <- UiHandles::scroll(parent, UiConst::Axis.Column, 0.0, 0.0, shell_color(28, 31, 38))
+    UiHandles::set_grow(shell.events_list, 0.65)
+    shell.event_count <- 0
+    index: mutable i32 = 0
+    while index < MAX_EVENT_ROWS:
+        row: UiHandles::Handle = UiHandles::row(shell.events_list, 2.0, 4.0, shell_color(28, 31, 38))
+        UiHandles::set_grow(row, 0.0)
+        name: UiHandles::Handle = UiHandles::label(row, "", 12.0, shell_color(166, 175, 196))
+        UiHandles::set_grow(name, 1.0)
+        editor: UiHandles::Handle = UiHandles::text_field(row, "", "handler symbol", "", 110.0, 24.0, 12.0, shell_color(232, 236, 246), shell_color(27, 32, 43))
+        UiHandles::set_help(editor, "Enter a handler symbol, then press Enter. The event signature is shown in the tooltip.")
+        UiHandles::set_grow(editor, 2.0)
+        clear: UiHandles::Handle = UiHandles::button(row, 54.0, 24.0, shell_color(42, 47, 58), panel_hover_color(shell.dark), panel_press_color(shell.dark))
+        UiHandles::set_text(clear, "Clear", 11.0, shell_color(238, 242, 252))
+        UiHandles::set_help(clear, "Disconnect this event handler")
+        UiHandles::set_grow(clear, 0.0)
+        shell.event_rows[index.usize()] <- name
+        shell.event_editors[index.usize()] <- editor
+        shell.event_clear_buttons[index.usize()] <- clear
+        shell.event_edit_dirty[index.usize()] <- false
+        shell.event_count <- shell.event_count + 1
         index <- index + 1
 
 def build_problems(shell: mutable Shell&, parent: UiHandles::Handle) -> void:
@@ -148,7 +209,10 @@ def build_problems(shell: mutable Shell&, parent: UiHandles::Handle) -> void:
     shell.problem_count <- 0
     index: mutable i32 = 0
     while index < MAX_PROBLEM_ROWS:
-        row: UiHandles::Handle = UiHandles::label(shell.problem_list, "", 12.0, shell_color(200, 140, 120))
+        row: UiHandles::Handle = UiHandles::button(shell.problem_list, 360.0, 20.0, shell_color(55, 42, 48), panel_hover_color(shell.dark), panel_press_color(shell.dark))
+        UiHandles::set_cross_alignment(row, UiConst::CrossAlignment.Start)
+        UiHandles::set_text(row, "", 12.0, shell_color(200, 140, 120))
+        UiHandles::set_help(row, "Select the design location associated with this diagnostic")
         shell.problem_rows[index.usize()] <- row
         shell.problem_count <- shell.problem_count + 1
         index <- index + 1
@@ -158,6 +222,8 @@ def build_problems(shell: mutable Shell&, parent: UiHandles::Handle) -> void:
     shell.problem_page_label <- UiHandles::label(navigation, "0 of 0", 11.0, shell_color(148, 158, 180))
     UiHandles::set_grow(shell.problem_page_label, 1.0)
     shell.problem_next_button <- nav_button(navigation, shell.dark, "Next", "Show the next page of problems")
+    shell.problem_copy_button <- nav_button(navigation, shell.dark, "Copy", "Copy the last selected diagnostic to the system clipboard")
+    UiHandles::set_enabled(shell.problem_copy_button, false)
 
 def set_status(shell: mutable Shell&, text: darray[u8]) -> void:
     shell.status_length <- 0
@@ -208,7 +274,55 @@ def refresh_palette(shell: mutable Shell&, process: mutable PosixProcess::Proces
         visible <- visible + 1
     shell.palette_count <- result_count
 
+def refresh_files(shell: mutable Shell&, process: mutable PosixProcess::Process&) -> void:
+    total: i64 = HostClient::request(process, 110, 0, 0).result
+    visible: mutable i32 = 0
+    while visible < MAX_FILE_ROWS:
+        row: UiHandles::Handle = shell.file_rows[visible.usize()]
+        if visible.i64() < total:
+            path: HostClient::HostReply = HostClient::request(process, 111, visible.i64(), 0)
+            UiHandles::set_text(row, ShellBytes::view_of(&path.text), 11.0, shell_color(198, 208, 228))
+            UiHandles::set_help(row, "Read-only project-relative file; generated entries are published by Build")
+            UiHandles::set_visible(row, path.result == 1 and path.text.count > 0)
+        else:
+            UiHandles::set_visible(row, false)
+        visible <- visible + 1
+    shell.file_count <- total.i32() if total < MAX_FILE_ROWS.i64() else MAX_FILE_ROWS
+
 def refresh_hierarchy(shell: mutable Shell&, process: mutable PosixProcess::Process&) -> void:
+    ancestor_count: i64 = HostClient::request(process, 64, 0, 0).result
+    truncated: bool = ancestor_count > MAX_HIERARCHY_BREADCRUMB_SEGMENTS.i64()
+    first_ancestor: i64 = ancestor_count - (MAX_HIERARCHY_BREADCRUMB_SEGMENTS.i64() - 1) if truncated else 0
+    visible_count: mutable i32 = ancestor_count.i32() if not truncated else MAX_HIERARCHY_BREADCRUMB_SEGMENTS
+    visible_count <- 1 if visible_count == 0
+    shell.hierarchy_breadcrumb_count <- visible_count
+    shell.hierarchy_breadcrumb_first <- first_ancestor
+    shell.hierarchy_breadcrumb_truncated <- truncated
+    breadcrumb_slot: mutable i32 = 0
+    while breadcrumb_slot < MAX_HIERARCHY_BREADCRUMB_SEGMENTS:
+        segment: UiHandles::Handle = shell.hierarchy_breadcrumb_segments[breadcrumb_slot.usize()]
+        if breadcrumb_slot < visible_count:
+            if ancestor_count == 0:
+                UiHandles::set_text(segment, "(no selection)", 10.0, shell_color(148, 158, 180))
+                UiHandles::set_enabled(segment, false)
+            elif truncated and breadcrumb_slot == 0:
+                UiHandles::set_text(segment, "...", 10.0, shell_color(190, 202, 224))
+                UiHandles::set_enabled(segment, true)
+            else:
+                ancestor_index: i64 = breadcrumb_slot.i64() if not truncated else first_ancestor + breadcrumb_slot.i64() - 1
+                ancestor_row: i64 = HostClient::request(process, 65, ancestor_index, 0).result
+                label: HostClient::HostReply = HostClient::request(process, 50, ancestor_row, 0)
+                UiHandles::set_text(segment, ShellBytes::view_of(&label.text), 10.0, shell_color(190, 202, 224))
+                UiHandles::set_enabled(segment, ancestor_index < ancestor_count - 1)
+            UiHandles::set_visible(segment, true)
+            if breadcrumb_slot < MAX_HIERARCHY_BREADCRUMB_SEGMENTS - 1:
+                separator: UiHandles::Handle = shell.hierarchy_breadcrumb_separators[breadcrumb_slot.usize()]
+                UiHandles::set_visible(separator, breadcrumb_slot < visible_count - 1)
+        else:
+            UiHandles::set_visible(segment, false)
+            if breadcrumb_slot < MAX_HIERARCHY_BREADCRUMB_SEGMENTS - 1:
+                UiHandles::set_visible(shell.hierarchy_breadcrumb_separators[breadcrumb_slot.usize()], false)
+        breadcrumb_slot <- breadcrumb_slot + 1
     window: ShellWindow::Window = ShellWindow::resolve(shell.projection.hierarchy_count, shell.hierarchy_page.i64(), MAX_HIERARCHY_ROWS.i64())
     shell.hierarchy_page <- window.page.i32()
     index: mutable i32 = 0
@@ -236,7 +350,6 @@ def refresh_inspector(shell: mutable Shell&, process: mutable PosixProcess::Proc
         name: UiHandles::Handle = shell.inspector_rows[index.usize()]
         editor: UiHandles::Handle = shell.inspector_editors[index.usize()]
         action: UiHandles::Handle = shell.inspector_action_buttons[index.usize()]
-        readonly: UiHandles::Handle = shell.inspector_readonly_values[index.usize()]
         if index.i64() < shell.projection.inspector_count:
             label: HostClient::HostReply = HostClient::request(process, 52, index.i64(), 0)
             value: HostClient::HostReply = HostClient::request(process, 53, index.i64(), 0)
@@ -250,37 +363,123 @@ def refresh_inspector(shell: mutable Shell&, process: mutable PosixProcess::Proc
             # or the next toolbar/palette action mistakes every inspector
             # field for a user edit and may commit an empty/invalid value.
             UiHandles::replace_text(editor, ShellBytes::view_of(&value.text))
-            UiHandles::set_text(readonly, ShellBytes::view_of(&value.text), 12.0, shell_color(148, 158, 180))
-            UiHandles::set_text(action, ShellBytes::view_of(&value.text), 12.0, shell_color(238, 242, 252))
+            UiHandles::set_text(action, "Reset" if tag.result != 0 and tag.result != 4 else ShellBytes::view_of(&value.text), 12.0, shell_color(238, 242, 252))
             is_boolean: bool = tag.result == 0
             is_enum: bool = tag.result == 4
-            editable_text: bool = tag.result == 1 or tag.result == 2 or tag.result == 3 or tag.result == 6
+            editable_text: bool = tag.result == 1 or tag.result == 2 or tag.result == 3 or tag.result == 6 or tag.result == 7
+            resettable: bool = (editable_text and tag.result != 7) or tag.result == 5
             is_readonly: bool = not is_boolean and not is_enum and not editable_text
-            UiHandles::set_visible(editor, editable_text)
+            UiHandles::set_visible(editor, editable_text or is_readonly)
             UiHandles::set_enabled(editor, editable_text)
-            UiHandles::set_visible(action, is_boolean or is_enum)
-            UiHandles::set_visible(readonly, is_readonly)
+            UiHandles::set_visible(action, is_boolean or is_enum or resettable)
+            UiHandles::set_enabled(action, is_boolean or is_enum or resettable)
             UiHandles::set_visible(name, true)
         else:
             UiHandles::set_visible(name, false)
             UiHandles::set_visible(editor, false)
             UiHandles::set_visible(action, false)
-            UiHandles::set_visible(readonly, false)
             shell.inspector_tags[index.usize()] <- -1
             shell.inspector_edit_dirty[index.usize()] <- false
         index <- index + 1
     shell.refreshing_inspector <- false
 
+def refresh_events(shell: mutable Shell&, process: mutable PosixProcess::Process&) -> void:
+    shell.refreshing_events <- true
+    index: mutable i32 = 0
+    while index < MAX_EVENT_ROWS:
+        name: UiHandles::Handle = shell.event_rows[index.usize()]
+        editor: UiHandles::Handle = shell.event_editors[index.usize()]
+        clear: UiHandles::Handle = shell.event_clear_buttons[index.usize()]
+        if index.i64() < shell.projection.event_count:
+            label: HostClient::HostReply = HostClient::request(process, 91, index.i64(), 0)
+            value: HostClient::HostReply = HostClient::request(process, 92, index.i64(), 0)
+            signature: HostClient::HostReply = HostClient::request(process, 93, index.i64(), 0)
+            UiHandles::set_text(name, ShellBytes::view_of(&label.text), 12.0, shell_color(166, 175, 196))
+            UiHandles::set_text(editor, ShellBytes::view_of(&value.text), 12.0, shell_color(232, 236, 246))
+            UiHandles::replace_text(editor, ShellBytes::view_of(&value.text))
+            UiHandles::set_help(editor, ShellBytes::view_of(&signature.text))
+            UiHandles::set_visible(name, true)
+            UiHandles::set_visible(editor, true)
+            UiHandles::set_enabled(editor, true)
+            UiHandles::set_visible(clear, true)
+            UiHandles::set_enabled(clear, value.text.count > 0)
+            shell.event_edit_dirty[index.usize()] <- false
+        else:
+            UiHandles::set_visible(name, false)
+            UiHandles::set_visible(editor, false)
+            UiHandles::set_visible(clear, false)
+            shell.event_edit_dirty[index.usize()] <- false
+        index <- index + 1
+    shell.refreshing_events <- false
+
+def build_output_text(shell: mutable Shell&) -> sview:
+    if UiHandles::widget(shell.build_output) is output_widget:
+        return output_widget.text
+    return ""
+
+def build_diagnostic_line(line: sview) -> bool:
+    return true if contains_ascii_fold(line, "error:")
+    return true if contains_ascii_fold(line, "warning:")
+    return true if contains_ascii_fold(line, "fatal error:")
+    return true if contains_ascii_fold(line, "note:")
+    return false
+
+def build_diagnostic_count(text: sview) -> i32:
+    count: mutable i32 = 0
+    line_start: mutable i64 = 0
+    while line_start < text.len and count < MAX_BUILD_PROBLEMS:
+        line_end: mutable i64 = line_start
+        while line_end < text.len and text[line_end] != 10:
+            line_end <- line_end + 1
+        if build_diagnostic_line(string_view_slice(text, line_start, line_end)):
+            count <- count + 1
+        line_start <- line_end + 1 if line_end < text.len else text.len
+    return count
+
+def build_diagnostic_at(text: sview, wanted: i32) -> sview:
+    return "" if wanted < 0
+    found: mutable i32 = 0
+    line_start: mutable i64 = 0
+    while line_start < text.len and found < MAX_BUILD_PROBLEMS:
+        line_end: mutable i64 = line_start
+        while line_end < text.len and text[line_end] != 10:
+            line_end <- line_end + 1
+        line: sview = string_view_slice(text, line_start, line_end)
+        if build_diagnostic_line(line):
+            return line if found == wanted
+            found <- found + 1
+        line_start <- line_end + 1 if line_end < text.len else text.len
+    return ""
+
 def refresh_problems(shell: mutable Shell&, process: mutable PosixProcess::Process&) -> void:
-    window: ShellWindow::Window = ShellWindow::resolve(shell.projection.problem_count, shell.problem_page.i64(), MAX_PROBLEM_ROWS.i64())
+    design_count: i64 = shell.projection.problem_count
+    build_count: i64 = build_diagnostic_count(build_output_text(shell)).i64()
+    total_count: i64 = design_count + build_count
+    window: ShellWindow::Window = ShellWindow::resolve(total_count, shell.problem_page.i64(), MAX_PROBLEM_ROWS.i64())
     shell.problem_page <- window.page.i32()
     index: mutable i32 = 0
     while index < MAX_PROBLEM_ROWS:
         row: UiHandles::Handle = shell.problem_rows[index.usize()]
         logical_row: i64 = ShellWindow::logical_index(window, index.i64())
         if logical_row >= 0:
-            label: HostClient::HostReply = HostClient::request(process, 63, logical_row, 0)
-            UiHandles::set_text(row, ShellBytes::view_of(&label.text), 12.0, shell_color(220, 160, 140))
+            if logical_row < design_count:
+                label: HostClient::HostReply = HostClient::request(process, 96, logical_row, 0)
+                message: HostClient::HostReply = HostClient::request(process, 97, logical_row, 0)
+                path: HostClient::HostReply = HostClient::request(process, 98, logical_row, 0)
+                display: mutable darray[u8] = []
+                append_panel_text(&display, ShellBytes::view_of(&label.text))
+                display.push(58)
+                display.push(32)
+                append_panel_text(&display, ShellBytes::view_of(&message.text))
+                if path.text.count > 0:
+                    append_panel_text(&display, " @ ")
+                    append_panel_text(&display, ShellBytes::view_of(&path.text))
+                UiHandles::set_text(row, ShellBytes::view_of(&display), 12.0, shell_color(220, 160, 140))
+                UiHandles::set_help(row, ShellBytes::view_of(&path.text))
+            else:
+                build_line: sview = build_diagnostic_at(build_output_text(shell), (logical_row - design_count).i32())
+                UiHandles::set_text(row, build_line, 12.0, shell_color(226, 194, 132))
+                UiHandles::set_help(row, "Build diagnostic; source mapping will be enabled when a matching source identity is available")
             UiHandles::set_visible(row, true)
         else:
             UiHandles::set_visible(row, false)
@@ -289,29 +488,269 @@ def refresh_problems(shell: mutable Shell&, process: mutable PosixProcess::Proce
     UiHandles::set_text(shell.problem_page_label, ShellBytes::view_of(&summary), 11.0, shell_color(148, 158, 180))
     UiHandles::set_enabled(shell.problem_previous_button, ShellWindow::has_previous(window))
     UiHandles::set_enabled(shell.problem_next_button, ShellWindow::has_next(window))
+    UiHandles::set_enabled(shell.problem_copy_button, shell.problem_copy_length > 0)
+
+def refresh_history_buttons(shell: mutable Shell&, process: mutable PosixProcess::Process&) -> void:
+    if shell.source_mode and HostClient::request(process, 113, 0, 0).result == 1:
+        UiHandles::set_enabled(shell.undo_button, HostClient::request(process, 136, 0, 0).result == 1)
+        UiHandles::set_enabled(shell.redo_button, HostClient::request(process, 137, 0, 0).result == 1)
+    else:
+        UiHandles::set_enabled(shell.undo_button, HostClient::request(process, 41, 0, 0).result == 1)
+        UiHandles::set_enabled(shell.redo_button, HostClient::request(process, 42, 0, 0).result == 1)
 
 # Refresh every panel from the host.
+def refresh_source_lines(shell: mutable Shell&, text: sview) -> void:
+    shell.source_line_count <- 0
+    line_start: mutable i64 = 0
+    shell.refreshing_source <- true
+    while line_start < text.len and shell.source_line_count < MAX_SOURCE_LINES:
+        line_end: mutable i64 = line_start
+        while line_end < text.len and text[line_end] != 10:
+            line_end <- line_end + 1
+        line: sview = string_view_slice(text, line_start, line_end)
+        row: UiHandles::Handle = shell.source_line_rows[shell.source_line_count.usize()]
+        display: mutable darray[u8] = []
+        append_nonnegative(&display, shell.source_line_count.i64() + 1)
+        append_panel_text(&display, ": ")
+        append_panel_text(&display, line)
+        UiHandles::set_visible(row, true)
+        UiHandles::set_enabled(row, true)
+        UiHandles::replace_text(row, ShellBytes::view_of(&display))
+        UiHandles::set_help(row, "Select the form owner for this generated source line")
+        UiHandles::set_visible(row, true)
+        UiHandles::set_enabled(row, false)
+        shell.source_line_offsets[shell.source_line_count.usize()] <- line_start
+        shell.source_line_count <- shell.source_line_count + 1
+        line_start <- line_end + 1 if line_end < text.len else text.len
+    index: mutable i32 = shell.source_line_count
+    while index < MAX_SOURCE_LINES:
+        row: UiHandles::Handle = shell.source_line_rows[index.usize()]
+        UiHandles::set_visible(row, false)
+        UiHandles::set_enabled(row, false)
+        index <- index + 1
+    shell.refreshing_source <- false
+
+def refresh_source_file_lines(shell: mutable Shell&, process: mutable PosixProcess::Process&) -> void:
+    total: i64 = HostClient::request(process, 115, 0, 0).result
+    dirty: bool = HostClient::request(process, 130, 0, 0).result == 1
+    UiHandles::set_text(shell.source_title, "Elisa source (modified)" if dirty else "Elisa source", 15.0, shell_color(230, 234, 242))
+    start: mutable i64 = shell.source_page_start
+    start <- 0 if start < 0
+    maximum_start: mutable i64 = 0
+    if total > MAX_SOURCE_LINES.i64():
+        maximum_start <- ((total - 1) / MAX_SOURCE_LINES.i64()) * MAX_SOURCE_LINES.i64()
+    start <- maximum_start if start > maximum_start
+    shell.source_page_start <- start
+    shell.source_selected_line <- start + 1
+    UiHandles::set_visible(shell.source_open_editor_button, true)
+    UiHandles::set_enabled(shell.source_open_editor_button, total > 0)
+    UiHandles::set_visible(shell.source_reveal_button, true)
+    shell.refreshing_source <- true
+    visible: mutable i32 = 0
+    while visible < MAX_SOURCE_LINES:
+        row: UiHandles::Handle = shell.source_line_rows[visible.usize()]
+        line_number: i64 = start + visible.i64()
+        if line_number < total:
+            line: HostClient::HostReply = HostClient::request(process, 116, line_number, 0)
+            display: mutable darray[u8] = []
+            append_nonnegative(&display, line_number + 1)
+            append_panel_text(&display, ": ")
+            append_panel_text(&display, ShellBytes::view_of(&line.text))
+            UiHandles::set_visible(row, true)
+            UiHandles::set_enabled(row, true)
+            UiHandles::replace_text(row, ShellBytes::view_of(&display))
+            UiHandles::set_help(row, "Elisa source line; long lines are locked to prevent editing hidden text")
+            UiHandles::set_visible(row, true)
+            UiHandles::set_enabled(row, line.result == 1)
+            shell.source_line_offsets[visible.usize()] <- line_number
+            visible <- visible + 1
+        else:
+            UiHandles::set_visible(row, false)
+            UiHandles::set_enabled(row, false)
+            shell.source_line_offsets[visible.usize()] <- -1
+            visible <- visible + 1
+    shell.refreshing_source <- false
+    shell.source_line_count <- 0
+    index: mutable i32 = 0
+    while index < MAX_SOURCE_LINES:
+        if start + index.i64() < total:
+            shell.source_line_count <- shell.source_line_count + 1
+        index <- index + 1
+    UiHandles::set_enabled(shell.source_previous_button, start > 0)
+    UiHandles::set_enabled(shell.source_next_button, start + MAX_SOURCE_LINES.i64() < total)
+    refresh_source_file_status(shell, process, total, start)
+
+def refresh_source_conflict_bar(shell: mutable Shell&, process: mutable PosixProcess::Process&) -> void:
+    if HostClient::request(process, 113, 0, 0).result != 1:
+        shell.source_compare_mode <- false
+        UiHandles::set_visible(shell.source_conflict_bar, false)
+        UiHandles::set_enabled(shell.source_compare_button, false)
+        UiHandles::set_enabled(shell.source_keep_buffer_button, false)
+        UiHandles::set_enabled(shell.source_reload_external_button, false)
+        return
+    changed: bool = HostClient::request(process, 138, 0, 0).result == 1
+    available: bool = changed and HostClient::request(process, 140, 0, 0).result == 1
+    UiHandles::set_visible(shell.source_conflict_bar, changed)
+    UiHandles::set_enabled(shell.source_compare_button, available)
+    UiHandles::set_enabled(shell.source_keep_buffer_button, available)
+    UiHandles::set_enabled(shell.source_reload_external_button, available)
+    UiHandles::set_text(shell.source_compare_button, "Editor" if shell.source_compare_mode else "Compare", 11.0, shell_color(220, 226, 240))
+    if changed and available:
+        UiHandles::set_text(shell.source_conflict_message, "File changed on disk. Use Save As to publish a separate copy.", 10.0, shell_color(246, 210, 145))
+    elif changed:
+        UiHandles::set_text(shell.source_conflict_message, "Disk copy is missing or unreadable. Save As can preserve this buffer.", 10.0, shell_color(246, 210, 145))
+        shell.source_compare_mode <- false
+    else:
+        shell.source_compare_mode <- false
+
+def refresh_source_file_status(shell: mutable Shell&, process: mutable PosixProcess::Process&, total: i64, start: i64) -> void:
+    path: HostClient::HostReply = HostClient::request(process, 114, 0, 0)
+    UiHandles::set_enabled(shell.source_reveal_button, path.result == 1 and path.text.count > 0)
+    ownership: mutable darray[u8] = []
+    append_panel_text(&ownership, ShellBytes::view_of(&path.text))
+    append_panel_text(&ownership, " | lines ")
+    append_nonnegative(&ownership, start + 1)
+    append_panel_text(&ownership, "-")
+    last: mutable i64 = start + MAX_SOURCE_LINES.i64()
+    last <- total if last > total
+    append_nonnegative(&ownership, last)
+    append_panel_text(&ownership, " of ")
+    append_nonnegative(&ownership, total)
+    append_panel_text(&ownership, " | editable")
+    UiHandles::set_text(shell.source_ownership, ShellBytes::view_of(&ownership), 10.0, shell_color(148, 158, 180))
+    refresh_history_buttons(shell, process)
+
+def refresh_source_view(shell: mutable Shell&, process: mutable PosixProcess::Process&) -> void:
+    shell.source_find_match_valid <- false
+    return if not shell.source_mode
+    if HostClient::request(process, 113, 0, 0).result == 1:
+        refresh_source_conflict_bar(shell, process)
+        if shell.source_compare_mode:
+            comparison: HostClient::HostReply = HostClient::request(process, 143, 0, 0)
+            UiHandles::set_text(shell.source_title, "Elisa source comparison", 15.0, shell_color(230, 234, 242))
+            UiHandles::set_text(shell.source_text, ShellBytes::view_of(&comparison.text), 11.0, shell_color(205, 214, 232))
+            UiHandles::set_visible(shell.source_text, true)
+            UiHandles::set_grow(shell.source_text, 1.0)
+            UiHandles::set_visible(shell.source_open_editor_button, false)
+            UiHandles::set_enabled(shell.source_open_editor_button, false)
+            UiHandles::set_visible(shell.source_reveal_button, false)
+            UiHandles::set_enabled(shell.source_reveal_button, false)
+            UiHandles::set_visible(shell.source_previous_button, false)
+            UiHandles::set_visible(shell.source_next_button, false)
+            UiHandles::set_visible(shell.source_find_field, false)
+            UiHandles::set_visible(shell.source_find_previous_button, false)
+            UiHandles::set_visible(shell.source_find_next_button, false)
+            UiHandles::set_visible(shell.source_replace_field, false)
+            UiHandles::set_visible(shell.source_replace_next_button, false)
+            UiHandles::set_visible(shell.source_replace_all_button, false)
+            UiHandles::set_visible(shell.source_goto_field, false)
+            UiHandles::set_visible(shell.source_goto_button, false)
+            UiHandles::set_text(shell.source_ownership, "Line-aligned differences | scroll to review | Keep Buffer or Discard + Reload to resolve", 10.0, shell_color(148, 158, 180))
+            index: mutable i32 = 0
+            while index < MAX_SOURCE_LINES:
+                UiHandles::set_visible(shell.source_line_rows[index.usize()], false)
+                UiHandles::set_enabled(shell.source_line_rows[index.usize()], false)
+                index <- index + 1
+            refresh_history_buttons(shell, process)
+            return
+        UiHandles::set_text(shell.source_title, "Elisa source", 15.0, shell_color(230, 234, 242))
+        UiHandles::set_text(shell.source_text, "", 11.0, shell_color(205, 214, 232))
+        UiHandles::set_visible(shell.source_text, false)
+        UiHandles::set_grow(shell.source_text, 0.0)
+        UiHandles::set_visible(shell.source_open_editor_button, true)
+        UiHandles::set_visible(shell.source_reveal_button, true)
+        UiHandles::set_visible(shell.source_previous_button, true)
+        UiHandles::set_visible(shell.source_next_button, true)
+        UiHandles::set_visible(shell.source_find_field, true)
+        UiHandles::set_visible(shell.source_find_previous_button, true)
+        UiHandles::set_visible(shell.source_find_next_button, true)
+        UiHandles::set_visible(shell.source_replace_field, true)
+        UiHandles::set_visible(shell.source_replace_next_button, true)
+        UiHandles::set_visible(shell.source_replace_all_button, true)
+        UiHandles::set_visible(shell.source_goto_field, true)
+        UiHandles::set_visible(shell.source_goto_button, true)
+        refresh_source_file_lines(shell, process)
+        return
+    shell.source_compare_mode <- false
+    UiHandles::set_visible(shell.source_find_field, false)
+    UiHandles::set_visible(shell.source_find_previous_button, false)
+    UiHandles::set_visible(shell.source_find_next_button, false)
+    UiHandles::set_visible(shell.source_replace_field, false)
+    UiHandles::set_visible(shell.source_replace_next_button, false)
+    UiHandles::set_visible(shell.source_replace_all_button, false)
+    UiHandles::set_visible(shell.source_goto_field, false)
+    UiHandles::set_visible(shell.source_goto_button, false)
+    UiHandles::set_visible(shell.source_conflict_bar, false)
+    UiHandles::set_enabled(shell.source_compare_button, false)
+    UiHandles::set_enabled(shell.source_keep_buffer_button, false)
+    UiHandles::set_enabled(shell.source_reload_external_button, false)
+    UiHandles::set_text(shell.source_title, "Generated Elisa source (read-only)", 15.0, shell_color(230, 234, 242))
+    UiHandles::set_visible(shell.source_open_editor_button, false)
+    UiHandles::set_enabled(shell.source_open_editor_button, false)
+    UiHandles::set_visible(shell.source_reveal_button, false)
+    UiHandles::set_enabled(shell.source_reveal_button, false)
+    UiHandles::set_enabled(shell.source_previous_button, false)
+    UiHandles::set_enabled(shell.source_next_button, false)
+    form_path: HostClient::HostReply = HostClient::request(process, 109, 0, 0)
+    ownership: mutable darray[u8] = []
+    append_panel_text(&ownership, "Form: ")
+    if form_path.text.count > 0:
+        append_panel_text(&ownership, ShellBytes::view_of(&form_path.text))
+    else:
+        append_panel_text(&ownership, "(unsaved)")
+    append_panel_text(&ownership, " | generated view is read-only | visible rows: 32")
+    UiHandles::set_text(shell.source_ownership, ShellBytes::view_of(&ownership), 10.0, shell_color(148, 158, 180))
+    generated: HostClient::HostReply = HostClient::request(process, 106, 0, 0)
+    if generated.result == 1:
+        source: sview = ShellBytes::view_of(&generated.text)
+        # Retain the complete generated bytes for exact inspection while the
+        # visible line buttons provide bounded source ownership navigation.
+        UiHandles::set_text(shell.source_text, source, 11.0, shell_color(205, 214, 232))
+        refresh_source_lines(shell, source)
+    else:
+        UiHandles::set_text(shell.source_text, "Generated source is unavailable for the current form.", 11.0, shell_color(214, 145, 130))
+        refresh_source_lines(shell, "Generated source is unavailable for the current form.")
+
 def refresh_all(shell: mutable Shell&, process: mutable PosixProcess::Process&) -> void:
     shell.projection.hierarchy_count <- HostClient::request(process, 20, 0, 0).result
     shell.projection.palette_count <- HostClient::request(process, 21, 0, 0).result
     shell.projection.inspector_count <- HostClient::request(process, 22, 0, 0).result
+    shell.projection.event_count <- HostClient::request(process, 90, 0, 0).result
     shell.projection.problem_count <- HostClient::request(process, 25, 0, 0).result
     shell.projection.node_count <- HostClient::request(process, 23, 0, 0).result
     shell.projection.selection_count <- HostClient::request(process, 24, 0, 0).result
     shell.projection.dirty <- HostClient::request(process, 40, 0, 0).result == 1
+    shell.build_problem_count <- build_diagnostic_count(build_output_text(shell))
+    recovery_available: bool = HostClient::request(process, 101, 0, 0).result == 1
+    UiHandles::set_visible(shell.recovery_restore_button, recovery_available)
+    UiHandles::set_visible(shell.recovery_discard_button, recovery_available)
+    UiHandles::set_enabled(shell.recovery_restore_button, recovery_available)
+    UiHandles::set_enabled(shell.recovery_discard_button, recovery_available)
+    external_change: bool = HostClient::request(process, 104, 0, 0).result == 1
+    UiHandles::set_visible(shell.reload_button, external_change)
+    UiHandles::set_enabled(shell.reload_button, external_change and not shell.projection.dirty)
     can_save: bool = HostClient::request(process, 44, 0, 0).result == 1
     UiHandles::set_enabled(shell.save_button, shell.projection.dirty and can_save)
     UiHandles::set_enabled(shell.new_button, not shell.projection.dirty)
+    UiHandles::set_enabled(shell.new_project_button, not shell.projection.dirty)
+    UiHandles::set_enabled(shell.compact_new_project_button, not shell.projection.dirty)
     UiHandles::set_enabled(shell.open_button, not shell.projection.dirty)
-    UiHandles::set_enabled(shell.undo_button, HostClient::request(process, 41, 0, 0).result == 1)
-    UiHandles::set_enabled(shell.redo_button, HostClient::request(process, 42, 0, 0).result == 1)
+    refresh_history_buttons(shell, process)
     UiHandles::set_enabled(shell.delete_button, shell.projection.selection_count > 0)
     UiHandles::set_enabled(shell.duplicate_button, shell.projection.selection_count > 0)
     refresh_palette(shell, process)
+    refresh_files(shell, process)
     refresh_hierarchy(shell, process)
     refresh_inspector(shell, process)
+    refresh_events(shell, process)
     refresh_problems(shell, process)
-    set_status(shell, HostClient::request(process, 56, 0, 0).text)
+    status_reply: HostClient::HostReply = HostClient::request(process, 56, 0, 0)
+    set_status(shell, status_reply.text)
+    if recovery_available:
+        set_status_view(shell, "Recovery snapshot available; choose Restore or Discard")
+    elif external_change:
+        set_status_view(shell, "File changed outside Elisa IDE; save is blocked until you reload or use Save As")
     set_form_title(shell, HostClient::request(process, 58, 0, 0).text, shell.projection.dirty)
+    refresh_source_view(shell, process)
     ShellPreview::refresh(shell, process)
     UiHandles::layout(UiCore::viewport_width(), UiCore::viewport_height())

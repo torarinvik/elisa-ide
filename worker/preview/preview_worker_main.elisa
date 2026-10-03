@@ -7,14 +7,32 @@
 include "../../framework/src/platform/appkit/ui_appkit_canvas_flat.elisa"
 include "preview_worker_app.elisa"
 
+@link_name("designer_report_frame_identity")
+extern preview_report_frame_identity(path: cstr, revision: i64, signature: i64) -> i64 can[Blocking.IO]
+
+@link_name("designer_preview_snapshot_signature")
+extern preview_snapshot_signature(bytes: mutable u8&, length: usize) -> i64
+
 def main() -> i64:
     preview_width: mutable f32 = 400.0
     preview_height: mutable f32 = 300.0
+    preview_revision: mutable u64 = 0
+    preview_signature: mutable i64 = 0
     input_path_opt: cstr? = getenv("ELISA_UI_PREVIEW_INPUT")
     if input_path_opt is input_path:
         bytes: mutable darray[u8] = []
         amount: usize = PosixFile::read_bytes(&bytes, input_path, PreviewWire::MAX_PAYLOAD_BYTES)
-        return 20 if amount == 0 or not PreviewWorkerApp::load_preview(bytes)
+        return 20 if amount == 0 or bytes.count < 16
+        for shift in 0..<8:
+            preview_revision <- preview_revision | (bytes[8 + shift].u64() << (shift * 8))
+        preview_signature <- preview_snapshot_signature(&bytes[0], bytes.count)
+        return 20 if not PreviewWorkerApp::load_preview(bytes, preview_signature)
         preview_width <- PreviewWorkerApp::viewport_width()
         preview_height <- PreviewWorkerApp::viewport_height()
-    return UiAppKitCanvas::run_with_min_size("Elisa IDE preview", preview_width, preview_height, 240.0, 180.0)
+    run_status: i64 = UiAppKitCanvas::run_with_min_size("Elisa IDE preview", preview_width, preview_height, 240.0, 180.0)
+    return run_status if run_status != 0
+    frame_path_opt: cstr? = getenv("ELISA_UI_SNAPSHOT")
+    if frame_path_opt is frame_path:
+        reported: i64 = preview_report_frame_identity(frame_path, preview_revision.i64(), preview_signature)
+        return 21 if reported != 0
+    return run_status

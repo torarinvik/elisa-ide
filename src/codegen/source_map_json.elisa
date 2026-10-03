@@ -26,44 +26,44 @@ module CodegenSourceMapJson:
                 index <- index + 1
             return result
 
-        def member_key(value: JsonValue, index: i64) -> sview:
-            return catch json_key_at(value, index):
+        def member_key[@r](value: JsonValueHandle[r], index: i64) -> sview @r:
+            return catch json_handle_key_at(value, index):
                 value:
                     value
                 error e:
                     ""
 
-        def member_value(value: JsonValue, index: i64) -> JsonValue:
-            return catch json_value_at(value, index):
+        def member_value[@r](value: JsonValueHandle[r], index: i64) -> JsonValueHandle[r]:
+            return catch json_handle_value_at(value, index):
                 value:
                     value
                 error e:
-                    JsonValue.Null
+                    json_handle_null(value)
 
-        def array_value(value: JsonValue, index: i64) -> JsonValue:
-            return catch json_at(value, index):
+        def array_value[@r](value: JsonValueHandle[r], index: i64) -> JsonValueHandle[r]:
+            return catch json_handle_at(value, index):
                 value:
                     value
                 error e:
-                    JsonValue.Null
+                    json_handle_null(value)
 
-        def member_at(value: JsonValue, key: sview) -> JsonValue:
-            return catch json_get(value, key):
+        def member_at[@r](value: JsonValueHandle[r], key: sview) -> JsonValueHandle[r]:
+            return catch json_handle_get(value, key):
                 value:
                     value
                 error e:
-                    JsonValue.Null
+                    json_handle_null(value)
 
-        def string_value(value: JsonValue) -> sview:
-            return catch json_as_string(value):
+        def string_value[@r](value: JsonValueHandle[r]) -> sview @r:
+            return catch json_handle_as_string(value):
                 value:
                     value
                 error e:
                     ""
 
-        def duplicate_members(value: JsonValue) -> bool:
-            return false if json_kind(value) != JsonKind.OBJECT
-            count: i64 = json_object_len(value)
+        def duplicate_members[@r](value: JsonValueHandle[r]) -> bool:
+            return false if json_handle_kind(value) != JsonKind.OBJECT
+            count: i64 = json_handle_object_len(value)
             index: mutable i64 = 0
             while index < count:
                 key: sview = member_key(value, index)
@@ -133,16 +133,33 @@ module CodegenSourceMapJson:
             valid <- false
             return CodegenSourceMap::OriginKind.Form
 
-        def json_text_member(arena: mutable Arena&, members: mutable darray[JsonMember]&, key: sview, value: sview) -> void:
-            members.push(json_member(arena, key, json_string(arena, value)))
+        def append_handle_json[@j, @r](arena: mutable Arena& @r, output: mutable darray[u8]&, value: JsonValueHandle[j]) -> void:
+            in arena:
+                encoded: darray[u8] = json_handle_write(arena, value)
+                DesignText::push_view(output, DesignText::view_of(encoded))
 
-        def json_number_member(arena: mutable Arena&, members: mutable darray[JsonMember]&, key: sview, value: i64) -> void:
-            members.push(json_member(arena, key, json_number(value.f64())))
+        def append_json_string[@r](arena: mutable Arena& @r, output: mutable darray[u8]&, value: sview) -> void:
+            in arena:
+                handle: JsonValueHandle[r] = json_handle_string(arena, value)
+                append_handle_json(arena, output, handle)
 
-        def parse_integer(value: JsonValue, maximum: i64, parsed: mutable bool&) -> i64:
+        def append_json_number[@r](arena: mutable Arena& @r, output: mutable darray[u8]&, value: f64) -> void:
+            in arena:
+                handle: JsonValueHandle[r] = json_handle_number(arena, value)
+                append_handle_json(arena, output, handle)
+
+        def object_key[@r](arena: mutable Arena& @r, output: mutable darray[u8]&, first: mutable bool&, key: sview) -> void:
+            in arena:
+                if not first:
+                    output.push(44)
+                first <- false
+                append_json_string(arena, output, key)
+                output.push(58)
+
+        def parse_integer[@r](value: JsonValueHandle[r], maximum: i64, parsed: mutable bool&) -> i64:
             parsed <- false
-            return 0 if not json_is_number(value)
-            number: f64 = catch json_as_number(value):
+            return 0 if not json_handle_is_number(value)
+            number: f64 = catch json_handle_as_number(value):
                 value:
                     value
                 error e:
@@ -153,25 +170,22 @@ module CodegenSourceMapJson:
             parsed <- true
             return integer
 
-        def valid_shape(root: JsonValue) -> bool:
-            return false if json_kind(root) != JsonKind.OBJECT or duplicate_members(root)
-            return false if json_object_len(root) != 5
-            spans: JsonValue = member_at(root, "spans")
-            return false if json_kind(spans) != JsonKind.ARRAY
-            count: i64 = json_array_len(spans)
+        def valid_shape[@r](root: JsonValueHandle[r]) -> bool:
+            return false if json_handle_kind(root) != JsonKind.OBJECT or duplicate_members(root)
+            return false if json_handle_object_len(root) != 5
+            spans: JsonValueHandle[r] = member_at(root, "spans")
+            return false if json_handle_kind(spans) != JsonKind.ARRAY
+            count: i64 = json_handle_array_len(spans)
             return false if count < 0 or count > 8192
             index: mutable i64 = 0
             while index < count:
-                span: JsonValue = array_value(spans, index)
-                return false if json_kind(span) != JsonKind.OBJECT or duplicate_members(span) or json_object_len(span) != 6
+                span: JsonValueHandle[r] = array_value(spans, index)
+                return false if json_handle_kind(span) != JsonKind.OBJECT or duplicate_members(span) or json_handle_object_len(span) != 6
                 index <- index + 1
             return true
 
         def failure(issue: Issue, generated_bytes: sview) -> DecodeResult:
             return DecodeResult{ok: false, issue: issue, map: CodegenSourceMap::empty(generated_bytes)}
-
-        def set_text_member(arena: mutable Arena&, members: mutable darray[JsonMember]&, key: sview, value: sview) -> void:
-            members.push(json_member(arena, key, json_string(arena, value)))
 
     public:
         const VERSION: i64 = 1
@@ -200,28 +214,48 @@ module CodegenSourceMapJson:
             checked: CodegenSourceMap::Validation = CodegenSourceMap::validate(map, generated_bytes)
             return [] if not checked.ok
             arena: mutable Arena = empty_arena()
-            members: mutable darray[JsonMember] = []
-            set_text_member(&arena, &members, "format", "elisa-ide-source-map")
-            json_number_member(&arena, &members, "version", VERSION)
-            json_number_member(&arena, &members, "generatedLength", map.generated_length)
-            hash: darray[u8] = hash_text(map.generated_hash)
-            set_text_member(&arena, &members, "generatedHash", DesignText::view_of(hash))
-
-            spans: mutable darray[JsonValue] = []
-            index: mutable i64 = 0
-            while index < map.spans.count.i64():
-                span: CodegenSourceMap::Span = map.spans[index.usize()]
-                span_members: mutable darray[JsonMember] = []
-                json_number_member(&arena, &span_members, "startByte", span.start_byte)
-                json_number_member(&arena, &span_members, "endByte", span.end_byte)
-                set_text_member(&arena, &span_members, "kind", kind_text(span.kind))
-                set_text_member(&arena, &span_members, "formId", DesignValues::text_of(map.strings, span.form_id))
-                set_text_member(&arena, &span_members, "nodeId", DesignValues::text_of(map.strings, span.node_id))
-                set_text_member(&arena, &span_members, "member", DesignValues::text_of(map.strings, span.member))
-                spans.push(json_object_from(&arena, span_members))
-                index <- index + 1
-            members.push(json_member(&arena, "spans", json_array_from(&arena, spans)))
-            return durable(json_write(&arena, json_object_from(&arena, members)))
+            output: mutable darray[u8] = []
+            in arena:
+                first: mutable bool = true
+                output.push(123)
+                object_key(&arena, &output, &first, "format")
+                append_json_string(&arena, &output, "elisa-ide-source-map")
+                object_key(&arena, &output, &first, "version")
+                append_json_number(&arena, &output, VERSION.f64())
+                object_key(&arena, &output, &first, "generatedLength")
+                append_json_number(&arena, &output, map.generated_length.f64())
+                object_key(&arena, &output, &first, "generatedHash")
+                hash: darray[u8] = hash_text(map.generated_hash)
+                append_json_string(&arena, &output, DesignText::view_of(hash))
+                object_key(&arena, &output, &first, "spans")
+                output.push(91)
+                index: mutable i64 = 0
+                array_first: mutable bool = true
+                while index < map.spans.count.i64():
+                    if not array_first:
+                        output.push(44)
+                    array_first <- false
+                    span: CodegenSourceMap::Span = map.spans[index.usize()]
+                    span_first: mutable bool = true
+                    output.push(123)
+                    object_key(&arena, &output, &span_first, "startByte")
+                    append_json_number(&arena, &output, span.start_byte.f64())
+                    object_key(&arena, &output, &span_first, "endByte")
+                    append_json_number(&arena, &output, span.end_byte.f64())
+                    object_key(&arena, &output, &span_first, "kind")
+                    append_json_string(&arena, &output, kind_text(span.kind))
+                    object_key(&arena, &output, &span_first, "formId")
+                    append_json_string(&arena, &output, DesignValues::text_of(map.strings, span.form_id))
+                    object_key(&arena, &output, &span_first, "nodeId")
+                    append_json_string(&arena, &output, DesignValues::text_of(map.strings, span.node_id))
+                    object_key(&arena, &output, &span_first, "member")
+                    append_json_string(&arena, &output, DesignValues::text_of(map.strings, span.member))
+                    output.push(125)
+                    index <- index + 1
+                output.push(93)
+                output.push(125)
+                output.push(10)
+            return durable(output)
 
         # The generated artifact is mandatory input. The returned failure map
         # is always empty and bound to those bytes; no partially decoded spans
@@ -230,20 +264,20 @@ module CodegenSourceMapJson:
             if text.len < 0 or text.len.usize() > MAX_JSON_BYTES:
                 return failure(Issue.InputTooLarge, generated_bytes)
             arena: mutable Arena = empty_arena()
-            parsed: JsonParseResult = json_parse_checked(arena, text)
-            if parsed.code != JsonErrorCode.OK or json_kind(parsed.value) != JsonKind.OBJECT:
+            parsed: JsonParseResult[arena] = json_parse_checked(&arena, text)
+            root: JsonValueHandle[arena] = json_handle_from_result(parsed)
+            if parsed.code != JsonErrorCode.OK or json_handle_kind(root) != JsonKind.OBJECT:
                 return failure(Issue.MalformedJson, generated_bytes)
-            root: JsonValue = parsed.value
             if duplicate_members(root):
                 return failure(Issue.DuplicateKey, generated_bytes)
-            if json_kind(member_at(root, "spans")) == JsonKind.ARRAY:
-                spans_for_duplicates: JsonValue = member_at(root, "spans")
-                if json_array_len(spans_for_duplicates) > 8192:
+            if json_handle_kind(member_at(root, "spans")) == JsonKind.ARRAY:
+                spans_for_duplicates: JsonValueHandle[arena] = member_at(root, "spans")
+                if json_handle_array_len(spans_for_duplicates) > 8192:
                     return failure(Issue.TooManySpans, generated_bytes)
                 duplicate_index: mutable i64 = 0
-                while duplicate_index < json_array_len(spans_for_duplicates):
-                    item: JsonValue = array_value(spans_for_duplicates, duplicate_index)
-                    if json_kind(item) == JsonKind.OBJECT and duplicate_members(item):
+                while duplicate_index < json_handle_array_len(spans_for_duplicates):
+                    item: JsonValueHandle[arena] = array_value(spans_for_duplicates, duplicate_index)
+                    if json_handle_kind(item) == JsonKind.OBJECT and duplicate_members(item):
                         return failure(Issue.DuplicateKey, generated_bytes)
                     duplicate_index <- duplicate_index + 1
             if not valid_shape(root):
@@ -265,21 +299,21 @@ module CodegenSourceMapJson:
             return failure(Issue.InvalidMetadata, generated_bytes) if not length_parsed or not hash_valid
             return failure(Issue.StaleGeneratedBytes, generated_bytes) if generated_length != generated_bytes.len or generated_hash != Fingerprint::fnv1a64(generated_bytes)
 
-            spans: JsonValue = member_at(root, "spans")
-            span_count: i64 = json_array_len(spans)
+            spans: JsonValueHandle[arena] = member_at(root, "spans")
+            span_count: i64 = json_handle_array_len(spans)
             result: mutable CodegenSourceMap::SourceMap = CodegenSourceMap::empty(generated_bytes)
             index: mutable i64 = 0
             while index < span_count:
-                item: JsonValue = array_value(spans, index)
+                item: JsonValueHandle[arena] = array_value(spans, index)
                 start_valid: mutable bool = false
                 end_valid: mutable bool = false
                 start_byte: i64 = parse_integer(member_at(item, "startByte"), generated_bytes.len, &start_valid)
                 end_byte: i64 = parse_integer(member_at(item, "endByte"), generated_bytes.len, &end_valid)
                 kind_valid: mutable bool = false
                 kind: CodegenSourceMap::OriginKind = parse_kind(string_value(member_at(item, "kind")), &kind_valid)
-                form_id: sview = string_value(member_at(item, "formId"))
-                node_id: sview = string_value(member_at(item, "nodeId"))
-                member: sview = string_value(member_at(item, "member"))
+                form_id: sview @arena = string_value(member_at(item, "formId"))
+                node_id: sview @arena = string_value(member_at(item, "nodeId"))
+                member: sview @arena = string_value(member_at(item, "member"))
                 if not start_valid or not end_valid or not kind_valid or not CodegenSourceMap::add_span(&result, start_byte, end_byte, kind, form_id, node_id, member):
                     return failure(Issue.InvalidSpan, generated_bytes)
                 index <- index + 1

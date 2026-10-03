@@ -212,9 +212,10 @@ module DesignRegistry:
 
         def text_field_properties(registry: mutable Registry&) -> darray[PropertyDescriptor]:
             properties: mutable darray[PropertyDescriptor] = []
-            reserve_properties(&properties, 16)
+            reserve_properties(&properties, 17)
             properties.push(text_property(registry, "label", "Field label", "Field", "label", true))
             properties.push(text_property(registry, "placeholder", "Placeholder", "", "placeholder", false))
+            properties.push(text_property(registry, "help", "Help text", "", "help", true))
             properties.push(text_property(registry, "initial", "Initial text", "", "initial", false))
             properties.push(scalar_property(registry, "size", "Text size", 15.0, 6.0, 200.0, "size", false))
             properties.push(length_property(registry, "minimumWidth", "Minimum width", 240.0, "minimumWidth", true))
@@ -223,6 +224,54 @@ module DesignRegistry:
             properties.push(color_property(registry, "fill", "Fill color", 27, 32, 43, "fill"))
             properties.push(bool_property(registry, "secure", "Secure field", false, "secure", true))
             properties.push(scalar_property(registry, "grow", "Grow weight", 0.0, 0.0, 1000.0, "grow", true))
+            properties.push(length_property(registry, "margin", "Margin", 0.0, "margin", true))
+            properties.push(bool_property(registry, "visible", "Visible", true, "visible", true))
+            return properties
+
+        def choice_properties(registry: mutable Registry&, default_text: cstr) -> darray[PropertyDescriptor]:
+            properties: mutable darray[PropertyDescriptor] = []
+            reserve_properties(&properties, 16)
+            properties.push(text_property(registry, "text", "Caption", default_text, "text", true))
+            properties.push(scalar_property(registry, "size", "Text size", 15.0, 6.0, 200.0, "size", false))
+            properties.push(length_property(registry, "minimumWidth", "Minimum width", 180.0, "minimumWidth", true))
+            properties.push(length_property(registry, "minimumHeight", "Minimum height", 32.0, "minimumHeight", true))
+            properties.push(color_property(registry, "color", "Marker color", 64, 112, 224, "color"))
+            properties.push(color_property(registry, "textColor", "Text color", 232, 236, 246, "textColor"))
+            properties.push(color_property(registry, "hoverColor", "Hover color", 84, 136, 244, "hoverColor"))
+            properties.push(color_property(registry, "pressColor", "Press color", 48, 90, 190, "pressColor"))
+            properties.push(bool_property(registry, "selected", "Selected", false, "selected", true))
+            properties.push(bool_property(registry, "enabled", "Enabled", true, "enabled", true))
+            properties.push(scalar_property(registry, "grow", "Grow weight", 0.0, 0.0, 1000.0, "grow", true))
+            properties.push(length_property(registry, "margin", "Margin", 0.0, "margin", true))
+            properties.push(bool_property(registry, "visible", "Visible", true, "visible", true))
+            return properties
+
+        def range_properties(registry: mutable Registry&, progress: bool) -> darray[PropertyDescriptor]:
+            properties: mutable darray[PropertyDescriptor] = []
+            reserve_properties(&properties, 16)
+            properties.push(text_property(registry, "label", "Label", "", "label", true))
+            properties.push(scalar_property(registry, "size", "Text size", 15.0, 6.0, 200.0, "size", false))
+            properties.push(length_property(registry, "minimumWidth", "Minimum width", 240.0, "minimumWidth", true))
+            properties.push(length_property(registry, "minimumHeight", "Minimum height", 24.0, "minimumHeight", true))
+            properties.push(scalar_property(registry, "value", "Value", 0.5, 0.0, 1.0, "value", false))
+            properties.push(color_property(registry, "trackColor", "Track color", 58, 64, 78, "trackColor"))
+            properties.push(color_property(registry, "fillColor", "Fill color", 64, 112, 224, "fillColor"))
+            properties.push(color_property(registry, "textColor", "Text color", 232, 236, 246, "textColor"))
+            if not progress:
+                properties.push(color_property(registry, "thumbColor", "Thumb color", 232, 236, 246, "thumbColor"))
+            properties.push(scalar_property(registry, "grow", "Grow weight", 0.0, 0.0, 1000.0, "grow", true))
+            properties.push(length_property(registry, "margin", "Margin", 0.0, "margin", true))
+            properties.push(bool_property(registry, "visible", "Visible", true, "visible", true))
+            return properties
+
+        def scroll_properties(registry: mutable Registry&) -> darray[PropertyDescriptor]:
+            properties: mutable darray[PropertyDescriptor] = []
+            reserve_properties(&properties, 12)
+            properties.push(enum_property(registry, "axis", "Axis", "column", "row,column", "axis", true))
+            properties.push(color_property(registry, "background", "Background", 28, 31, 38, "color"))
+            properties.push(length_property(registry, "minimumWidth", "Minimum width", 240.0, "minimumWidth", true))
+            properties.push(length_property(registry, "minimumHeight", "Minimum height", 180.0, "minimumHeight", true))
+            properties.push(scalar_property(registry, "grow", "Grow weight", 1.0, 0.0, 1000.0, "grow", true))
             properties.push(length_property(registry, "margin", "Margin", 0.0, "margin", true))
             properties.push(bool_property(registry, "visible", "Visible", true, "visible", true))
             return properties
@@ -255,6 +304,16 @@ module DesignRegistry:
             })
             return events
 
+        def change_events(registry: mutable Registry&) -> darray[EventDescriptor]:
+            events: mutable darray[EventDescriptor] = []
+            reserve_events(&events, 2)
+            events.push(EventDescriptor{
+                key: DesignValues::append_cstr(registry.strings.bytes, "change"),
+                label: DesignValues::append_cstr(registry.strings.bytes, "Value changed"),
+                signature: DesignValues::append_cstr(registry.strings.bytes, "def handler(widget: usize, event: i32) -> void"),
+            })
+            return events
+
         def build_builtin() -> Registry:
             registry: mutable Registry = empty_registry()
             add_component(&registry, "elisa.ui.column", "Column", Category.Container, ComponentKind.Panel, "column", true, 320.0, 240.0, container_properties(&registry, false), no_events())
@@ -263,6 +322,11 @@ module DesignRegistry:
             add_component(&registry, "elisa.ui.label", "Label", Category.Display, ComponentKind.Label, "label", false, 120.0, 24.0, label_properties(&registry), no_events())
             add_component(&registry, "elisa.ui.button", "Button", Category.Input, ComponentKind.Button, "button", false, 120.0, 36.0, button_properties(&registry), button_events(&registry))
             add_component(&registry, "elisa.ui.text_field", "Text field", Category.Input, ComponentKind.TextField, "text_field", false, 240.0, 40.0, text_field_properties(&registry), field_events(&registry))
+            add_component(&registry, "elisa.ui.check_box", "Check box", Category.Input, ComponentKind.CheckBox, "check_box", false, 180.0, 32.0, choice_properties(&registry, "Check box"), change_events(&registry))
+            add_component(&registry, "elisa.ui.radio_button", "Radio button", Category.Input, ComponentKind.RadioButton, "radio_button", false, 180.0, 32.0, choice_properties(&registry, "Radio button"), change_events(&registry))
+            add_component(&registry, "elisa.ui.slider", "Slider", Category.Input, ComponentKind.Slider, "slider", false, 240.0, 28.0, range_properties(&registry, false), change_events(&registry))
+            add_component(&registry, "elisa.ui.progress_bar", "Progress bar", Category.Display, ComponentKind.ProgressBar, "progress_bar", false, 240.0, 24.0, range_properties(&registry, true), no_events())
+            add_component(&registry, "elisa.ui.scroll", "Scroll", Category.Navigation, ComponentKind.Scroll, "scroll", true, 240.0, 180.0, scroll_properties(&registry), no_events())
             return registry
 
         # ---- queries -------------------------------------------------------------

@@ -1,0 +1,39 @@
+# Skia image adapter for the shell's isolated PNG preview.
+#
+# The C++ boundary copies decoded RGBA into a host-owned raster SkImage. Elisa
+# retains the logical resource/generation binding; this module releases native
+# ownership only after it has unbound or replaced that resource.
+
+include "../../framework/src/platform/skia/ui_skia.elisa"
+include "../../framework/src/platform/skia/ui_skia_resources.elisa"
+
+@link_name("elisa_ide_skia_image_from_rgba32")
+extern ide_skia_image_from_rgba32(pixels: u8&?, byte_length: usize, width: usize, height: usize, row_stride: usize) -> usize
+
+@link_name("elisa_ide_skia_image_release")
+extern ide_skia_image_release(image: usize) -> void
+
+module PreviewImageBackend:
+    public:
+        def is_bound(resource: UiResources::ResourceHandle, image: UiCore::ImageRef, native_image: usize) -> bool:
+            # Reassert the binding on every frame. AppKit/Skia clears borrowed
+            # image bindings when its surface is lost; the retained SkImage is
+            # still owned here and can be rebound without decoding or copying
+            # the preview pixels again.
+            return native_image != 0 and UiSkia::bind_image(resource, native_image)
+
+        def bind_rgba32(resource: UiResources::ResourceHandle, image: UiCore::ImageRef, pixels: u8&?, byte_length: usize, width: usize, height: usize, row_stride: usize, native_image: mutable usize&) -> bool can[Memory.Allocate, Memory.Release]:
+            native_image <- ide_skia_image_from_rgba32(pixels, byte_length, width, height, row_stride)
+            return false if native_image == 0
+            if not UiSkia::bind_image(resource, native_image):
+                ide_skia_image_release(native_image)
+                native_image <- 0
+                return false
+            return true
+
+        def unbind(resource: UiResources::ResourceHandle, image: UiCore::ImageRef, native_image: usize) -> void can[Memory.Release]:
+            _ = UiSkia::unbind_image(resource)
+            ide_skia_image_release(native_image) if native_image != 0
+
+        def release(native_image: usize) -> void can[Memory.Release]:
+            ide_skia_image_release(native_image) if native_image != 0

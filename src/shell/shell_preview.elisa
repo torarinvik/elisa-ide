@@ -2,33 +2,80 @@
 #
 # The document host returns a bounded binary form snapshot. A short-lived
 # AppKit worker renders it to PNG; the shell decodes that PNG into retained
-# RGBA bytes and uploads them through elisa-ui's SDL3 image resource bridge.
-# The UI thread only polls a running worker and uploads completed pixels.
+# RGBA bytes and passes them to the selected renderer adapter. The UI thread
+# only polls a running worker and binds completed pixels on the main thread.
 
 include "../platform/posix/posix_file.elisa"
 include "../platform/posix/posix_process.elisa"
 include "host_client.elisa"
 include "shell_state.elisa"
 
-const PREVIEW_INPUT_PATH: cstr = "build/elisa-ide-preview.bin"
-const PREVIEW_FRAME_PATH: cstr = "build/elisa-ide-preview.png"
-const PREVIEW_WORKER_PATH: cstr = "build/preview_worker"
+const PREVIEW_PATH_CAPACITY: usize = 1024
 const PREVIEW_PIXEL_CAPACITY: usize = 4194304
 const PREVIEW_RESOURCE_OWNER: u32 = 0x454C4953
 
 global mutable preview_process: mutable PosixProcess::Process = PosixProcess::Process{handle: null}
 global mutable preview_pixels: mutable u8[PREVIEW_PIXEL_CAPACITY] = zeroed
+global mutable preview_worker_path_storage: mutable u8[PREVIEW_PATH_CAPACITY] = zeroed
 
 @link_name("designer_setenv")
 extern shell_preview_setenv(name: cstr, value: cstr) -> i64
+
+@link_name("designer_app_helper_path")
+extern shell_preview_helper_path(name: cstr, output: mutable u8&, capacity: usize) -> i64 can[Blocking.IO]
+
+@link_name("designer_preview_paths_create")
+extern shell_preview_paths_create(input_path: mutable u8&, input_capacity: usize, frame_path: mutable u8&, frame_capacity: usize) -> i64 can[Blocking.IO]
+
+@link_name("designer_preview_paths_cleanup")
+extern shell_preview_paths_cleanup(input_path: cstr, frame_path: cstr) -> i64 can[Blocking.IO]
+
+@link_name("designer_preview_frame_identity")
+extern shell_preview_frame_identity(path: cstr, length: mutable usize&, hash_high: mutable u32&, hash_low: mutable u32&) -> i64 can[Blocking.IO]
+
+@link_name("designer_preview_snapshot_signature")
+extern shell_preview_snapshot_signature(bytes: mutable u8&, length: usize) -> i64
 
 @link_name("designer_png_decode_rgba32")
 extern shell_preview_decode_png(path: cstr, output: mutable u8&, capacity: usize, width: mutable usize&, height: mutable usize&, row_stride: mutable usize&) -> i64 can[Blocking.IO]
 
 module ShellPreview:
     private:
+        const MAX_GEOMETRY_Q10: i64 = 1024000000000000
+
         def set_message(shell: mutable Shell&, message: sview) -> void:
             UiHandles::set_text(shell.preview_status, message, 11.0, shell_color(148, 158, 180))
+
+        def input_path(shell: mutable Shell&) -> cstr:
+            path: mutable cstr = ""
+            can Unsafe.PointerCast:
+                path <- (&shell.preview_input_path[0]).cast[cstr] can Unsafe.PointerCast
+            return path
+
+        def frame_path(shell: mutable Shell&) -> cstr:
+            path: mutable cstr = ""
+            can Unsafe.PointerCast:
+                path <- (&shell.preview_frame_path[0]).cast[cstr] can Unsafe.PointerCast
+            return path
+
+        def worker_path() -> cstr:
+            path: mutable cstr = ""
+            can Unsafe.PointerCast:
+                path <- (&preview_worker_path_storage[0]).cast[cstr] can Unsafe.PointerCast
+            return path
+
+        def cleanup_paths(shell: mutable Shell&) -> void can[Blocking.IO, Unsafe.PointerCast]:
+            if shell.preview_input_path[0] != 0 and shell.preview_frame_path[0] != 0:
+                _ = shell_preview_paths_cleanup(input_path(shell), frame_path(shell))
+            shell.preview_input_path[0] <- 0
+            shell.preview_frame_path[0] <- 0
+
+        def verify_frame_identity(shell: mutable Shell&, output: darray[u8]&) -> bool can[Blocking.IO, Unsafe.PointerCast]:
+            length: mutable usize = 0
+            hash_high: mutable u32 = 0
+            hash_low: mutable u32 = 0
+            return false if shell_preview_frame_identity(frame_path(shell), &length, &hash_high, &hash_low) != 0
+            return parse_frame_identity_output(output, shell.preview_revision, shell.preview_signature, length, hash_high, hash_low)
 
         def revision_of(snapshot: darray[u8]&) -> u64:
             return 0 if snapshot.count < 16
@@ -37,46 +84,313 @@ module ShellPreview:
                 revision <- revision | (snapshot[8 + shift].u64() << (shift * 8))
             return revision
 
-        def decode_completed_frame(shell: mutable Shell&) -> bool can[Blocking.IO]:
+        def read_u32(bytes: darray[u8]&, offset: usize) -> u32:
+            value: mutable u32 = 0
+            for shift in 0..<4:
+                value <- value | (bytes[offset + shift].u32() << (shift * 8))
+            return value
+
+        def next_geometry_number(bytes: sview, offset: mutable i64&, output: mutable i64&) -> bool:
+            while offset < bytes.len and (bytes[offset] == 32 or bytes[offset] == 9):
+                offset <- offset + 1
+            return false if offset >= bytes.len
+            value: mutable i64 = 0
+            digits: mutable i64 = 0
+            while offset < bytes.len and bytes[offset] != 32 and bytes[offset] != 9:
+                byte: u8 = bytes[offset]
+                return false if byte < 48 or byte > 57
+                digit: i64 = byte.i64() - 48
+                return false if value > (MAX_GEOMETRY_Q10 - digit) / 10
+                value <- value * 10 + digit
+                digits <- digits + 1
+                offset <- offset + 1
+            return false if digits == 0
+            output <- value
+            return true
+
+        def next_geometry_id(bytes: sview, offset: mutable i64&, storage: mutable u8[24]&, length: mutable i64&) -> bool:
+            while offset < bytes.len and (bytes[offset] == 32 or bytes[offset] == 9):
+                offset <- offset + 1
+            return false if offset >= bytes.len
+            length <- 0
+            while offset < bytes.len and bytes[offset] != 32 and bytes[offset] != 9:
+                byte: u8 = bytes[offset]
+                if length == 0:
+                    return false if byte < 97 or byte > 122
+                else:
+                    return false if not ((byte >= 97 and byte <= 122) or (byte >= 48 and byte <= 57) or byte == 45)
+                return false if length >= 24
+                storage[length.usize()] <- byte
+                length <- length + 1
+                offset <- offset + 1
+            return length > 0
+
+        def geometry_marker_at(bytes: sview, offset: i64) -> bool:
+            marker: sview = "geometry_v1"
+            return false if offset < 0 or offset + marker.len > bytes.len
+            index: mutable i64 = 0
+            while index < marker.len:
+                return false if bytes[offset + index] != marker[index]
+                index <- index + 1
+            return true if offset + marker.len == bytes.len
+            return bytes[offset + marker.len] == 32 or bytes[offset + marker.len] == 9 or bytes[offset + marker.len] == 10 or bytes[offset + marker.len] == 13
+
+        def frame_marker_at(bytes: sview, offset: i64) -> bool:
+            marker: sview = "frame_v1"
+            return false if offset < 0 or offset + marker.len > bytes.len
+            index: mutable i64 = 0
+            while index < marker.len:
+                return false if bytes[offset + index] != marker[index]
+                index <- index + 1
+            return true if offset + marker.len == bytes.len
+            return bytes[offset + marker.len] == 32 or bytes[offset + marker.len] == 9 or bytes[offset + marker.len] == 10 or bytes[offset + marker.len] == 13
+
+        def parse_frame_identity_output(output: darray[u8]&, revision: u64, signature: i64, length: usize, hash_high: u32, hash_low: u32) -> bool:
+            return false if output.count == 0 or length == 0
+            bytes: sview = ShellBytes::view_of(output)
+            found: mutable bool = false
+            line_start: mutable i64 = 0
+            while line_start < bytes.len:
+                line_end: mutable i64 = line_start
+                while line_end < bytes.len and bytes[line_end] != 10:
+                    line_end <- line_end + 1
+                line_length: mutable i64 = line_end - line_start
+                if line_length > 0 and bytes[line_start + line_length - 1] == 13:
+                    line_length <- line_length - 1
+                line: sview = bytes_view_range(output, line_start.usize(), line_length.usize())
+                offset: mutable i64 = 0
+                while offset < line.len and (line[offset] == 32 or line[offset] == 9):
+                    offset <- offset + 1
+                marker_search: mutable i64 = offset
+                marker_found: mutable bool = false
+                while marker_search + 8 <= line.len:
+                    if frame_marker_at(line, marker_search):
+                        return false if marker_search != offset or found
+                        marker_found <- true
+                        break
+                    marker_search <- marker_search + 1
+                if marker_found:
+                    offset <- offset + 8
+                    record_revision: mutable i64 = 0
+                    record_signature: mutable i64 = 0
+                    record_length: mutable i64 = 0
+                    record_hash_high: mutable i64 = 0
+                    record_hash_low: mutable i64 = 0
+                    if not next_geometry_number(line, &offset, &record_revision) or not next_geometry_number(line, &offset, &record_signature):
+                        return false
+                    if not next_geometry_number(line, &offset, &record_length) or not next_geometry_number(line, &offset, &record_hash_high) or not next_geometry_number(line, &offset, &record_hash_low):
+                        return false
+                    while offset < line.len and (line[offset] == 32 or line[offset] == 9):
+                        offset <- offset + 1
+                    if offset != line.len or record_revision.u64() != revision or record_signature != signature:
+                        return false
+                    if record_length != length.i64() or record_hash_high != hash_high.i64() or record_hash_low != hash_low.i64():
+                        return false
+                    found <- true
+                line_start <- line_end + 1
+            return found
+
+        def invalidate_geometry(shell: mutable Shell&) -> void:
+            shell.preview_region_count <- 0
+            shell.preview_geometry_revision <- 0
+            shell.preview_geometry_signature <- 0
+            shell.preview_form_width <- 0.0
+            shell.preview_form_height <- 0.0
+
+        def worker_poll(timeout_ms: i64) -> bool can[Blocking.IO]:
+            process: PosixProcess::Process = preview_process
+            return PosixProcess::poll(&process, timeout_ms)
+
+        def parse_geometry_output(shell: mutable Shell&, output: darray[u8]&, revision: u64, signature: i64, form_width: f32, form_height: f32) -> bool:
+            invalidate_geometry(shell)
+            if output.count == 0 or form_width <= 0.0 or form_height <= 0.0:
+                return false
+            bytes: sview = ShellBytes::view_of(output)
+            # Parse into temporary storage. A malformed, stale, mixed, or
+            # duplicate record invalidates the whole worker result; no prefix
+            # of the worker's geometry may become selectable.
+            staged_regions: mutable PreviewRegion[MAX_PREVIEW_REGIONS] = zeroed
+            staged_count: mutable usize = 0
+            line_start: mutable i64 = 0
+            while line_start < bytes.len:
+                line_end: mutable i64 = line_start
+                while line_end < bytes.len and bytes[line_end] != 10:
+                    line_end <- line_end + 1
+                line_length: mutable i64 = line_end - line_start
+                if line_length > 0 and bytes[line_start + line_length - 1] == 13:
+                    line_length <- line_length - 1
+                line: sview = bytes_view_range(output, line_start.usize(), line_length.usize())
+                offset: mutable i64 = 0
+                while offset < line.len and (line[offset] == 32 or line[offset] == 9):
+                    offset <- offset + 1
+                marker_found: mutable bool = false
+                marker_search: mutable i64 = offset
+                while marker_search + 11 <= line.len:
+                    if geometry_marker_at(line, marker_search):
+                        return false if marker_search != offset
+                        marker_found <- true
+                        break
+                    marker_search <- marker_search + 1
+                if marker_found:
+                    offset <- offset + 11
+                    record_revision: mutable i64 = 0
+                    record_signature: mutable i64 = 0
+                    x: mutable i64 = 0
+                    y: mutable i64 = 0
+                    width: mutable i64 = 0
+                    height: mutable i64 = 0
+                    visible: mutable i64 = 0
+                    selectable: mutable i64 = 0
+                    id_storage: mutable u8[24] = zeroed
+                    id_length: mutable i64 = 0
+                    if not next_geometry_number(line, &offset, &record_revision):
+                        return false
+                    if not next_geometry_number(line, &offset, &record_signature):
+                        return false
+                    if not next_geometry_id(line, &offset, &id_storage, &id_length):
+                        return false
+                    if not next_geometry_number(line, &offset, &x) or not next_geometry_number(line, &offset, &y):
+                        return false
+                    if not next_geometry_number(line, &offset, &width) or not next_geometry_number(line, &offset, &height):
+                        return false
+                    if not next_geometry_number(line, &offset, &visible) or visible > 1:
+                        return false
+                    if not next_geometry_number(line, &offset, &selectable) or selectable > 1:
+                        return false
+                    while offset < line.len and (line[offset] == 32 or line[offset] == 9):
+                        offset <- offset + 1
+                    if offset != line.len or record_revision.u64() != revision or record_signature != signature or width == 0 or height == 0:
+                        return false
+                    return false if staged_count >= MAX_PREVIEW_REGIONS
+                    id_word0: mutable u64 = 0
+                    id_word1: mutable u64 = 0
+                    id_word2: mutable u64 = 0
+                    for byte_index in 0..<id_length:
+                        if byte_index < 8:
+                            id_word0 <- id_word0 | (id_storage[byte_index.usize()].u64() << (byte_index * 8))
+                        elif byte_index < 16:
+                            id_word1 <- id_word1 | (id_storage[byte_index.usize()].u64() << ((byte_index - 8) * 8))
+                        else:
+                            id_word2 <- id_word2 | (id_storage[byte_index.usize()].u64() << ((byte_index - 16) * 8))
+                    for existing_index in 0..<staged_count:
+                        existing: PreviewRegion = staged_regions[existing_index]
+                        if existing.id_length == id_length.i32() and existing.id_word0 == id_word0 and existing.id_word1 == id_word1 and existing.id_word2 == id_word2:
+                            return false
+                    region: mutable PreviewRegion& = &staged_regions[staged_count]
+                    region.id_word0 <- id_word0
+                    region.id_word1 <- id_word1
+                    region.id_word2 <- id_word2
+                    region.id_length <- id_length.i32()
+                    region.x_q10 <- x
+                    region.y_q10 <- y
+                    region.width_q10 <- width
+                    region.height_q10 <- height
+                    region.visible <- visible == 1
+                    region.selectable <- selectable == 1
+                    staged_count <- staged_count + 1
+                line_start <- line_end + 1
+            if staged_count == 0:
+                return false
+            for region_index in 0..<staged_count:
+                shell.preview_regions[region_index] <- staged_regions[region_index]
+            shell.preview_region_count <- staged_count
+            shell.preview_form_width <- form_width
+            shell.preview_form_height <- form_height
+            shell.preview_geometry_revision <- revision
+            shell.preview_geometry_signature <- signature
+            return true
+
+        def snapshot_dimensions(snapshot: darray[u8]&, width: mutable f32&, height: mutable f32&) -> bool:
+            return false if snapshot.count < 28
+            width_q10: u32 = read_u32(snapshot, 16)
+            height_q10: u32 = read_u32(snapshot, 20)
+            return false if width_q10 == 0 or height_q10 == 0
+            width <- width_q10.f32() / 1024.0
+            height <- height_q10.f32() / 1024.0
+            return true
+
+        def decode_completed_frame(shell: mutable Shell&) -> bool can[Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast, Ui.Draw]:
             width: mutable usize = 0
             height: mutable usize = 0
             row_stride: mutable usize = 0
-            decoded: i64 = shell_preview_decode_png(PREVIEW_FRAME_PATH, &preview_pixels[0], PREVIEW_PIXEL_CAPACITY, &width, &height, &row_stride)
+            decoded: i64 = shell_preview_decode_png(frame_path(shell), &preview_pixels[0], PREVIEW_PIXEL_CAPACITY, &width, &height, &row_stride)
             if decoded != 1 or width == 0 or height == 0 or row_stride < width * 4:
                 return false
             if not UiResources::resource_is_valid(shell.preview_resource):
                 return false
-            if UiResources::state(shell.preview_resource) == UiResources::State.Requested:
+            resource_state: UiResources::State = UiResources::state(shell.preview_resource)
+            if resource_state == UiResources::State.Requested:
+                if not UiResources::set_intrinsic_size(shell.preview_resource, width.f32(), height.f32()):
+                    return false
                 return false if not UiResources::set_state(shell.preview_resource, UiResources::State.Ready)
+            elif resource_state == UiResources::State.Ready:
+                intrinsic: UiCore::Size = UiResources::intrinsic_size(shell.preview_resource)
+                return false if intrinsic.width != width.f32() or intrinsic.height != height.f32()
+            else:
+                return false
             shell.preview_width <- width
             shell.preview_height <- height
             shell.preview_row_stride <- row_stride
             shell.preview_image <- UiCore::image_ref(shell.preview_resource.slot, shell.preview_resource.generation)
+            native_image: mutable usize = 0
+            if not PreviewImageBackend::bind_rgba32(shell.preview_resource, shell.preview_image, &preview_pixels[0], row_stride * height, width, height, row_stride, &native_image):
+                return false
+            previous_native_image: usize = shell.preview_native_image
+            shell.preview_native_image <- native_image
+            PreviewImageBackend::release(previous_native_image) if previous_native_image != 0
             UiHandles::set_image(shell.preview_canvas, shell.preview_image)
             shell.preview_ready <- true
             return true
 
-        def finish_worker(shell: mutable Shell&) -> void can[Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast]:
+        def finish_worker(shell: mutable Shell&) -> void can[Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast, Ui.Draw]:
             stdout: mutable darray[u8] = []
             stderr: mutable darray[u8] = []
-            status: PosixProcess::Status = PosixProcess::status(&preview_process)
-            _ = PosixProcess::read_stdout(&preview_process, &stdout, 1048576)
-            _ = PosixProcess::read_stderr(&preview_process, &stderr, 1048576)
-            PosixProcess::dispose(&preview_process)
+            process: mutable PosixProcess::Process = preview_process
+            status: PosixProcess::Status = PosixProcess::status(&process)
+            _ = PosixProcess::read_stdout(&process, &stdout, 1048576)
+            _ = PosixProcess::read_stderr(&process, &stderr, 1048576)
+            PosixProcess::dispose(&process)
+            preview_process <- process
             shell.preview_pending <- false
             if not status.finished or status.exit_code != 0 or status.stdout_truncated:
+                cleanup_paths(shell)
+                invalidate_geometry(shell)
                 shell.preview_revision <- 0
+                shell.preview_signature <- 0
                 if stderr.count > 0:
                     UiHandles::set_help(shell.preview_status, ShellBytes::view_of(&stderr))
                 set_message(shell, "Preview worker failed; edit the form or retry to render again")
                 return
-            if not decode_completed_frame(shell):
+            if not verify_frame_identity(shell, stdout):
+                cleanup_paths(shell)
+                invalidate_geometry(shell)
                 shell.preview_revision <- 0
-                set_message(shell, "Preview frame could not be decoded or uploaded")
+                shell.preview_signature <- 0
+                set_message(shell, "Preview frame identity did not match this request; the previous frame is retained")
                 return
+            if not accept_geometry_output(shell, stdout, shell.preview_revision, shell.preview_signature, shell.preview_form_width, shell.preview_form_height):
+                cleanup_paths(shell)
+                shell.preview_revision <- 0
+                shell.preview_signature <- 0
+                set_message(shell, "Preview result was rejected; the previous frame is retained")
+                return
+            if not decode_completed_frame(shell):
+                cleanup_paths(shell)
+                invalidate_geometry(shell)
+                shell.preview_revision <- 0
+                shell.preview_signature <- 0
+                set_message(shell, "Preview frame could not be decoded or uploaded; the previous frame is retained")
+                return
+            cleanup_paths(shell)
             set_message(shell, "Preview ready")
 
     public:
+        def accept_geometry_output(shell: mutable Shell&, output: darray[u8]&, revision: u64, signature: i64, form_width: f32, form_height: f32) -> bool:
+            return parse_geometry_output(shell, output, revision, signature, form_width, form_height)
+
+        def accept_frame_identity_output(output: darray[u8]&, revision: u64, signature: i64, length: usize, hash_high: u32, hash_low: u32) -> bool:
+            return parse_frame_identity_output(output, revision, signature, length, hash_high, hash_low)
+
         def initialize(shell: mutable Shell&) -> void:
             shell.preview_resource <- UiResources::request("elisa-ide-preview-frame", PREVIEW_RESOURCE_OWNER)
             if not UiResources::resource_is_valid(shell.preview_resource):
@@ -86,48 +400,214 @@ module ShellPreview:
             UiHandles::set_image(shell.preview_canvas, shell.preview_image)
             set_message(shell, "Waiting for form preview")
 
+        def select_at(shell: mutable Shell&, process: mutable PosixProcess::Process&, at: UiCore::Vec2) -> bool can[Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast]:
+            return false if not shell.host_running or not shell.preview_ready
+            return false if shell.preview_region_count == 0 or shell.preview_geometry_revision != shell.preview_revision or shell.preview_geometry_signature != shell.preview_signature
+            return false if shell.preview_form_width <= 0.0 or shell.preview_form_height <= 0.0
+            if UiHandles::widget(shell.preview_canvas) is canvas:
+                return false if canvas.width <= 0.0 or canvas.height <= 0.0
+                scale_x: f32 = canvas.width / shell.preview_form_width
+                scale_y: f32 = canvas.height / shell.preview_form_height
+                scale: f32 = scale_x if scale_x < scale_y else scale_y
+                return false if scale <= 0.0
+                drawn_width: f32 = shell.preview_form_width * scale
+                drawn_height: f32 = shell.preview_form_height * scale
+                left: f32 = canvas.x + (canvas.width - drawn_width) * 0.5
+                top: f32 = canvas.y + (canvas.height - drawn_height) * 0.5
+                return false if at.x < left or at.y < top or at.x >= left + drawn_width or at.y >= top + drawn_height
+                form_x: f32 = (at.x - left) / scale
+                form_y: f32 = (at.y - top) / scale
+                return false if form_x < 0.0 or form_y < 0.0 or form_x >= shell.preview_form_width or form_y >= shell.preview_form_height
+                x_q10: i64 = (form_x.f64() * 1024.0).i64()
+                y_q10: i64 = (form_y.f64() * 1024.0).i64()
+                index: mutable i64 = shell.preview_region_count.i64() - 1
+                while index >= 0:
+                    region: PreviewRegion = shell.preview_regions[index.usize()]
+                    if region.visible and region.selectable and x_q10 >= region.x_q10 and y_q10 >= region.y_q10 and x_q10 < region.x_q10 + region.width_q10 and y_q10 < region.y_q10 + region.height_q10:
+                        id_bytes: mutable u8[24] = zeroed
+                        for byte_index in 0..<region.id_length.i64():
+                            if byte_index < 8:
+                                id_bytes[byte_index.usize()] <- ((region.id_word0 >> (byte_index * 8)) & 255).u8()
+                            elif byte_index < 16:
+                                id_bytes[byte_index.usize()] <- ((region.id_word1 >> ((byte_index - 8) * 8)) & 255).u8()
+                            else:
+                                id_bytes[byte_index.usize()] <- ((region.id_word2 >> ((byte_index - 16) * 8)) & 255).u8()
+                        id: sview = UiText::fixed_bytes_view_range[24](id_bytes, 0, region.id_length.usize())
+                        return HostClient::request_text(process, 81, 0, 0, id).result == 1
+                    index <- index - 1
+            return false
+
+        # Select every visible/selectable preview region intersecting a canvas
+        # marquee. The first match replaces the selection; later matches use
+        # the existing toggle protocol so the host remains the authority for
+        # stable-ID selection and topmost-root reduction.
+        def select_rect(shell: mutable Shell&, process: mutable PosixProcess::Process&, start: UiCore::Vec2, finish: UiCore::Vec2) -> bool can[Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast]:
+            return false if not shell.host_running or not shell.preview_ready
+            return false if shell.preview_region_count == 0 or shell.preview_geometry_revision != shell.preview_revision or shell.preview_geometry_signature != shell.preview_signature
+            return false if shell.preview_form_width <= 0.0 or shell.preview_form_height <= 0.0
+            if UiHandles::widget(shell.preview_canvas) is canvas:
+                return false if canvas.width <= 0.0 or canvas.height <= 0.0
+                scale_x: f32 = canvas.width / shell.preview_form_width
+                scale_y: f32 = canvas.height / shell.preview_form_height
+                scale: f32 = scale_x if scale_x < scale_y else scale_y
+                return false if scale <= 0.0
+                drawn_width: f32 = shell.preview_form_width * scale
+                drawn_height: f32 = shell.preview_form_height * scale
+                left: f32 = canvas.x + (canvas.width - drawn_width) * 0.5
+                top: f32 = canvas.y + (canvas.height - drawn_height) * 0.5
+                x0: f32 = start.x if start.x < finish.x else finish.x
+                x1: f32 = finish.x if finish.x > start.x else start.x
+                y0: f32 = start.y if start.y < finish.y else finish.y
+                y1: f32 = finish.y if finish.y > start.y else start.y
+                form_x0: mutable f32 = (x0 - left) / scale
+                form_x1: mutable f32 = (x1 - left) / scale
+                form_y0: mutable f32 = (y0 - top) / scale
+                form_y1: mutable f32 = (y1 - top) / scale
+                form_x0 <- 0.0 if form_x0 < 0.0
+                form_y0 <- 0.0 if form_y0 < 0.0
+                form_x1 <- shell.preview_form_width if form_x1 > shell.preview_form_width
+                form_y1 <- shell.preview_form_height if form_y1 > shell.preview_form_height
+                return false if form_x1 <= 0.0 or form_y1 <= 0.0 or form_x0 >= shell.preview_form_width or form_y0 >= shell.preview_form_height or form_x1 <= form_x0 or form_y1 <= form_y0
+                x0_q10: i64 = (form_x0.f64() * 1024.0).i64()
+                x1_q10: i64 = (form_x1.f64() * 1024.0).i64()
+                y0_q10: i64 = (form_y0.f64() * 1024.0).i64()
+                y1_q10: i64 = (form_y1.f64() * 1024.0).i64()
+                selected: mutable bool = false
+                index: mutable i64 = 0
+                while index < shell.preview_region_count.i64():
+                    region: PreviewRegion = shell.preview_regions[index.usize()]
+                    if region.visible and region.selectable and region.x_q10 < x1_q10 and region.x_q10 + region.width_q10 > x0_q10 and region.y_q10 < y1_q10 and region.y_q10 + region.height_q10 > y0_q10:
+                        id_bytes: mutable u8[24] = zeroed
+                        for byte_index in 0..<region.id_length.i64():
+                            if byte_index < 8:
+                                id_bytes[byte_index.usize()] <- ((region.id_word0 >> (byte_index * 8)) & 255).u8()
+                            elif byte_index < 16:
+                                id_bytes[byte_index.usize()] <- ((region.id_word1 >> ((byte_index - 8) * 8)) & 255).u8()
+                            else:
+                                id_bytes[byte_index.usize()] <- ((region.id_word2 >> ((byte_index - 16) * 8)) & 255).u8()
+                        id: sview = UiText::fixed_bytes_view_range[24](id_bytes, 0, region.id_length.usize())
+                        opcode: i64 = 31 if not selected else 82
+                        if HostClient::request_text(process, opcode, 0, 0, id).result != 1:
+                            return false
+                        selected <- true
+                    index <- index + 1
+                return selected
+            return false
+
         def refresh(shell: mutable Shell&, process: mutable PosixProcess::Process&) -> void can[Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast]:
             return if not shell.host_running
-            snapshot: HostClient::HostReply = HostClient::request(process, 80, 0, 0)
+            if preview_worker_path_storage[0] == 0 and shell_preview_helper_path("preview_worker", &preview_worker_path_storage[0], PREVIEW_PATH_CAPACITY) != 0:
+                set_message(shell, "Preview worker is missing from this app bundle")
+                return
+            snapshot: mutable HostClient::HostReply = HostClient::request(process, 80, 0, 0)
             if snapshot.result != 1:
                 set_message(shell, "This form cannot be rendered in the live preview")
                 return
             revision: u64 = revision_of(snapshot.text)
-            return if revision == 0 or revision == shell.preview_revision
+            if revision == 0:
+                set_message(shell, "Make a form change to start the live preview")
+                return
+            signature: i64 = shell_preview_snapshot_signature(&snapshot.text[0], snapshot.text.count)
+            same_request: bool = revision == shell.preview_revision and signature == shell.preview_signature
+            matching_geometry: bool = shell.preview_geometry_revision == revision and shell.preview_geometry_signature == signature and shell.preview_region_count > 0
+            return if same_request and (shell.preview_pending or matching_geometry)
+            form_width: mutable f32 = 0.0
+            form_height: mutable f32 = 0.0
+            if not snapshot_dimensions(snapshot.text, &form_width, &form_height):
+                invalidate_geometry(shell)
+                set_message(shell, "Preview snapshot has invalid viewport dimensions")
+                return
+            invalidate_geometry(shell)
             if shell.preview_pending:
-                _ = PosixProcess::cancel(&preview_process)
-                PosixProcess::dispose(&preview_process)
+                previous_process: mutable PosixProcess::Process = preview_process
+                _ = PosixProcess::cancel(&previous_process)
+                PosixProcess::dispose(&previous_process)
+                preview_process <- previous_process
                 shell.preview_pending <- false
-            _ = PosixFile::remove(PREVIEW_INPUT_PATH)
-            _ = PosixFile::remove(PREVIEW_FRAME_PATH)
-            written: i64 = PosixFile::write_bytes_plain(PREVIEW_INPUT_PATH, snapshot.text)
+                cleanup_paths(shell)
+            paths_created: i64 = shell_preview_paths_create(&shell.preview_input_path[0], PREVIEW_PATH_CAPACITY, &shell.preview_frame_path[0], PREVIEW_PATH_CAPACITY)
+            if paths_created != 0:
+                cleanup_paths(shell)
+                set_message(shell, "Preview worker paths could not be allocated")
+                return
+            input: cstr = input_path(shell)
+            frame: cstr = frame_path(shell)
+            written: i64 = PosixFile::write_bytes_plain(input, snapshot.text)
             if written != snapshot.text.count.i64():
+                cleanup_paths(shell)
                 set_message(shell, "Preview snapshot could not be written")
                 return
-            if shell_preview_setenv("ELISA_UI_PREVIEW_INPUT", PREVIEW_INPUT_PATH) != 0 or
-               shell_preview_setenv("ELISA_UI_SNAPSHOT", PREVIEW_FRAME_PATH) != 0 or
-               shell_preview_setenv("ELISA_UI_SMOKE_FRAMES", "1") != 0:
+            input_env: i64 = shell_preview_setenv("ELISA_UI_PREVIEW_INPUT", input)
+            if input_env != 0:
+                cleanup_paths(shell)
+                set_message(shell, "Preview worker environment could not be configured")
+                return
+            snapshot_env: i64 = shell_preview_setenv("ELISA_UI_SNAPSHOT", frame)
+            if snapshot_env != 0:
+                cleanup_paths(shell)
+                set_message(shell, "Preview worker environment could not be configured")
+                return
+            smoke_env: i64 = shell_preview_setenv("ELISA_UI_SMOKE_FRAMES", "1")
+            if smoke_env != 0:
+                cleanup_paths(shell)
                 set_message(shell, "Preview worker environment could not be configured")
                 return
             arguments: mutable darray[cstr] = []
-            arguments.push(PREVIEW_WORKER_PATH)
+            arguments.push(worker_path())
             preview_process <- PosixProcess::start(&arguments)
-            if not PosixProcess::valid(&preview_process):
+            started_process: PosixProcess::Process = preview_process
+            if not PosixProcess::valid(&started_process):
+                cleanup_paths(shell)
                 set_message(shell, "Preview worker could not be started")
                 return
             shell.preview_revision <- revision
+            shell.preview_signature <- signature
+            shell.preview_form_width <- form_width
+            shell.preview_form_height <- form_height
             shell.preview_pending <- true
-            set_message(shell, "Rendering form preview…")
+            if shell.preview_ready:
+                set_message(shell, "Rendering preview; previous frame is retained")
+            else:
+                set_message(shell, "Rendering form preview…")
 
-        def poll_and_bind(shell: mutable Shell&) -> void can[Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast]:
-            if shell.preview_pending and PosixProcess::poll(&preview_process, 0):
+        def retry(shell: mutable Shell&, process: mutable PosixProcess::Process&) -> void can[Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast]:
+            return if not shell.host_running
+            shell.preview_revision <- 0
+            shell.preview_signature <- 0
+            refresh(shell, process)
+
+        def poll_and_bind(shell: mutable Shell&) -> void can[Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast, Ui.Draw]:
+            # A completed child does not invalidate the canvas on its own.
+            # Keep a short frame timer armed while rendering so the next
+            # frame can reap it, consume its output, and publish the result.
+            if shell.preview_pending:
+                UiCore::request_frame_after(0.016)
+            if shell.preview_pending and worker_poll(0):
                 finish_worker(shell)
             return if not shell.preview_ready or not UiCore::image_ref_is_valid(shell.preview_image)
-            return if UiSdl3Draw::is_image_bound(shell.preview_image)
-            if not UiSdl3Draw::bind_image_rgba32(shell.preview_image, &preview_pixels[0], preview_row_stride * preview_height, preview_width, preview_height, preview_row_stride):
-                set_message(shell, "Preview frame is ready but could not be uploaded to SDL")
+            return if PreviewImageBackend::is_bound(shell.preview_resource, shell.preview_image, shell.preview_native_image)
+            native_image: mutable usize = 0
+            if not PreviewImageBackend::bind_rgba32(shell.preview_resource, shell.preview_image, &preview_pixels[0], shell.preview_row_stride * shell.preview_height, shell.preview_width, shell.preview_height, shell.preview_row_stride, &native_image):
+                set_message(shell, "Preview frame is ready but could not be bound to the active renderer")
+                return
+            previous_native_image: usize = shell.preview_native_image
+            shell.preview_native_image <- native_image
+            PreviewImageBackend::release(previous_native_image) if previous_native_image != 0
 
-        def stop() -> void can[Blocking.IO, Memory.Release]:
-            if PosixProcess::valid(&preview_process):
-                _ = PosixProcess::cancel(&preview_process)
-                PosixProcess::dispose(&preview_process)
+        def stop(shell: mutable Shell&) -> void can[Blocking.IO, Memory.Release, Unsafe.PointerCast, Ui.Draw]:
+            process: mutable PosixProcess::Process = preview_process
+            if PosixProcess::valid(process):
+                _ = PosixProcess::cancel(&process)
+                PosixProcess::dispose(&process)
+                preview_process <- process
+            cleanup_paths(shell)
+            if UiResources::resource_is_valid(shell.preview_resource):
+                PreviewImageBackend::unbind(shell.preview_resource, shell.preview_image, shell.preview_native_image)
+                _ = UiResources::dispose(shell.preview_resource)
+            else:
+                # A host may have invalidated the logical resource before
+                # application shutdown; the shell still owns this native
+                # image and must release it even when there is no live key to
+                # unbind.
+                PreviewImageBackend::release(shell.preview_native_image) if shell.preview_native_image != 0
+            shell.preview_native_image <- 0

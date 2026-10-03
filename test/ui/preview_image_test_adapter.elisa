@@ -1,0 +1,21 @@
+# Headless preview image adapter used only by designer_shell_integration_test.
+# It validates the decoded pixel contract while leaving native texture/image
+# ownership to the live Skia product adapter.
+
+module PreviewImageBackend:
+    public:
+        def is_bound(resource: UiResources::ResourceHandle, image: UiCore::ImageRef, native_image: usize) -> bool:
+            return native_image == 1 and UiCore::image_ref_is_valid(image)
+
+        def bind_rgba32(resource: UiResources::ResourceHandle, image: UiCore::ImageRef, pixels: u8&?, byte_length: usize, width: usize, height: usize, row_stride: usize, native_image: mutable usize&) -> bool can[Ui.Draw]:
+            native_image <- 0
+            return false if pixels == null or not UiCore::image_ref_is_valid(image)
+            return false if width == 0 or height == 0 or row_stride < width * 4 or byte_length < row_stride * height
+            native_image <- 1
+            return true
+
+        def unbind(resource: UiResources::ResourceHandle, image: UiCore::ImageRef, native_image: usize) -> void can[Ui.Draw]:
+            return
+
+        def release(native_image: usize) -> void:
+            return

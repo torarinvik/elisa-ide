@@ -92,7 +92,17 @@ module PreviewForm:
                 return PreviewWire::Component.Label
             if DesignText::equal(type_key, "elisa.ui.button"):
                 return PreviewWire::Component.Button
-            return PreviewWire::Component.TextField
+            if DesignText::equal(type_key, "elisa.ui.text_field"):
+                return PreviewWire::Component.TextField
+            if DesignText::equal(type_key, "elisa.ui.check_box"):
+                return PreviewWire::Component.CheckBox
+            if DesignText::equal(type_key, "elisa.ui.radio_button"):
+                return PreviewWire::Component.RadioButton
+            if DesignText::equal(type_key, "elisa.ui.slider"):
+                return PreviewWire::Component.Slider
+            if DesignText::equal(type_key, "elisa.ui.progress_bar"):
+                return PreviewWire::Component.ProgressBar
+            return PreviewWire::Component.Scroll
 
         def enum_cross(value: sview) -> u8:
             return 0 if DesignText::equal(value, "start")
@@ -143,11 +153,14 @@ module PreviewForm:
             flags <- flags | 1 if effective_bool(form, registry, node, component, "visible", true) and not node.runtime_hidden
             flags <- flags | 2 if effective_bool(form, registry, node, component, "enabled", true)
             flags <- flags | 4 if effective_bool(form, registry, node, component, "secure", false)
+            flags <- flags | 8 if effective_bool(form, registry, node, component, "selected", false)
             push_u16(out, flags)
 
             axis: mutable u8 = 1 if kind == PreviewWire::Component.Column else 0
             axis <- 0 if kind == PreviewWire::Component.Row
             axis <- 0 if kind == PreviewWire::Component.Panel and DesignText::equal(effective_text(form, registry, node, component, "axis"), "row")
+            axis <- 0 if kind == PreviewWire::Component.Scroll and DesignText::equal(effective_text(form, registry, node, component, "axis"), "row")
+            axis <- 1 if kind == PreviewWire::Component.Scroll and DesignText::equal(effective_text(form, registry, node, component, "axis"), "column")
             cross: u8 = enum_cross(effective_text(form, registry, node, component, "crossAlignment"))
             main: u8 = enum_main(effective_text(form, registry, node, component, "mainAlignment"))
             push_u8(out, axis)
@@ -160,7 +173,8 @@ module PreviewForm:
                 out.push(id_text[index])
                 index <- index + 1
 
-            push_u32(out, q10(effective_number(form, registry, node, component, "padding"), 100000.0))
+            range_value: f64 = effective_number(form, registry, node, component, "value") if kind == PreviewWire::Component.Slider or kind == PreviewWire::Component.ProgressBar else effective_number(form, registry, node, component, "padding")
+            push_u32(out, q10(range_value, 100000.0))
             push_u32(out, q10(effective_number(form, registry, node, component, "spacing"), 100000.0))
             push_u32(out, q10(effective_number(form, registry, node, component, "grow"), 1000.0))
             push_u32(out, q10(effective_number(form, registry, node, component, "minimumWidth"), 100000.0))
@@ -176,12 +190,19 @@ module PreviewForm:
             background: mutable DesignValues::ColorValue = effective_color(form, registry, node, component, "background", background_default)
             background <- effective_color(form, registry, node, component, "color", background) if kind == PreviewWire::Component.Button
             background <- effective_color(form, registry, node, component, "fill", fill_default) if kind == PreviewWire::Component.TextField
+            background <- effective_color(form, registry, node, component, "color", background) if kind == PreviewWire::Component.CheckBox or kind == PreviewWire::Component.RadioButton
+            background <- effective_color(form, registry, node, component, "trackColor", background) if kind == PreviewWire::Component.Slider or kind == PreviewWire::Component.ProgressBar
+            background <- effective_color(form, registry, node, component, "background", background) if kind == PreviewWire::Component.Scroll
             foreground: mutable DesignValues::ColorValue = effective_color(form, registry, node, component, "color", foreground_default)
             foreground <- effective_color(form, registry, node, component, "textColor", foreground) if kind == PreviewWire::Component.Button
             foreground <- effective_color(form, registry, node, component, "ink", foreground) if kind == PreviewWire::Component.TextField
-            hover: DesignValues::ColorValue = effective_color(form, registry, node, component, "hoverColor", hover_default)
-            press: DesignValues::ColorValue = effective_color(form, registry, node, component, "pressColor", press_default)
+            foreground <- effective_color(form, registry, node, component, "textColor", foreground) if kind == PreviewWire::Component.CheckBox or kind == PreviewWire::Component.RadioButton
+            foreground <- effective_color(form, registry, node, component, "textColor", foreground) if kind == PreviewWire::Component.Slider or kind == PreviewWire::Component.ProgressBar
+            hover: mutable DesignValues::ColorValue = effective_color(form, registry, node, component, "hoverColor", hover_default)
+            press: mutable DesignValues::ColorValue = effective_color(form, registry, node, component, "pressColor", press_default)
             fill: DesignValues::ColorValue = effective_color(form, registry, node, component, "fill", fill_default)
+            hover <- effective_color(form, registry, node, component, "fillColor", hover) if kind == PreviewWire::Component.Slider or kind == PreviewWire::Component.ProgressBar
+            press <- effective_color(form, registry, node, component, "thumbColor", press) if kind == PreviewWire::Component.Slider
             push_color(out, background)
             push_color(out, foreground)
             push_color(out, hover)

@@ -1,0 +1,388 @@
+# Focused retained-shell inspector test. This covers editing component metadata
+# through the live shell widgets and document host without starting the preview
+# worker, so source/property editing remains independently diagnosable.
+
+include "shell_test_platform.elisa"
+include "preview_image_test_adapter.elisa"
+include "../../framework/src/test/ui_harness.elisa"
+include "../../src/shell/shell_app.elisa"
+
+global mutable shell_inspector_failure: i64 = 0
+const SHELL_INSPECTOR_SOURCE_PATH: cstr = "build/shell-inspector-source.elisa"
+
+@link_name("designer_report_i64")
+extern shell_inspector_report_i64(label: cstr, value: i64) -> void
+@link_name("designer_report_text")
+extern shell_inspector_report_text(text: cstr) -> void
+
+def shell_inspector_same(left: sview, right: sview) -> bool:
+    return false if left.len != right.len
+    index: mutable i64 = 0
+    while index < left.len:
+        return false if left[index] != right[index]
+        index <- index + 1
+    return true
+
+def shell_inspector_contains(text: sview, needle: sview) -> bool:
+    return false if needle.len == 0 or text.len < needle.len
+    start: mutable i64 = 0
+    while start + needle.len <= text.len:
+        matched: mutable bool = true
+        offset: mutable i64 = 0
+        while offset < needle.len:
+            if text[start + offset] != needle[offset]:
+                matched <- false
+                break
+            offset <- offset + 1
+        if matched:
+            return true
+        start <- start + 1
+    return false
+
+def shell_inspector_index_of(text: sview, needle: sview) -> i64:
+    return -1 if needle.len == 0 or text.len < needle.len
+    start: mutable i64 = 0
+    while start + needle.len <= text.len:
+        matched: mutable bool = true
+        offset: mutable i64 = 0
+        while offset < needle.len:
+            if text[start + offset] != needle[offset]:
+                matched <- false
+                break
+            offset <- offset + 1
+        if matched:
+            return start
+        start <- start + 1
+    return -1
+
+def shell_inspector_expect(condition: bool, code: i64) -> void:
+    if not condition and shell_inspector_failure == 0:
+        shell_inspector_failure <- code
+
+def shell_inspector_enter(row: i64, text: sview) -> bool:
+    return false if row < 0 or row >= shell.inspector_count.i64()
+    editor: UiHandles::Handle = shell.inspector_editors[row.usize()]
+    return false if not UiHandles::request_focus(editor)
+    current: sview = UiHandles::text_value(editor)
+    UiHandles::set_selection_utf16(editor, 0, current.len.usize())
+    app_text_input(text)
+    app_widget_event(editor.widget_id.usize(), UiConst::WidgetEvent.Change.i32())
+    return commit_pending_inspector_edits(shell, host_process)
+
+def app_init() -> void:
+    register_shortcuts()
+    build_shell(shell)
+
+def app_widget_event(widget: usize, event: i32) -> void:
+    widget_event(shell, widget, event)
+
+def app_event(event: UiCore::Event) -> void:
+    handle_shell_event(shell, event)
+
+def app_text_input(text: sview) -> void:
+    UiHandles::insert_text(text)
+
+def app_text_editing(text: sview, selected_start: i32, selected_length: i32) -> void:
+    UiHandles::update_marked_text_utf8_characters(text, selected_start, selected_length)
+
+def app_frame() -> void can[Ui.Draw]:
+    UiCore::clear(shell_color(12, 14, 20))
+    UiHandles::layout(UiCore::viewport_width(), UiCore::viewport_height())
+    UiHandles::paint()
+
+def main() -> i64:
+    UiHarness::start(1180.0, 760.0)
+    UiHarness::focus_gained()
+    if UiFlat::overflowed() or not UiHandles::is_valid(shell.status_line):
+        shell_inspector_failure <- 44
+        shell_inspector_report_i64("shell-inspector assertion failure=", shell_inspector_failure)
+        return shell_inspector_failure
+    shell_inspector_expect(shell.inspector_count == 16, 1)
+
+    start_host(shell)
+    shell_inspector_expect(shell.host_running, 2)
+    opened: HostClient::HostReply = HostClient::request_text(host_process, 11, 0, 0, "test/fixtures/settings-form.elisaform.json")
+    selected: HostClient::HostReply = HostClient::request_text(host_process, 81, 0, 0, "node-reset")
+    shell.projection.inspector_count <- HostClient::request(host_process, 22, 0, 0).result
+    refresh_inspector(shell, host_process)
+    UiHandles::layout(UiCore::viewport_width(), UiCore::viewport_height())
+
+    display_row: i64 = shell.projection.inspector_count - 2
+    symbol_row: i64 = shell.projection.inspector_count - 1
+    display_label: HostClient::HostReply = HostClient::request(host_process, 52, display_row, 0)
+    display_value: HostClient::HostReply = HostClient::request(host_process, 53, display_row, 0)
+    symbol_label: HostClient::HostReply = HostClient::request(host_process, 52, symbol_row, 0)
+    symbol_value: HostClient::HostReply = HostClient::request(host_process, 53, symbol_row, 0)
+    shell_inspector_expect(opened.result == 1 and selected.result == 1, 3)
+    shell_inspector_expect(shell.projection.inspector_count == 14
+        and shell.inspector_tags[display_row.usize()] == 7
+        and shell.inspector_tags[symbol_row.usize()] == 7, 4)
+    shell_inspector_expect(shell_inspector_same(ShellBytes::view_of(&display_label.text), "Display name")
+        and shell_inspector_same(ShellBytes::view_of(&display_value.text), "Reset")
+        and shell_inspector_same(ShellBytes::view_of(&symbol_label.text), "Generated symbol")
+        and shell_inspector_same(ShellBytes::view_of(&symbol_value.text), "reset_button"), 5)
+
+    renamed_display: bool = shell_inspector_enter(display_row, "Apply settings")
+    refresh_inspector(shell, host_process)
+    renamed_symbol: bool = shell_inspector_enter(symbol_row, "apply_settings")
+    refresh_inspector(shell, host_process)
+    generated: HostClient::HostReply = HostClient::request(host_process, 106, 0, 0)
+    shell_inspector_expect(renamed_display and renamed_symbol
+        and shell_inspector_same(UiHandles::text_value(shell.inspector_editors[display_row.usize()]), "Apply settings")
+        and shell_inspector_same(UiHandles::text_value(shell.inspector_editors[symbol_row.usize()]), "apply_settings")
+        and shell_inspector_contains(ShellBytes::view_of(&generated.text), "def widget_apply_settings()"), 6)
+
+    shell.source_mode <- true
+    apply_shell_layout(shell)
+    UiHandles::layout(UiCore::viewport_width(), UiCore::viewport_height())
+    refresh_source_view(shell, host_process)
+    generated_button_offset: mutable i64 = -1
+    generated_owner_row: mutable i32 = -1
+    generated_scan: mutable i32 = 0
+    while generated_scan < shell.source_line_count:
+        generated_line: sview = UiHandles::text_value(shell.source_line_rows[generated_scan.usize()])
+        generated_token: i64 = shell_inspector_index_of(generated_line, "UiHandles::column")
+        if generated_token >= 0:
+            generated_prefix: darray[u8] = source_line_prefix(generated_scan.i64() + 1)
+            generated_button_offset <- shell.source_line_offsets[generated_scan.usize()] + generated_token - generated_prefix.count.i64()
+            generated_owner_row <- generated_scan
+            break
+        generated_scan <- generated_scan + 1
+    shell_inspector_expect(generated_button_offset >= 0, 9)
+    shell_inspector_expect(generated_owner_row >= 0, 10)
+    generated_pointer_selected: mutable bool = false
+    generated_previous_type: HostClient::HostReply = HostClient::request(host_process, 55, 0, 0)
+    if generated_owner_row >= 0 and UiHandles::widget(shell.source_line_rows[generated_owner_row.usize()]) is generated_widget:
+        generated_x: f32 = generated_widget.x + generated_widget.width * 0.5
+        generated_y: f32 = generated_widget.y + generated_widget.height * 0.5
+        UiHarness::dispatch(UiCore::PointerEvent.Down(at: UiCore::Vec2(generated_x, generated_y), button: UiCore::PointerButton.Primary.i32()))
+        UiHarness::dispatch(UiCore::PointerEvent.Up(at: UiCore::Vec2(generated_x, generated_y), button: UiCore::PointerButton.Primary.i32()))
+        selected_generated_owner: HostClient::HostReply = HostClient::request(host_process, 54, 0, 0)
+        generated_pointer_selected <- selected_generated_owner.result == 1 and not shell_inspector_same(ShellBytes::view_of(&selected_generated_owner.text), ShellBytes::view_of(&generated_previous_type.text))
+    shell_inspector_expect(generated_pointer_selected, 11)
+    shell.source_mode <- false
+    apply_shell_layout(shell)
+    UiHandles::layout(UiCore::viewport_width(), UiCore::viewport_height())
+
+    source_fixture: mutable darray[u8] = []
+    source_fixture_length: mutable usize = PosixFile::read_bytes(&source_fixture, "test/fixtures/source_view.elisa", 1048576)
+    source_page_fill: mutable i32 = 0
+    while source_page_fill < 40:
+        append_panel_text(&source_fixture, "    # additional source paging fixture line\n")
+        source_page_fill <- source_page_fill + 1
+    source_fixture_length <- source_fixture.count
+    _ = PosixFile::remove(SHELL_INSPECTOR_SOURCE_PATH)
+    source_copy_length: i64 = PosixFile::write_plain(SHELL_INSPECTOR_SOURCE_PATH, ShellBytes::view_of(&source_fixture))
+    source_opened: HostClient::HostReply = HostClient::request_text(host_process, 112, 0, 0, "build/shell-inspector-source.elisa")
+    shell.source_mode <- true
+    apply_shell_layout(shell)
+    UiHandles::layout(UiCore::viewport_width(), UiCore::viewport_height())
+    refresh_source_view(shell, host_process)
+    source_editor: UiHandles::Handle = shell.source_line_rows[0.usize()]
+    source_focused: bool = UiHandles::request_focus(source_editor)
+    UiHandles::replace_text(source_editor, "1: module source_view_edited:")
+    app_widget_event(source_editor.widget_id.usize(), UiConst::WidgetEvent.Change.i32())
+    source_projection: HostClient::HostReply = HostClient::request(host_process, 116, 0, 0)
+    shell_inspector_expect(source_fixture_length > 0
+        and source_copy_length == source_fixture_length.i64()
+        and source_opened.result == 1
+        and source_focused
+        and shell_inspector_same(ShellBytes::view_of(&source_projection.text), "module source_view_edited:")
+        and HostClient::request(host_process, 130, 0, 0).result == 1
+        and shell_inspector_same(UiFlat::widget(shell.source_title.widget_id.usize()).text, "Elisa source (modified)"), 7)
+    run_shell_command(shell, ShellCommand.SaveDocument.u32())
+    saved_source: mutable darray[u8] = []
+    saved_source_length: usize = PosixFile::read_bytes(&saved_source, SHELL_INSPECTOR_SOURCE_PATH, 1048576)
+    shell_inspector_expect(saved_source_length > 0
+        and shell_inspector_contains(ShellBytes::view_of(&saved_source), "module source_view_edited:")
+        and HostClient::request(host_process, 130, 0, 0).result == 0
+        and shell_inspector_same(UiFlat::widget(shell.source_title.widget_id.usize()).text, "Elisa source"), 8)
+    _ = UiHandles::request_focus(source_editor)
+    UiHandles::set_selection_utf16(source_editor, 10, 0)
+    app_event(UiCore::KeyEvent.Down(UiCore::Key.Enter))
+    split_first_line: HostClient::HostReply = HostClient::request(host_process, 116, 0, 0)
+    split_second_line: HostClient::HostReply = HostClient::request(host_process, 116, 1, 0)
+    shell_inspector_expect(HostClient::request(host_process, 115, 0, 0).result == 76
+        and shell_inspector_same(ShellBytes::view_of(&split_first_line.text), "module ")
+        and shell_inspector_same(ShellBytes::view_of(&split_second_line.text), "source_view_edited:")
+        and UiHandles::is_focused(shell.source_line_rows[1.usize()])
+        and UiFlat::selection_start(shell.source_line_rows[1.usize()].widget_id.usize()) == 3
+        and HostClient::request(host_process, 130, 0, 0).result == 1, 19)
+    app_event(UiCore::KeyEvent.Down(UiCore::Key.Backspace))
+    merged_line: HostClient::HostReply = HostClient::request(host_process, 116, 0, 0)
+    shell_inspector_expect(HostClient::request(host_process, 115, 0, 0).result == 75
+        and shell_inspector_same(ShellBytes::view_of(&merged_line.text), "module source_view_edited:")
+        and UiHandles::is_focused(shell.source_line_rows[0.usize()])
+        and UiFlat::selection_start(shell.source_line_rows[0.usize()].widget_id.usize()) == 10, 20)
+    app_event(UiCore::KeyEvent.Down(UiCore::Key.Enter))
+    shell_inspector_expect(UiHandles::is_enabled(shell.undo_button)
+        and not UiHandles::is_enabled(shell.redo_button)
+        and HostClient::request(host_process, 115, 0, 0).result == 76, 21)
+    run_shell_command(shell, ShellCommand.Undo.u32())
+    source_undo_line: HostClient::HostReply = HostClient::request(host_process, 116, 0, 0)
+    shell_inspector_expect(HostClient::request(host_process, 115, 0, 0).result == 75
+        and shell_inspector_same(ShellBytes::view_of(&source_undo_line.text), "module source_view_edited:")
+        and UiHandles::is_enabled(shell.redo_button), 22)
+    run_shell_command(shell, ShellCommand.Redo.u32())
+    source_redo_line: HostClient::HostReply = HostClient::request(host_process, 116, 1, 0)
+    shell_inspector_expect(HostClient::request(host_process, 115, 0, 0).result == 76
+        and shell_inspector_same(ShellBytes::view_of(&source_redo_line.text), "source_view_edited:")
+        and not UiHandles::is_enabled(shell.redo_button), 23)
+    app_event(UiCore::KeyEvent.Down(UiCore::Key.Tab))
+    indented_source_line: HostClient::HostReply = HostClient::request(host_process, 116, 1, 0)
+    shell_inspector_expect(shell_inspector_same(ShellBytes::view_of(&indented_source_line.text), "    source_view_edited:")
+        and UiHandles::is_enabled(shell.undo_button), 24)
+    outdent_handled: bool = indent_source_line(shell, true)
+    outdented_source_line: HostClient::HostReply = HostClient::request(host_process, 116, 1, 0)
+    shell_inspector_expect(outdent_handled
+        and shell_inspector_same(ShellBytes::view_of(&outdented_source_line.text), "source_view_edited:"), 25)
+    run_shell_command(shell, ShellCommand.Undo.u32())
+    indented_undo_line: HostClient::HostReply = HostClient::request(host_process, 116, 1, 0)
+    shell_inspector_expect(shell_inspector_same(ShellBytes::view_of(&indented_undo_line.text), "    source_view_edited:"), 26)
+    run_shell_command(shell, ShellCommand.Redo.u32())
+    app_event(UiCore::KeyEvent.Down(UiCore::Key.Down))
+    shell_inspector_expect(UiHandles::is_focused(shell.source_line_rows[2.usize()])
+        and shell.source_selected_line == 3, 12)
+    app_event(UiCore::KeyEvent.Down(UiCore::Key.Up))
+    shell_inspector_expect(UiHandles::is_focused(shell.source_line_rows[1.usize()])
+        and shell.source_selected_line == 2, 13)
+    vertical_step: mutable i32 = 0
+    while vertical_step < 30:
+        app_event(UiCore::KeyEvent.Down(UiCore::Key.Down))
+        vertical_step <- vertical_step + 1
+    shell_inspector_expect(UiHandles::is_focused(shell.source_line_rows[31.usize()])
+        and shell.source_selected_line == 32 and shell.source_page_start == 0, 14)
+    app_event(UiCore::KeyEvent.Down(UiCore::Key.PageDown))
+    shell_inspector_expect(UiHandles::is_focused(shell.source_line_rows[31.usize()])
+        and shell.source_selected_line == 64 and shell.source_page_start == 32, 17)
+    app_event(UiCore::KeyEvent.Down(UiCore::Key.PageUp))
+    shell_inspector_expect(UiHandles::is_focused(shell.source_line_rows[31.usize()])
+        and shell.source_selected_line == 32 and shell.source_page_start == 0, 18)
+    app_event(UiCore::KeyEvent.Down(UiCore::Key.Down))
+    shell_inspector_expect(UiHandles::is_focused(shell.source_line_rows[0.usize()])
+        and shell.source_selected_line == 33 and shell.source_page_start == 32, 15)
+    app_event(UiCore::KeyEvent.Down(UiCore::Key.Up))
+    shell_inspector_expect(UiHandles::is_focused(shell.source_line_rows[31.usize()])
+        and shell.source_selected_line == 32 and shell.source_page_start == 0, 16)
+    selected_source_row: UiHandles::Handle = shell.source_line_rows[31.usize()]
+    selected_source_value: sview = UiHandles::text_value(selected_source_row)
+    selected_source_prefix: darray[u8] = source_line_prefix(shell.source_line_offsets[31.usize()] + 1)
+    _ = UiHandles::request_focus(selected_source_row)
+    app_event(UiCore::KeyEvent.Down(UiCore::Key.LeftSuper))
+    app_event(UiCore::KeyEvent.Down(UiCore::Key.A))
+    app_event(UiCore::KeyEvent.Up(UiCore::Key.LeftSuper))
+    shell_inspector_expect(UiFlat::selection_start(selected_source_row.widget_id.usize()) == selected_source_prefix.count
+        and UiFlat::selection_end(selected_source_row.widget_id.usize()) == selected_source_value.len.usize(), 32)
+    UiHandles::replace_text(shell.source_goto_field, "33")
+    app_widget_event(shell.source_goto_field.widget_id.usize(), UiConst::WidgetEvent.Submit.i32())
+    goto_source_row: UiHandles::Handle = shell.source_line_rows[0.usize()]
+    goto_source_prefix: darray[u8] = source_line_prefix(33)
+    goto_row_visible: mutable bool = false
+    if UiHandles::widget(shell.source_scroll) is goto_scroll and UiHandles::widget(goto_source_row) is goto_widget:
+        goto_row_visible <- goto_widget.y >= goto_scroll.y and goto_widget.y + goto_widget.height <= goto_scroll.y + goto_scroll.height
+    shell_inspector_expect(shell.source_page_start == 32
+        and shell.source_selected_line == 33
+        and UiHandles::is_focused(goto_source_row)
+        and UiFlat::selection_start(goto_source_row.widget_id.usize()) == goto_source_prefix.count
+        and goto_row_visible, 33)
+    find_query: sview = "source_view_edited"
+    UiHandles::replace_text(shell.source_find_field, find_query)
+    missing_find_start: i64 = HostClient::request(host_process, 118, 32, 0).result
+    missing_find: HostClient::HostReply = HostClient::request_text(host_process, 147, missing_find_start, 1, find_query)
+    shell_inspector_expect(missing_find.result < 0, 36)
+    app_widget_event(shell.source_find_field.widget_id.usize(), UiConst::WidgetEvent.Submit.i32())
+    found_source_row: UiHandles::Handle = shell.source_line_rows[1.usize()]
+    found_source_prefix: darray[u8] = source_line_prefix(2)
+    found_source_start: usize = UiFlat::selection_start(found_source_row.widget_id.usize())
+    found_source_end: usize = UiFlat::selection_end(found_source_row.widget_id.usize())
+    shell_inspector_expect(shell.source_selected_line == 2
+        and UiHandles::is_focused(found_source_row)
+        and found_source_start == found_source_prefix.count
+        and found_source_end - found_source_start == find_query.len.usize(), 34)
+    _ = UiHandles::request_focus(shell.source_find_next_button)
+    app_widget_event(shell.source_find_next_button.widget_id.usize(), UiConst::WidgetEvent.Click.i32())
+    shell_inspector_expect(shell.source_selected_line == 2
+        and UiFlat::selection_start(found_source_row.widget_id.usize()) == found_source_start, 35)
+    _ = UiHandles::request_focus(found_source_row)
+    app_event(UiCore::KeyEvent.Down(UiCore::Key.LeftSuper))
+    app_event(UiCore::KeyEvent.Down(UiCore::Key.F))
+    app_event(UiCore::KeyEvent.Up(UiCore::Key.LeftSuper))
+    shell_inspector_expect(UiHandles::is_focused(shell.source_find_field)
+        and UiFlat::selection_start(shell.source_find_field.widget_id.usize()) == 0
+        and UiFlat::selection_end(shell.source_find_field.widget_id.usize()) == UiFlat::text_utf16_length(shell.source_find_field.widget_id.usize()), 37)
+    UiHandles::replace_text(shell.source_replace_field, "source_replaced")
+    app_widget_event(shell.source_replace_next_button.widget_id.usize(), UiConst::WidgetEvent.Click.i32())
+    replaced_source_line: HostClient::HostReply = HostClient::request(host_process, 116, 1, 0)
+    shell_inspector_expect(shell.source_selected_line == 2
+        and shell_inspector_same(ShellBytes::view_of(&replaced_source_line.text), "source_replaced:")
+        and HostClient::request(host_process, 130, 0, 0).result == 1, 38)
+    run_shell_command(shell, ShellCommand.Undo.u32())
+    replaced_undo_line: HostClient::HostReply = HostClient::request(host_process, 116, 1, 0)
+    shell_inspector_expect(shell_inspector_same(ShellBytes::view_of(&replaced_undo_line.text), "source_view_edited:"), 39)
+    run_shell_command(shell, ShellCommand.Redo.u32())
+    replaced_redo_line: HostClient::HostReply = HostClient::request(host_process, 116, 1, 0)
+    shell_inspector_expect(shell_inspector_same(ShellBytes::view_of(&replaced_redo_line.text), "source_replaced:"), 40)
+    replace_all_query: sview = "additional source paging fixture line"
+    UiHandles::replace_text(shell.source_find_field, replace_all_query)
+    app_widget_event(shell.source_find_field.widget_id.usize(), UiConst::WidgetEvent.Change.i32())
+    UiHandles::replace_text(shell.source_replace_field, "all_replaced")
+    app_widget_event(shell.source_replace_all_button.widget_id.usize(), UiConst::WidgetEvent.Click.i32())
+    update_status(shell)
+    replace_all_status: sview = UiFlat::widget(shell.status_line.widget_id.usize()).text
+    replace_all_match: i64 = HostClient::request_text(host_process, 147, 0, 1, "all_replaced").result
+    shell_inspector_expect(shell_inspector_contains(replace_all_status, "Replaced 40 source matches")
+        and replace_all_match >= 0
+        and HostClient::request(host_process, 130, 0, 0).result == 1, 41)
+    run_shell_command(shell, ShellCommand.Undo.u32())
+    undone_replace_all_match: i64 = HostClient::request_text(host_process, 147, 0, 1, "all_replaced").result
+    restored_replace_all_query: i64 = HostClient::request_text(host_process, 147, 0, 1, replace_all_query).result
+    shell_inspector_expect(undone_replace_all_match < 0 and restored_replace_all_query >= 0, 42)
+    run_shell_command(shell, ShellCommand.Redo.u32())
+    redone_replace_all_match: i64 = HostClient::request_text(host_process, 147, 0, 1, "all_replaced").result
+    shell_inspector_expect(redone_replace_all_match >= 0, 43)
+    _ = PosixFile::remove(SHELL_INSPECTOR_SOURCE_PATH)
+    external_edit_length: i64 = PosixFile::write_plain(SHELL_INSPECTOR_SOURCE_PATH, "module disk_changed:\n")
+    refresh_source_view(shell, host_process)
+    shell_inspector_expect(external_edit_length > 0
+        and UiFlat::widget(shell.source_conflict_bar.widget_id.usize()).visible
+        and UiHandles::is_enabled(shell.source_compare_button)
+        and UiHandles::is_enabled(shell.source_keep_buffer_button)
+        and UiHandles::is_enabled(shell.source_reload_external_button), 27)
+    app_widget_event(shell.source_compare_button.widget_id.usize(), UiConst::WidgetEvent.Click.i32())
+    compared_text: sview = UiFlat::widget(shell.source_text.widget_id.usize()).text
+    shell_inspector_expect(shell.source_compare_mode
+        and UiFlat::widget(shell.source_text.widget_id.usize()).visible
+        and shell_inspector_contains(compared_text, "- local:")
+        and shell_inspector_contains(compared_text, "+ disk:"), 28)
+    app_widget_event(shell.source_keep_buffer_button.widget_id.usize(), UiConst::WidgetEvent.Click.i32())
+    shell_inspector_expect(not shell.source_compare_mode
+        and not UiFlat::widget(shell.source_conflict_bar.widget_id.usize()).visible
+        and HostClient::request(host_process, 130, 0, 0).result == 1, 29)
+    run_shell_command(shell, ShellCommand.SaveDocument.u32())
+    kept_source: mutable darray[u8] = []
+    kept_length: usize = PosixFile::read_bytes(&kept_source, SHELL_INSPECTOR_SOURCE_PATH, 1048576)
+    shell_inspector_expect(kept_length > 0
+        and shell_inspector_contains(ShellBytes::view_of(&kept_source), "source_replaced:")
+        and HostClient::request(host_process, 130, 0, 0).result == 0, 30)
+    _ = PosixFile::remove(SHELL_INSPECTOR_SOURCE_PATH)
+    reload_edit_length: i64 = PosixFile::write_plain(SHELL_INSPECTOR_SOURCE_PATH, "module disk_reloaded:\n")
+    refresh_source_view(shell, host_process)
+    app_widget_event(shell.source_reload_external_button.widget_id.usize(), UiConst::WidgetEvent.Click.i32())
+    reloaded_source_line: HostClient::HostReply = HostClient::request(host_process, 116, 0, 0)
+    shell_inspector_expect(reload_edit_length > 0
+        and shell_inspector_same(ShellBytes::view_of(&reloaded_source_line.text), "module disk_reloaded:")
+        and HostClient::request(host_process, 130, 0, 0).result == 0
+        and HostClient::request(host_process, 136, 0, 0).result == 0
+        and not UiFlat::widget(shell.source_conflict_bar.widget_id.usize()).visible, 31)
+    _ = PosixFile::remove(SHELL_INSPECTOR_SOURCE_PATH)
+
+    HostClient::stop(&host_process)
+    _ = PosixProcess::poll(&host_process, 1000)
+    PosixProcess::dispose(&host_process)
+    shell.host_running <- false
+    UiHarness::stop()
+    if shell_inspector_failure != 0:
+        shell_inspector_report_i64("shell-inspector assertion failure=", shell_inspector_failure)
+        return 1
+    shell_inspector_report_text("shell-inspector: metadata and Elisa source editing passed")
+    return 0

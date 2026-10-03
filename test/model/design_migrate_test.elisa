@@ -8,6 +8,7 @@ include "test_support.elisa"
 module DesignMigrateTest:
     private:
         const FUTURE_FORM: cstr = "{\"format\":\"elisa-ide-form\",\"schemaVersion\":99,\"id\":\"form-future\",\"name\":\"Future\",\"moduleSymbol\":\"future_view\",\"root\":\"node-root\",\"nodes\":[{\"id\":\"node-root\",\"type\":\"elisa.ui.label\",\"name\":\"Root\",\"symbol\":\"root_label\",\"properties\":{},\"children\":[],\"events\":{}}]}"
+        const LEGACY_PROJECT: cstr = "{\"format\":\"elisa-ide-project\",\"schemaVersion\":0,\"projectId\":\"project-legacy\",\"name\":\"Legacy\",\"appId\":\"org.example.legacy\",\"entryForm\":\"form-main\",\"forms\":[{\"id\":\"form-main\",\"path\":\"forms/main.elisaform.json\"}]}"
 
     public:
         def run() -> i64:
@@ -26,6 +27,17 @@ module DesignMigrateTest:
             encoded: darray[u8] = DesignEncode::encode_form(legacy)
             TestSupport::check("migrated encoding has name", TestSupport::text_contains(TestSupport::view_of(encoded), "\"name\":\"Legacy form\""))
             TestSupport::check("migrated encoding drops title", not TestSupport::text_contains(TestSupport::view_of(encoded), "\"title\""))
+
+            # Legacy project 0 -> 1: `appId` becomes `applicationId`.
+            legacy_project_sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
+            legacy_project: DesignProjects::Project = DesignDecode::decode_project(sview(LEGACY_PROJECT, 0, -1), &legacy_project_sink)
+            TestSupport::check("legacy project has no errors", not DesignDiagnostics::has_errors(legacy_project_sink))
+            TestSupport::check("project migration is reported", TestSupport::has_warning_code(legacy_project_sink, DesignDiagnostics::Code.MigrationApplied))
+            TestSupport::check("migrated project is version 1", legacy_project.schema_version == 1)
+            TestSupport::check_text("appId became applicationId", DesignValues::text_of(legacy_project.strings, legacy_project.application_id), "org.example.legacy")
+            legacy_project_encoded: darray[u8] = DesignEncode::encode_project(legacy_project)
+            TestSupport::check("migrated project encoding has applicationId", TestSupport::text_contains(TestSupport::view_of(legacy_project_encoded), "\"applicationId\":\"org.example.legacy\""))
+            TestSupport::check("migrated project encoding drops appId", not TestSupport::text_contains(TestSupport::view_of(legacy_project_encoded), "\"appId\""))
 
             # A future schema is refused with a diagnostic and no partial model.
             future_sink: mutable DesignDiagnostics::Sink = TestSupport::sink()

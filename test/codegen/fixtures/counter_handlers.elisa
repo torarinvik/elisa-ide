@@ -1,0 +1,36 @@
+# User-owned behavior for the generated counter application.
+global mutable counter_value: i64 = 0
+global mutable counter_text: u8[32] = zeroed
+
+def counter_view_text() -> sview:
+    prefix: sview = "Count: "
+    index: mutable i64 = 0
+    while index < prefix.len:
+        counter_text[index.usize()] <- prefix[index]
+        index <- index + 1
+    digits: mutable u8[24] = zeroed
+    value: mutable i64 = counter_value
+    count: mutable i64 = 0
+    if value == 0:
+        digits[0] <- 48
+        count <- 1
+    else:
+        while value > 0:
+            digits[count.usize()] <- (48 + value % 10).u8()
+            value <- value / 10
+            count <- count + 1
+        while count > 0:
+            counter_text[index.usize()] <- digits[(count - 1).usize()]
+            index <- index + 1
+            count <- count - 1
+    return UiText::fixed_bytes_view_range[32](counter_text, 0, index.usize())
+
+module CounterHandlers:
+    public:
+        def increment(widget: usize, event: i32) -> void:
+            counter_value <- counter_value + 1
+            label: UiHandles::Handle = counter_view::widget_count_label()
+            UiHandles::set_text(label, counter_view_text(), 24.0, UiCore::rgb(232, 236, 246))
+
+        def value() -> i64:
+            return counter_value

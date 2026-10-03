@@ -242,10 +242,9 @@ module PreviewProtocol:
             frame.response_to <- read_u64(bytes, 36)
             frame.document_revision <- read_u64(bytes, 44)
             frame.content_hash <- read_u64(bytes, 52)
-            # The transport is binary, so `sview(pointer, ...)` is not suitable:
-            # that overload measures a C string and stops at the first zero byte.
-            # Start with the counted byte-buffer view, then slice the payload.
-            frame.payload <- string_view_slice(bytes_view(bytes), HEADER_BYTES, expected_length)
+            # The incoming sview is already length-counted; preserve binary
+            # payload bytes by slicing its explicit bounds.
+            frame.payload <- string_view_slice(bytes, HEADER_BYTES, expected_length)
 
             invalid.code <- Issue.InvalidSession
             return invalid if frame.session_nonce == 0 or frame.worker_generation == 0

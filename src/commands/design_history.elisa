@@ -145,7 +145,8 @@ module DesignHistory:
                 write: mutable i64 = 0
                 read: mutable i64 = 1
                 while read < history.entries.count.i64():
-                    copy_entry_into(&history.entries[write.usize()], &history.entries[read.usize()])
+                    moved_entry: DesignHistory::Entry = history.entries[read.usize()]
+                    copy_entry_into(&history.entries[write.usize()], &moved_entry)
                     write <- write + 1
                     read <- read + 1
                 history.entries.resize(write.usize())

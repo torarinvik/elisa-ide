@@ -8,6 +8,7 @@ include "test_support.elisa"
 module DesignValidateTest:
     private:
         const DUPLICATE_IDS: cstr = "{\"schemaVersion\":1,\"id\":\"form-dup\",\"name\":\"Dup\",\"moduleSymbol\":\"dup_view\",\"root\":\"node-a\",\"nodes\":[{\"id\":\"node-a\",\"type\":\"elisa.ui.label\",\"name\":\"A\",\"symbol\":\"label_a\",\"properties\":{},\"children\":[],\"events\":{}},{\"id\":\"node-a\",\"type\":\"elisa.ui.label\",\"name\":\"B\",\"symbol\":\"label_b\",\"properties\":{},\"children\":[],\"events\":{}}]}"
+        const DUPLICATE_SYMBOLS: cstr = "{\"schemaVersion\":1,\"id\":\"form-symbols\",\"name\":\"Symbols\",\"moduleSymbol\":\"symbols_view\",\"root\":\"node-a\",\"nodes\":[{\"id\":\"node-a\",\"type\":\"elisa.ui.column\",\"name\":\"A\",\"symbol\":\"shared_control\",\"properties\":{},\"children\":[\"node-b\"],\"events\":{}},{\"id\":\"node-b\",\"type\":\"elisa.ui.label\",\"name\":\"B\",\"symbol\":\"shared_control\",\"properties\":{},\"children\":[],\"events\":{}}]}"
         const CYCLE: cstr = "{\"schemaVersion\":1,\"id\":\"form-cycle\",\"name\":\"Cycle\",\"moduleSymbol\":\"cycle_view\",\"root\":\"node-a\",\"nodes\":[{\"id\":\"node-a\",\"type\":\"elisa.ui.column\",\"name\":\"A\",\"symbol\":\"col_a\",\"properties\":{},\"children\":[\"node-b\"],\"events\":{}},{\"id\":\"node-b\",\"type\":\"elisa.ui.column\",\"name\":\"B\",\"symbol\":\"col_b\",\"properties\":{},\"children\":[\"node-a\"],\"events\":{}}]}"
         const LEAF_PARENT: cstr = "{\"schemaVersion\":1,\"id\":\"form-leaf\",\"name\":\"Leaf\",\"moduleSymbol\":\"leaf_view\",\"root\":\"node-root\",\"nodes\":[{\"id\":\"node-root\",\"type\":\"elisa.ui.button\",\"name\":\"Root\",\"symbol\":\"root_button\",\"properties\":{},\"children\":[\"node-child\"],\"events\":{}},{\"id\":\"node-child\",\"type\":\"elisa.ui.label\",\"name\":\"Child\",\"symbol\":\"child_label\",\"properties\":{},\"children\":[],\"events\":{}}]}"
         const WRONG_TYPE: cstr = "{\"schemaVersion\":1,\"id\":\"form-type\",\"name\":\"Type\",\"moduleSymbol\":\"type_view\",\"root\":\"node-root\",\"nodes\":[{\"id\":\"node-root\",\"type\":\"elisa.ui.label\",\"name\":\"Root\",\"symbol\":\"root_label\",\"properties\":{\"text\":5},\"children\":[],\"events\":{}}]}"
@@ -46,6 +47,10 @@ module DesignValidateTest:
             duplicate_sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
             _ = validate_text(registry, sview(DUPLICATE_IDS, 0, -1), &duplicate_sink)
             TestSupport::check("duplicate ids rejected", TestSupport::has_error_code(duplicate_sink, DesignDiagnostics::Code.DuplicateId))
+
+            duplicate_symbols_sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
+            _ = validate_text(registry, sview(DUPLICATE_SYMBOLS, 0, -1), &duplicate_symbols_sink)
+            TestSupport::check("duplicate generated symbols rejected", TestSupport::has_error_code(duplicate_symbols_sink, DesignDiagnostics::Code.InvalidSymbol))
 
             cycle_sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
             _ = validate_text(registry, sview(CYCLE, 0, -1), &cycle_sink)

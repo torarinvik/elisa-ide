@@ -42,7 +42,12 @@ module DesignerShellTest:
             return copied
 
         def view_of(bytes: darray[u8]) -> sview:
-            return sview(&bytes[0], 0, bytes.count.i64())
+            return "" if bytes.count == 0 or bytes.items == null or bytes.count > bytes.capacity
+            count: i64 = bytes.count.i64()
+            return "" if count < 0 or count.usize() != bytes.count
+            trusted Unsafe.UncheckedIndex:
+                can Unsafe.PointerCast:
+                    return UiText::unsafe_sview_bounded_bytes(&bytes[0], bytes.count)
 
         def click(handle: UiHandles::Handle) -> void:
             if UiHandles::widget(handle) is widget:

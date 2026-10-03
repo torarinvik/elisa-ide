@@ -1,0 +1,85 @@
+# Exercise the generated counter form through a real physical pointer click.
+
+include "../../framework/src/platform/sdl3/ui_sdl3_flat.elisa"
+include "../../framework/src/test/ui_harness.elisa"
+include "../../build/generated_counter_view.elisa"
+include "../codegen/fixtures/counter_handlers.elisa"
+
+global mutable failures: i64 = 0
+global mutable generated_view_built: bool = false
+
+def app_init() -> void:
+    generated_view_built <- counter_view::build()
+
+def app_event(event: UiCore::Event) -> void:
+    UiHandles::handle(event)
+
+def app_widget_event(widget: usize, event: i32) -> void:
+    counter_view::dispatch_widget_event(widget, event)
+
+def app_text_input(text: sview) -> void:
+    UiHandles::insert_text(text)
+
+def app_text_editing(text: sview, selected_start: i32, selected_length: i32) -> void:
+    UiHandles::update_marked_text_utf8_characters(text, selected_start, selected_length)
+
+def app_frame() -> void can[Ui.Draw]:
+    UiCore::clear(UiCore::rgb(20, 22, 28))
+    UiHandles::layout(UiCore::viewport_width(), UiCore::viewport_height())
+    UiHandles::paint()
+
+def check(condition: bool) -> void:
+    failures <- failures + 1 if not condition
+
+def same(left: sview, right: sview) -> bool:
+    return false if left.len != right.len
+    index: mutable i64 = 0
+    while index < left.len:
+        return false if left[index] != right[index]
+        index <- index + 1
+    return true
+
+def find_button() -> UiHandles::Handle:
+    index: mutable usize = 0
+    while index < UiHandles::count():
+        candidate: UiHandles::Handle = UiHandles::from_index(index)
+        if UiHandles::widget(candidate) is widget:
+            if widget.kind == UiConst::WidgetKind.Button and same(widget.text, "Increment"):
+                return candidate
+        index <- index + 1
+    return UiHandles::invalid()
+
+def click(handle: UiHandles::Handle) -> bool:
+    return false if not UiHandles::is_valid(handle)
+    if UiHandles::widget(handle) is widget:
+        x: f32 = widget.x + widget.width * 0.5
+        y: f32 = widget.y + widget.height * 0.5
+        UiHarness::dispatch(UiCore::PointerEvent.Down(at: UiCore::Vec2(x, y), button: UiCore::PointerButton.Primary.i32()))
+        UiHarness::dispatch(UiCore::PointerEvent.Up(at: UiCore::Vec2(x, y), button: UiCore::PointerButton.Primary.i32()))
+        return true
+    return false
+
+def widget_text_matches(handle: UiHandles::Handle, expected: sview) -> bool:
+    return false if not UiHandles::is_valid(handle)
+    if UiHandles::widget(handle) is widget:
+        return same(widget.text, expected)
+    return false
+
+def main() -> i64:
+    UiHarness::start(640.0, 480.0)
+    UiHarness::focus_gained()
+    check(generated_view_built)
+    UiHarness::frame()
+    label: UiHandles::Handle = counter_view::widget_count_label()
+    check(widget_text_matches(label, "Count: 0"))
+    increment: UiHandles::Handle = find_button()
+    check(click(increment))
+    UiHarness::frame()
+    check(CounterHandlers::value() == 1)
+    check(widget_text_matches(label, "Count: 1"))
+    check(click(increment))
+    UiHarness::frame()
+    check(CounterHandlers::value() == 2)
+    check(widget_text_matches(label, "Count: 2"))
+    UiHarness::stop()
+    return failures

@@ -26,7 +26,8 @@ module DesignOps:
             read: mutable i64 = 0
             while read < ids.count.i64():
                 if read != position:
-                    DesignIds::copy_into(&ids[write.usize()], &ids[read.usize()])
+                    moved_id: DesignIds::DesignId = ids[read.usize()]
+                    DesignIds::copy_into(&ids[write.usize()], &moved_id)
                     write <- write + 1
                 read <- read + 1
             ids.resize(write.usize())
@@ -39,7 +40,8 @@ module DesignOps:
             DesignIds::append_copy(ids, id)
             cursor: mutable i64 = ids.count.i64() - 1
             while cursor > clamped:
-                DesignIds::copy_into(&ids[cursor.usize()], &ids[(cursor - 1).usize()])
+                moved_id: DesignIds::DesignId = ids[(cursor - 1).usize()]
+                DesignIds::copy_into(&ids[cursor.usize()], &moved_id)
                 cursor <- cursor - 1
             DesignIds::copy_into(&ids[clamped.usize()], id)
 
@@ -142,39 +144,6 @@ module DesignOps:
                 attempts <- attempts + 1
             return false
 
-        # Give every copied node a valid symbol distinct from both original
-        # symbols and symbols assigned earlier in this duplicate operation.
-        # The new ID provides a stable unique suffix; truncation keeps the
-        # complete Elisa identifier within the model's byte limit.
-        def duplicate_symbol(form: DesignForms::Form&, source: sview, id: DesignIds::DesignId&) -> DesignValues::StringRef:
-            base: sview = source
-            if not DesignIds::valid_symbol(base):
-                base = "component"
-            id_text_storage: mutable u8[24] = zeroed
-            id_text: sview = DesignIds::text(id, &id_text_storage)
-            attempt: mutable i64 = 0
-            while attempt <= form.nodes.count.i64() + 1:
-                suffix: mutable darray[u8] = []
-                DesignText::push_cstr(&suffix, "_copy_")
-                DesignText::push_view(&suffix, id_text)
-                if attempt > 0:
-                    DesignText::push_char(&suffix, 95)
-                    DesignText::push_i64(&suffix, attempt)
-                available: mutable i64 = DesignLimits::MAX_SYMBOL_BYTES.i64() - suffix.count.i64()
-                if available < 1:
-                    available <- 1
-                base_length: mutable i64 = base.len
-                if base_length > available:
-                    base_length <- available
-                candidate: mutable darray[u8] = []
-                DesignText::push_view(&candidate, sview(base.data, 0, base_length))
-                DesignText::push_view(&candidate, DesignText::view_of(suffix))
-                candidate_view: sview = DesignText::view_of(candidate)
-                if not symbol_taken(form, candidate_view, id):
-                    return DesignValues::append(form.strings.bytes, candidate_view)
-                attempt <- attempt + 1
-            return DesignValues::no_text()
-
         def fill_default_properties(form: mutable DesignForms::Form&, registry: DesignRegistry::Registry&, component: i64, properties: mutable darray[DesignNodes::Property]&) -> void:
             if component < 0:
                 return
@@ -187,10 +156,35 @@ module DesignOps:
                 # pool so the form owns its own strings.
                 value: mutable DesignValues::DesignValue = descriptor.default_value
                 if value.tag == DesignValues::ValueTag.Text or value.tag == DesignValues::ValueTag.EnumKey:
-                    copied: DesignValues::StringRef = DesignValues::append(form.strings.bytes, DesignValues::text_of(registry.strings, value.text_ref))
+                    copied: DesignValues::StringRef = DesignValues::append(&form.strings.bytes, DesignValues::text_of(registry.strings, value.text_ref))
                     value.text_ref <- copied
-                properties.push(DesignNodes::Property{key: DesignValues::append(form.strings.bytes, DesignValues::text_of(registry.strings, descriptor.key)), value: value})
+                properties.push(DesignNodes::Property{key: DesignValues::append(&form.strings.bytes, DesignValues::text_of(registry.strings, descriptor.key)), value: value})
                 index <- index + 1
+
+        # Handler names may be local symbols or qualified Elisa symbols such
+        # as `SettingsHandlers::save_clicked`. Accept identifier segments in
+        # either case while rejecting punctuation and incomplete qualifiers.
+        def valid_handler(text: sview) -> bool:
+            return false if text.len <= 0 or text.len.usize() > DesignLimits::MAX_SYMBOL_BYTES
+            index: mutable i64 = 0
+            expect_name: mutable bool = true
+            while index < text.len:
+                if expect_name:
+                    byte: u8 = text[index]
+                    if not ((byte >= 65 and byte <= 90) or (byte >= 97 and byte <= 122) or byte == 95):
+                        return false
+                    index <- index + 1
+                    while index < text.len:
+                        part: u8 = text[index]
+                        break if part == 58
+                        return false if not ((part >= 65 and part <= 90) or (part >= 97 and part <= 122) or (part >= 48 and part <= 57) or part == 95)
+                        index <- index + 1
+                    expect_name <- false
+                else:
+                    return false if index + 1 >= text.len or text[index] != 58 or text[index + 1] != 58
+                    index <- index + 2
+                    expect_name <- true
+            return not expect_name
 
     public:
         # Drops selected IDs that already have a selected ancestor.
@@ -254,17 +248,17 @@ module DesignOps:
 
             descriptor: DesignRegistry::ComponentDescriptor = registry.components[component.usize()]
             DesignIds::alloc_into(created_id, allocator)
-            name_ref: DesignValues::StringRef = DesignValues::append(form.strings.bytes, DesignValues::text_of(registry.strings, descriptor.display))
+            name_ref: DesignValues::StringRef = DesignValues::append(&form.strings.bytes, DesignValues::text_of(registry.strings, descriptor.display))
             constructor: sview = DesignValues::text_of(registry.strings, descriptor.constructor)
             symbol_buffer: mutable darray[u8] = []
             DesignText::push_view(&symbol_buffer, constructor)
             symbol_buffer.push(95)
             DesignText::push_i64(&symbol_buffer, allocator.next.i64())
-            symbol_ref: DesignValues::StringRef = DesignValues::append(form.strings.bytes, DesignText::view_of(symbol_buffer))
+            symbol_ref: DesignValues::StringRef = DesignValues::append(&form.strings.bytes, DesignText::view_of(symbol_buffer))
 
             node: mutable DesignNodes::Node = DesignNodes::empty_node()
             DesignIds::copy_into(&node.id, created_id)
-            node.type_key <- DesignValues::append(form.strings.bytes, type_key)
+            node.type_key <- DesignValues::append(&form.strings.bytes, type_key)
             node.name <- name_ref
             node.symbol <- symbol_ref
             DesignIds::copy_into(&node.parent, &parent)
@@ -344,7 +338,8 @@ module DesignOps:
                     # copying. When the compaction positions match, source and
                     # destination alias, so leave that node in place.
                     if write != read:
-                        DesignClone::clone_node_into(&form.nodes[write.usize()], &form.nodes[read.usize()])
+                        moved_node: DesignNodes::Node = form.nodes[read.usize()]
+                        DesignClone::clone_node_into(&form.nodes[write.usize()], &moved_node)
                     write <- write + 1
                 read <- read + 1
             form.nodes.resize(write.usize())
@@ -353,7 +348,7 @@ module DesignOps:
         # Set one property on every selected node, adding it to the form's
         # string pool when new. Returns false when any node is missing.
         def set_property(form: mutable DesignForms::Form&, ids: darray[DesignIds::DesignId], key: sview, value: DesignValues::DesignValue, sink: mutable DesignDiagnostics::Sink&) -> bool:
-            key_ref: DesignValues::StringRef = DesignValues::append(form.strings.bytes, key)
+            key_ref: DesignValues::StringRef = DesignValues::append(&form.strings.bytes, key)
             index: mutable i64 = 0
             while index < ids.count.i64():
                 node_index: i64 = DesignForms::find_node(form, ids[index.usize()])
@@ -365,6 +360,38 @@ module DesignOps:
             while index < ids.count.i64():
                 target_index: i64 = DesignForms::find_node(form, ids[index.usize()])
                 _ = DesignNodes::set_property(form.nodes[target_index.usize()], form.strings, key_ref, value)
+                index <- index + 1
+            return true
+
+        # Connect or disconnect one named event on every selected node. The
+        # registry check happens for the complete selection before any node is
+        # changed, preserving the operation's atomic contract.
+        def set_event_handler(form: mutable DesignForms::Form&, registry: DesignRegistry::Registry&, ids: darray[DesignIds::DesignId], event_key: sview, handler: sview, sink: mutable DesignDiagnostics::Sink&) -> bool:
+            if ids.count == 0:
+                report(sink, DesignDiagnostics::Code.MissingParent, "events", "event target does not resolve to a node")
+                return false
+            index: mutable i64 = 0
+            while index < ids.count.i64():
+                node_index: i64 = DesignForms::find_node(form, ids[index.usize()])
+                if node_index < 0:
+                    report(sink, DesignDiagnostics::Code.MissingParent, "events", "event target does not resolve to a node")
+                    return false
+                component: i64 = DesignRegistry::find_component(registry, DesignValues::text_of(form.strings, form.nodes[node_index.usize()].type_key))
+                if DesignRegistry::find_event(registry, component, event_key) < 0:
+                    report(sink, DesignDiagnostics::Code.UnknownEvent, "events", "event is not supported by this component")
+                    return false
+                index <- index + 1
+            if handler.len > 0 and not valid_handler(handler):
+                report(sink, DesignDiagnostics::Code.InvalidSymbol, "events", "handler must be a valid Elisa symbol or qualified symbol")
+                return false
+            key_ref: DesignValues::StringRef = DesignValues::append(&form.strings.bytes, event_key)
+            handler_ref: DesignValues::StringRef = DesignValues::append(&form.strings.bytes, handler)
+            index <- 0
+            while index < ids.count.i64():
+                node_index: i64 = DesignForms::find_node(form, ids[index.usize()])
+                if not DesignNodes::set_event(&form.nodes[node_index.usize()], form.strings, key_ref, handler_ref):
+                    report(sink, DesignDiagnostics::Code.TooManyNodes, "events", "event connection limit reached")
+                    return false
                 index <- index + 1
             return true
 
@@ -457,6 +484,152 @@ module DesignOps:
                 moved_index <- moved_index + 1
             return true
 
+        # Wrap topmost selected siblings in a newly-created container. The
+        # insertion and reparent are performed on the prepared form, so a
+        # failed reparent leaves the live document untouched at commit time.
+        def wrap_selection(form: mutable DesignForms::Form&, registry: DesignRegistry::Registry&, ids: darray[DesignIds::DesignId], type_key: sview, allocator: mutable DesignIds::Allocator&, created_id: mutable DesignIds::DesignId&, sink: mutable DesignDiagnostics::Sink&) -> bool:
+            created_id <- DesignIds::empty()
+            if ids.count == 0:
+                report(sink, DesignDiagnostics::Code.MissingParent, "selection", "wrap requires at least one selected node")
+                return false
+            roots: darray[DesignIds::DesignId] = topmost_roots(form, ids)
+            if roots.count == 0:
+                report(sink, DesignDiagnostics::Code.MissingParent, "selection", "wrap requires at least one selected node")
+                return false
+            first_index: i64 = DesignForms::find_node(form, roots[0.usize()])
+            if first_index < 0:
+                report(sink, DesignDiagnostics::Code.MissingParent, "selection", "wrap target does not resolve to a node")
+                return false
+            parent: DesignIds::DesignId = form.nodes[first_index.usize()].parent
+            if DesignIds::is_empty(parent):
+                report(sink, DesignDiagnostics::Code.MissingRoot, "root", "the form root cannot be wrapped")
+                return false
+            parent_index: i64 = DesignForms::find_node(form, parent)
+            if parent_index < 0:
+                report(sink, DesignDiagnostics::Code.MissingParent, "parent", "wrap parent does not resolve to a node")
+                return false
+            ordered: mutable darray[DesignIds::DesignId] = []
+            child_index: mutable i64 = 0
+            while child_index < form.nodes[parent_index.usize()].children.count.i64():
+                child: DesignIds::DesignId = form.nodes[parent_index.usize()].children[child_index.usize()]
+                if index_of_id(roots, child) >= 0:
+                    DesignIds::append_copy(&ordered, &child)
+                child_index <- child_index + 1
+            if ordered.count != roots.count:
+                report(sink, DesignDiagnostics::Code.MissingParent, "children", "every selected node must be a sibling of the first")
+                return false
+            if ordered.count > DesignLimits::MAX_CHILDREN_PER_NODE:
+                report(sink, DesignDiagnostics::Code.TooManyNodes, "children", "wrapped container would exceed its child limit")
+                return false
+            insertion_index: i64 = index_of_id(form.nodes[parent_index.usize()].children, ordered[0.usize()])
+            if insertion_index < 0:
+                report(sink, DesignDiagnostics::Code.MissingParent, "children", "wrap insertion position is invalid")
+                return false
+            if not insert_node_into(form, registry, parent, insertion_index, type_key, allocator, created_id, sink):
+                return false
+            return reparent(form, registry, ordered, created_id, -1, sink)
+
+        # Replace one selected container with its children. The operation
+        # preserves child order and stable child IDs while removing only the
+        # wrapper node itself. References to the wrapper are rejected rather
+        # than silently becoming dangling IDs.
+        def unwrap_selection(form: mutable DesignForms::Form&, ids: darray[DesignIds::DesignId], sink: mutable DesignDiagnostics::Sink&) -> bool:
+            roots: darray[DesignIds::DesignId] = topmost_roots(form, ids)
+            if roots.count != 1:
+                report(sink, DesignDiagnostics::Code.PropertyOutOfRange, "selection", "unwrap requires exactly one top-level container")
+                return false
+            wrapper: DesignIds::DesignId = roots[0.usize()]
+            if DesignIds::equal(wrapper, form.root):
+                report(sink, DesignDiagnostics::Code.MissingRoot, "root", "the form root cannot be unwrapped")
+                return false
+            wrapper_index: i64 = DesignForms::find_node(form, wrapper)
+            if wrapper_index < 0:
+                report(sink, DesignDiagnostics::Code.MissingParent, "selection", "unwrap target does not resolve to a node")
+                return false
+            wrapper_node: DesignNodes::Node = form.nodes[wrapper_index.usize()]
+            if wrapper_node.events.count > 0:
+                report(sink, DesignDiagnostics::Code.InvalidReference, "events", "cannot unwrap a container that owns event handlers")
+                return false
+            parent: DesignIds::DesignId = wrapper_node.parent
+            parent_index: i64 = DesignForms::find_node(form, parent)
+            if parent_index < 0:
+                report(sink, DesignDiagnostics::Code.MissingParent, "parent", "unwrap parent does not resolve to a node")
+                return false
+            wrapper_position: i64 = index_of_id(form.nodes[parent_index.usize()].children, wrapper)
+            if wrapper_position < 0:
+                report(sink, DesignDiagnostics::Code.MissingParent, "children", "unwrap target is not linked from its parent")
+                return false
+            final_count: i64 = form.nodes[parent_index.usize()].children.count.i64() - 1 + wrapper_node.children.count.i64()
+            if final_count > DesignLimits::MAX_CHILDREN_PER_NODE.i64():
+                report(sink, DesignDiagnostics::Code.TooManyNodes, "children", "unwrapped children exceed the parent child limit")
+                return false
+            property_scan: mutable i64 = 0
+            while property_scan < form.nodes.count.i64():
+                node: DesignNodes::Node = form.nodes[property_scan.usize()]
+                if not DesignIds::equal(node.id, wrapper):
+                    property_index: mutable i64 = 0
+                    while property_index < node.properties.count.i64():
+                        property: DesignNodes::Property = node.properties[property_index.usize()]
+                        if property.value.tag == DesignValues::ValueTag.NodeRef:
+                            reference: sview = DesignValues::text_of(form.strings, property.value.text_ref)
+                            parsed_reference: DesignIds::DesignId = DesignIds::from_text(reference)
+                            if DesignIds::equal(parsed_reference, wrapper):
+                                report(sink, DesignDiagnostics::Code.MissingParent, "properties", "cannot unwrap a node referenced by a surviving NodeRef property")
+                                return false
+                        property_index <- property_index + 1
+                property_scan <- property_scan + 1
+            _ = remove_id_in_place(form.nodes[parent_index.usize()].children, wrapper_position)
+            child_index: mutable i64 = 0
+            while child_index < wrapper_node.children.count.i64():
+                child: DesignIds::DesignId = wrapper_node.children[child_index.usize()]
+                child_node_index: i64 = DesignForms::find_node(form, child)
+                if child_node_index < 0:
+                    report(sink, DesignDiagnostics::Code.MissingParent, "children", "unwrap child does not resolve to a node")
+                    return false
+                DesignIds::copy_into(&form.nodes[child_node_index.usize()].parent, &parent)
+                insert_id_in_place(form.nodes[parent_index.usize()].children, &child, wrapper_position + child_index)
+                child_index <- child_index + 1
+            write: mutable i64 = 0
+            read: mutable i64 = 0
+            while read < form.nodes.count.i64():
+                if not DesignIds::equal(form.nodes[read.usize()].id, wrapper):
+                    if write != read:
+                        moved_node: DesignNodes::Node = form.nodes[read.usize()]
+                        DesignClone::clone_node_into(&form.nodes[write.usize()], &moved_node)
+                    write <- write + 1
+                read <- read + 1
+            form.nodes.resize(write.usize())
+            return true
+
+        # Change a Row into a Column or a Column into a Row without changing
+        # the node identity, children, properties, or event connections.
+        def convert_container(form: mutable DesignForms::Form&, registry: DesignRegistry::Registry&, ids: darray[DesignIds::DesignId], type_key: sview, sink: mutable DesignDiagnostics::Sink&) -> bool:
+            roots: darray[DesignIds::DesignId] = topmost_roots(form, ids)
+            if roots.count != 1:
+                report(sink, DesignDiagnostics::Code.PropertyOutOfRange, "selection", "orientation conversion requires one container")
+                return false
+            node_index: i64 = DesignForms::find_node(form, roots[0.usize()])
+            if node_index < 0:
+                report(sink, DesignDiagnostics::Code.MissingParent, "selection", "orientation target does not resolve to a node")
+                return false
+            current: sview = DesignValues::text_of(form.strings, form.nodes[node_index.usize()].type_key)
+            if not (DesignText::equal(current, "elisa.ui.row") or DesignText::equal(current, "elisa.ui.column")):
+                report(sink, DesignDiagnostics::Code.InvalidPropertyType, "type", "only Row and Column containers support orientation conversion")
+                return false
+            if not (DesignText::equal(type_key, "elisa.ui.row") or DesignText::equal(type_key, "elisa.ui.column")):
+                report(sink, DesignDiagnostics::Code.UnknownComponent, "type", "orientation target must be Row or Column")
+                return false
+            if DesignText::equal(current, type_key):
+                report(sink, DesignDiagnostics::Code.PropertyOutOfRange, "type", "container already has that orientation")
+                return false
+            component: i64 = DesignRegistry::find_component(registry, type_key)
+            if component < 0 or not registry.components[component.usize()].can_have_children:
+                report(sink, DesignDiagnostics::Code.UnknownComponent, "type", "orientation target is not a container")
+                return false
+            form.nodes[node_index.usize()].type_key <- DesignValues::append(&form.strings.bytes, type_key)
+            form.nodes[node_index.usize()].name <- DesignValues::append(&form.strings.bytes, DesignValues::text_of(registry.strings, registry.components[component.usize()].display))
+            return true
+
         # Duplicate topmost selected roots atomically after their originals.
         # One mapping spans the whole selection so NodeRefs between separately
         # selected subtrees also point at the corresponding copies.
@@ -535,11 +708,40 @@ module DesignOps:
                 copy: mutable DesignNodes::Node = DesignNodes::empty_node()
                 DesignClone::clone_node_into(&copy, form.nodes[source_index.usize()])
                 DesignIds::copy_into(&copy.id, &new_ids[index.usize()])
-                copy.symbol <- duplicate_symbol(form, DesignValues::text_of(form.strings, form.nodes[source_index.usize()].symbol), new_ids[index.usize()])
-                if copy.symbol.length == 0:
+                symbol_base: sview = DesignValues::text_of(form.strings, form.nodes[source_index.usize()].symbol)
+                if not DesignIds::valid_symbol(symbol_base):
+                    symbol_base = "component"
+                symbol_id_storage: mutable u8[24] = zeroed
+                symbol_id_text: sview = DesignIds::text(&new_ids[index.usize()], &symbol_id_storage)
+                symbol_ref: mutable DesignValues::StringRef = DesignValues::no_text()
+                symbol_made: mutable bool = false
+                symbol_attempt: mutable i64 = 0
+                while symbol_attempt <= form.nodes.count.i64() + 1 and not symbol_made:
+                    suffix: mutable darray[u8] = []
+                    DesignText::push_cstr(&suffix, "_copy_")
+                    DesignText::push_view(&suffix, symbol_id_text)
+                    if symbol_attempt > 0:
+                        DesignText::push_char(&suffix, 95)
+                        DesignText::push_i64(&suffix, symbol_attempt)
+                    available: mutable i64 = DesignLimits::MAX_SYMBOL_BYTES.i64() - suffix.count.i64()
+                    if available < 1:
+                        available <- 1
+                    base_length: mutable i64 = symbol_base.len
+                    if base_length > available:
+                        base_length <- available
+                    candidate: mutable darray[u8] = []
+                    DesignText::push_view(&candidate, string_view_prefix(symbol_base, base_length))
+                    DesignText::push_view(&candidate, DesignText::view_of(suffix))
+                    candidate_view: sview = DesignText::view_of(candidate)
+                    if not symbol_taken(form, candidate_view, new_ids[index.usize()]):
+                        symbol_ref <- DesignValues::append(&form.strings.bytes, candidate_view)
+                        symbol_made <- true
+                    symbol_attempt <- symbol_attempt + 1
+                if not symbol_made:
                     DesignClone::clone_form_into(form, backup)
                     report(sink, DesignDiagnostics::Code.InvalidSymbol, "symbol", "could not generate a unique symbol for duplicate")
                     return []
+                copy.symbol <- symbol_ref
                 # Remap parent and child links through the complete mapping.
                 parent_position: i64 = index_of_id(old_ids, copy.parent)
                 if parent_position >= 0:
@@ -560,7 +762,7 @@ module DesignOps:
                         if target_position >= 0:
                             id_text_storage: mutable u8[24] = zeroed
                             id_text: sview = DesignIds::text(&new_ids[target_position.usize()], &id_text_storage)
-                            copy.properties[property_index.usize()].value.text_ref <- DesignValues::append(form.strings.bytes, id_text)
+                            copy.properties[property_index.usize()].value.text_ref <- DesignValues::append(&form.strings.bytes, id_text)
                     property_index <- property_index + 1
                 if not DesignForms::add_node(form, copy):
                     DesignClone::clone_form_into(form, backup)
@@ -588,6 +790,160 @@ module DesignOps:
                 root_index <- root_index + 1
             return created
 
+        # Paste a detached clipboard snapshot into `parent`. The clipboard is
+        # a form clone, so all source string references are copied into the
+        # destination pool and every pasted node receives a fresh stable ID.
+        # A complete old-to-new map remaps child links and NodeRef properties
+        # that point within the pasted selection.
+        def paste(form: mutable DesignForms::Form&, registry: DesignRegistry::Registry, source: DesignForms::Form&, roots: darray[DesignIds::DesignId], parent: DesignIds::DesignId, index: i64, allocator: mutable DesignIds::Allocator&, sink: mutable DesignDiagnostics::Sink&) -> darray[DesignIds::DesignId]:
+            created: mutable darray[DesignIds::DesignId] = []
+            if roots.count == 0:
+                report(sink, DesignDiagnostics::Code.MissingParent, "selection", "paste requires a nonempty clipboard")
+                return created
+            parent_index: i64 = DesignForms::find_node(form, parent)
+            if parent_index < 0 or not can_have_children(registry, DesignValues::text_of(form.strings, form.nodes[parent_index.usize()].type_key)):
+                report(sink, DesignDiagnostics::Code.LeafParent, "parent", "paste target cannot contain children")
+                return created
+            old_ids: mutable darray[DesignIds::DesignId] = []
+            root_index: mutable i64 = 0
+            while root_index < roots.count.i64():
+                source_root_index: i64 = DesignForms::find_node(source, roots[root_index.usize()])
+                if source_root_index < 0:
+                    report(sink, DesignDiagnostics::Code.MissingParent, "selection", "clipboard root no longer resolves")
+                    return []
+                subtree: darray[DesignIds::DesignId] = collect_subtree(source, roots[root_index.usize()])
+                subtree_index: mutable i64 = 0
+                while subtree_index < subtree.count.i64():
+                    if id_in_list(old_ids, subtree[subtree_index.usize()]):
+                        report(sink, DesignDiagnostics::Code.MissingParent, "children", "clipboard contains a repeated subtree")
+                        return []
+                    DesignIds::append_copy(&old_ids, &subtree[subtree_index.usize()])
+                    subtree_index <- subtree_index + 1
+                root_index <- root_index + 1
+            if parent_index < 0 or form.nodes[parent_index.usize()].children.count.i64() + roots.count.i64() > DesignLimits::MAX_CHILDREN_PER_NODE.i64():
+                report(sink, DesignDiagnostics::Code.TooManyNodes, "children", "paste would exceed the target child limit")
+                return []
+            if form.nodes.count.i64() + old_ids.count.i64() > DesignLimits::MAX_NODES.i64():
+                report(sink, DesignDiagnostics::Code.TooManyNodes, "nodes", "paste would exceed the node limit")
+                return []
+            new_ids: mutable darray[DesignIds::DesignId] = []
+            cursor: mutable i64 = 0
+            while cursor < old_ids.count.i64():
+                if not append_fresh_id(form, &new_ids, allocator):
+                    report(sink, DesignDiagnostics::Code.DuplicateId, "id", "could not allocate a unique pasted ID")
+                    return []
+                cursor <- cursor + 1
+            backup: mutable DesignForms::Form = DesignForms::empty_form()
+            DesignClone::clone_form_into(&backup, form)
+            cursor <- 0
+            while cursor < old_ids.count.i64():
+                source_index: i64 = DesignForms::find_node(source, old_ids[cursor.usize()])
+                if source_index < 0:
+                    DesignClone::clone_form_into(form, backup)
+                    report(sink, DesignDiagnostics::Code.MissingParent, "selection", "clipboard node no longer resolves")
+                    return []
+                source_node: DesignNodes::Node = source.nodes[source_index.usize()]
+                copy: mutable DesignNodes::Node = DesignNodes::empty_node()
+                DesignClone::clone_node_into(&copy, source_node)
+                DesignIds::copy_into(&copy.id, &new_ids[cursor.usize()])
+                copy.name <- DesignValues::append(&form.strings.bytes, DesignValues::text_of(source.strings, source_node.name))
+                copy.type_key <- DesignValues::append(&form.strings.bytes, DesignValues::text_of(source.strings, source_node.type_key))
+                symbol_base: sview = DesignValues::text_of(source.strings, source_node.symbol)
+                if not DesignIds::valid_symbol(symbol_base):
+                    symbol_base = "component"
+                symbol_id_storage: mutable u8[24] = zeroed
+                symbol_id_text: sview = DesignIds::text(&new_ids[cursor.usize()], &symbol_id_storage)
+                symbol_ref: mutable DesignValues::StringRef = DesignValues::no_text()
+                symbol_made: mutable bool = false
+                symbol_attempt: mutable i64 = 0
+                while symbol_attempt <= form.nodes.count.i64() + 1 and not symbol_made:
+                    suffix: mutable darray[u8] = []
+                    DesignText::push_cstr(&suffix, "_copy_")
+                    DesignText::push_view(&suffix, symbol_id_text)
+                    if symbol_attempt > 0:
+                        DesignText::push_char(&suffix, 95)
+                        DesignText::push_i64(&suffix, symbol_attempt)
+                    available: mutable i64 = DesignLimits::MAX_SYMBOL_BYTES.i64() - suffix.count.i64()
+                    if available < 1:
+                        available <- 1
+                    base_length: mutable i64 = symbol_base.len
+                    if base_length > available:
+                        base_length <- available
+                    candidate: mutable darray[u8] = []
+                    DesignText::push_view(&candidate, string_view_prefix(symbol_base, base_length))
+                    DesignText::push_view(&candidate, DesignText::view_of(suffix))
+                    candidate_view: sview = DesignText::view_of(candidate)
+                    if not symbol_taken(form, candidate_view, new_ids[cursor.usize()]):
+                        symbol_ref <- DesignValues::append(&form.strings.bytes, candidate_view)
+                        symbol_made <- true
+                    symbol_attempt <- symbol_attempt + 1
+                if not symbol_made:
+                    DesignClone::clone_form_into(form, backup)
+                    report(sink, DesignDiagnostics::Code.InvalidSymbol, "symbol", "could not generate a unique pasted symbol")
+                    return []
+                copy.symbol <- symbol_ref
+                parent_position: i64 = index_of_id(old_ids, source_node.parent)
+                if parent_position >= 0:
+                    DesignIds::copy_into(&copy.parent, &new_ids[parent_position.usize()])
+                else:
+                    root_position: i64 = index_of_id(roots, source_node.id)
+                    if root_position < 0:
+                        DesignClone::clone_form_into(form, backup)
+                        report(sink, DesignDiagnostics::Code.MissingParent, "parent", "clipboard node has an external parent")
+                        return []
+                    DesignIds::copy_into(&copy.parent, &parent)
+                child_index: mutable i64 = 0
+                while child_index < copy.children.count.i64():
+                    child_position: i64 = index_of_id(old_ids, copy.children[child_index.usize()])
+                    if child_position < 0:
+                        DesignClone::clone_form_into(form, backup)
+                        report(sink, DesignDiagnostics::Code.MissingParent, "children", "clipboard child is missing")
+                        return []
+                    DesignIds::copy_into(&copy.children[child_index.usize()], &new_ids[child_position.usize()])
+                    child_index <- child_index + 1
+                property_index: mutable i64 = 0
+                while property_index < copy.properties.count.i64():
+                    property: mutable DesignNodes::Property = copy.properties[property_index.usize()]
+                    property.key <- DesignValues::append(&form.strings.bytes, DesignValues::text_of(source.strings, source_node.properties[property_index.usize()].key))
+                    if property.value.tag == DesignValues::ValueTag.Text or property.value.tag == DesignValues::ValueTag.EnumKey or property.value.tag == DesignValues::ValueTag.Unsupported:
+                        property.value.text_ref <- DesignValues::append(&form.strings.bytes, DesignValues::text_of(source.strings, source_node.properties[property_index.usize()].value.text_ref))
+                    elif property.value.tag == DesignValues::ValueTag.NodeRef:
+                        reference: sview = DesignValues::text_of(source.strings, source_node.properties[property_index.usize()].value.text_ref)
+                        target_position: i64 = index_of_id_text(old_ids, reference)
+                        if target_position >= 0:
+                            id_text_storage: mutable u8[24] = zeroed
+                            id_text: sview = DesignIds::text(&new_ids[target_position.usize()], &id_text_storage)
+                            property.value.text_ref <- DesignValues::append(&form.strings.bytes, id_text)
+                        else:
+                            property.value.text_ref <- DesignValues::append(&form.strings.bytes, reference)
+                    copy.properties[property_index.usize()] <- property
+                    property_index <- property_index + 1
+                event_index: mutable i64 = 0
+                while event_index < copy.events.count.i64():
+                    copy.events[event_index.usize()].event_key <- DesignValues::append(&form.strings.bytes, DesignValues::text_of(source.strings, source_node.events[event_index.usize()].event_key))
+                    copy.events[event_index.usize()].handler <- DesignValues::append(&form.strings.bytes, DesignValues::text_of(source.strings, source_node.events[event_index.usize()].handler))
+                    event_index <- event_index + 1
+                if not DesignForms::add_node(form, copy):
+                    DesignClone::clone_form_into(form, backup)
+                    report(sink, DesignDiagnostics::Code.TooManyNodes, "nodes", "paste exceeded the node limit")
+                    return []
+                cursor <- cursor + 1
+            position: mutable i64 = index
+            if position < 0 or position > form.nodes[parent_index.usize()].children.count.i64():
+                position <- form.nodes[parent_index.usize()].children.count.i64()
+            root_index <- 0
+            while root_index < roots.count.i64():
+                copied_root_position: i64 = index_of_id(old_ids, roots[root_index.usize()])
+                if copied_root_position < 0:
+                    DesignClone::clone_form_into(form, backup)
+                    report(sink, DesignDiagnostics::Code.MissingParent, "selection", "clipboard root mapping failed")
+                    return []
+                insert_id_in_place(form.nodes[parent_index.usize()].children, &new_ids[copied_root_position.usize()], position)
+                DesignIds::append_copy(&created, &new_ids[copied_root_position.usize()])
+                position <- position + 1
+                root_index <- root_index + 1
+            return created
+
         def rename_symbol(form: mutable DesignForms::Form&, id: DesignIds::DesignId, symbol: sview, sink: mutable DesignDiagnostics::Sink&) -> bool:
             if not DesignIds::valid_symbol(symbol):
                 report(sink, DesignDiagnostics::Code.InvalidSymbol, "symbol", "symbol must be a lowercase Elisa identifier")
@@ -599,5 +955,23 @@ module DesignOps:
             if node_index < 0:
                 report(sink, DesignDiagnostics::Code.MissingParent, "symbol", "rename target does not resolve to a node")
                 return false
-            form.nodes[node_index.usize()].symbol <- DesignValues::append(form.strings.bytes, symbol)
+            form.nodes[node_index.usize()].symbol <- DesignValues::append(&form.strings.bytes, symbol)
+            return true
+
+        def rename_display_name(form: mutable DesignForms::Form&, id: DesignIds::DesignId, name: sview, sink: mutable DesignDiagnostics::Sink&) -> bool:
+            if name.len == 0 or name.len > DesignLimits::MAX_TEXT_VALUE_BYTES.i64():
+                report(sink, DesignDiagnostics::Code.InvalidPropertyType, "name", "display name must contain 1 to 4096 bytes")
+                return false
+            index: mutable i64 = 0
+            while index < name.len:
+                byte: u8 = name[index]
+                if byte == 0 or byte < 32 or byte == 127:
+                    report(sink, DesignDiagnostics::Code.InvalidPropertyType, "name", "display name cannot contain control characters")
+                    return false
+                index <- index + 1
+            node_index: i64 = DesignForms::find_node(form, id)
+            if node_index < 0:
+                report(sink, DesignDiagnostics::Code.MissingParent, "name", "rename target does not resolve to a node")
+                return false
+            form.nodes[node_index.usize()].name <- DesignValues::append(&form.strings.bytes, name)
             return true

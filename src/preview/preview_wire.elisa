@@ -17,6 +17,16 @@ module PreviewWire:
         const MAX_TEXT_BYTES: usize = 4096
         const MAX_PAYLOAD_BYTES: usize = 4194304
 
+        # Stable content signature for correlating one-shot worker geometry
+        # with the exact ELPF snapshot, including forms sharing a revision.
+        def snapshot_signature(bytes: sview) -> i64:
+            value: mutable i64 = 17
+            index: mutable i64 = 0
+            while index < bytes.len:
+                value <- (value * 131 + bytes[index].i64()) % 2147483647
+                index <- index + 1
+            return 1 if value == 0 else value
+
         const enum Component of u8:
             Column = 1
             Row = 2
@@ -24,3 +34,8 @@ module PreviewWire:
             Label = 4
             Button = 5
             TextField = 6
+            CheckBox = 7
+            RadioButton = 8
+            Slider = 9
+            ProgressBar = 10
+            Scroll = 11

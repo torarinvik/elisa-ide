@@ -1,12 +1,12 @@
-# Host-free native smoke test for the retained editor shell.
+# Host-free frame smoke test for the retained editor shell.
 #
-# This exercises the global Shell record through the real SDL startup,
-# application callbacks, layout, paint, and teardown path. It deliberately
-# calls build_shell directly instead of ShellApp::init because init also starts
-# the document host. No document host process is needed for this UI regression
-# test.
+# UiHarness drives the same app callbacks, lifecycle, retained layout, and
+# paint-command generation without coupling this shell test to a native
+# painter. Native rendering is exercised by the AppKit + Skia IDE build.
 
-include "../../framework/src/platform/sdl3/ui_sdl3_flat.elisa"
+include "shell_test_platform.elisa"
+include "preview_image_test_adapter.elisa"
+include "../../framework/src/test/ui_harness.elisa"
 include "../../src/shell/shell_app.elisa"
 
 global mutable shell_frame_failure: i64 = 0
@@ -20,7 +20,10 @@ extern shell_frame_report_text(text: cstr) -> void
 extern shell_frame_setenv(name: cstr, value: cstr) -> i64
 
 def shell_frame_path_cstr(path: mutable darray[u8]&) -> cstr:
-    return (&path[0]).cast[cstr] can Unsafe.PointerCast
+    path_c: mutable cstr = ""
+    can Unsafe.PointerCast:
+        path_c <- (&path[0]).cast[cstr] can Unsafe.PointerCast
+    return path_c
 
 def shell_frame_append_path(path: mutable darray[u8]&, text: sview) -> void:
     index: mutable i64 = 0
@@ -61,6 +64,7 @@ def app_init() -> void:
     expect_shell_frame(UiHandles::is_valid(shell.compact_open_path_field), 57)
     expect_shell_frame(UiHandles::is_valid(shell.compact_open_button), 58)
     expect_shell_frame(UiHandles::is_valid(shell.compact_save_as_button), 59)
+    expect_shell_frame(UiHandles::is_valid(shell.compact_new_project_button), 72)
     expect_shell_frame(UiHandles::is_valid(shell.compact_palette_button), 60)
     expect_shell_frame(UiHandles::is_valid(shell.compact_canvas_button), 61)
     expect_shell_frame(UiHandles::is_valid(shell.compact_inspector_button), 62)
@@ -74,6 +78,7 @@ def app_init() -> void:
     expect_shell_frame(UiHandles::is_valid(shell.bottom_splitter), 51)
     expect_shell_frame(UiHandles::is_valid(shell.bottom_pane), 8)
     expect_shell_frame(UiHandles::is_valid(shell.status_line), 9)
+    expect_shell_frame(not UiFlat::overflowed() and UiHandles::is_valid(shell.status_line), 84)
     expect_shell_frame(UiHandles::is_valid(shell.inspector_list), 25)
     expect_shell_frame(UiHandles::is_valid(shell.palette_list), 37)
     expect_shell_frame(UiHandles::is_valid(shell.hierarchy_list), 38)
@@ -87,22 +92,26 @@ def app_init() -> void:
     expect_shell_frame(UiHandles::is_valid(shell.palette_search), 33)
     expect_shell_frame(UiHandles::is_valid(shell.open_path_field), 26)
     expect_shell_frame(UiHandles::is_valid(shell.open_button), 27)
+    expect_shell_frame(UiHandles::is_valid(shell.new_project_button), 73)
+    expect_shell_frame(UiHandles::is_valid(shell.build_button), 76)
+    expect_shell_frame(UiHandles::is_valid(shell.run_button), 77)
+    expect_shell_frame(UiHandles::is_valid(shell.stop_button), 78)
     expect_shell_frame(UiHandles::is_valid(shell.save_as_button), 28)
 
     # Exercise the fixed row arrays stored on the global Shell at both ends.
     expect_shell_frame(shell.palette_count == 12, 10)
     expect_shell_frame(shell.hierarchy_count == 12, 11)
-    expect_shell_frame(shell.inspector_count == 12, 12)
-    expect_shell_frame(shell.problem_count == 12, 13)
+    expect_shell_frame(shell.inspector_count == 16, 12)
+    expect_shell_frame(shell.problem_count == 6, 13)
     expect_shell_frame(UiHandles::is_valid(shell.palette_rows[0]), 14)
     expect_shell_frame(UiHandles::is_valid(shell.palette_rows[11]), 15)
     expect_shell_frame(UiHandles::is_valid(shell.hierarchy_rows[0]), 16)
     expect_shell_frame(UiHandles::is_valid(shell.hierarchy_rows[11]), 17)
-    expect_shell_frame(UiHandles::is_valid(shell.inspector_rows[11]), 18)
-    expect_shell_frame(UiHandles::is_valid(shell.inspector_editors[11]), 19)
-    expect_shell_frame(UiHandles::is_valid(shell.inspector_action_buttons[11]), 29)
-    expect_shell_frame(UiHandles::is_valid(shell.inspector_readonly_values[11]), 30)
-    expect_shell_frame(UiHandles::is_valid(shell.problem_rows[11]), 20)
+    expect_shell_frame(UiHandles::is_valid(shell.inspector_rows[15]), 18)
+    expect_shell_frame(UiHandles::is_valid(shell.inspector_editors[15]), 19)
+    expect_shell_frame(UiHandles::is_valid(shell.inspector_action_buttons[15]), 29)
+    expect_shell_frame(UiHandles::is_valid(shell.inspector_rows[15]), 30)
+    expect_shell_frame(UiHandles::is_valid(shell.problem_rows[5]), 20)
     expect_shell_frame(not UiHandles::overflowed(), 21)
     expect_shell_frame(UiHandles::count() > 0, 22)
     expect_shell_frame(UiHandles::count() < 256, 34)
@@ -112,7 +121,8 @@ def app_init() -> void:
     expect_shell_frame(ShellLayout::left_ratio_at(0.0, 1000.0) == 0.08, 52)
     expect_shell_frame(ShellLayout::right_ratio_at(1000.0, 1000.0) == 0.08, 53)
     expect_shell_frame(ShellLayout::bottom_ratio_at(2000.0, 800.0) == 0.08, 54)
-    expect_shell_frame(ShellLayout::is_compact(600.0) and not ShellLayout::is_compact(900.0), 63)
+    expect_shell_frame(ShellLayout::is_compact(600.0) and ShellLayout::is_compact(900.0)
+        and not ShellLayout::is_compact(960.0), 63)
 
     # Exercise actual compact panel selection and return to the three-pane
     # layout at a normal desktop width.
@@ -120,6 +130,10 @@ def app_init() -> void:
     apply_shell_layout(shell)
     UiHandles::layout(600.0, 760.0)
     expect_shell_frame(shell.compact_mode and UiHandles::is_visible(shell.compact_navigation), 64)
+    expect_shell_frame(UiHandles::is_visible(shell.compact_new_project_button) and not UiHandles::is_visible(shell.new_project_button), 74)
+    expect_shell_frame(UiHandles::is_visible(shell.build_button)
+        and UiHandles::is_visible(shell.run_button)
+        and UiHandles::is_visible(shell.stop_button), 79)
     expect_shell_frame(UiHandles::is_visible(shell.center_pane) and not UiHandles::is_visible(shell.left_pane) and not UiHandles::is_visible(shell.right_pane), 65)
     shell.compact_panel <- 1
     apply_shell_layout(shell)
@@ -129,10 +143,17 @@ def app_init() -> void:
     apply_shell_layout(shell)
     UiHandles::layout(600.0, 760.0)
     expect_shell_frame(UiHandles::is_visible(shell.right_pane) and not UiHandles::is_visible(shell.left_pane), 67)
+    app_widget_event(shell.source_button.widget_id.usize(), UiConst::WidgetEvent.Click.i32())
+    expect_shell_frame(shell.source_mode and shell.compact_panel == 0
+        and UiHandles::is_visible(shell.center_pane)
+        and UiHandles::is_visible(shell.source_pane), 82)
+    app_widget_event(shell.source_button.widget_id.usize(), UiConst::WidgetEvent.Click.i32())
+    expect_shell_frame(not shell.source_mode and UiHandles::is_visible(shell.surface_pane), 83)
     UiCore::set_viewport(1180.0, 760.0)
     apply_shell_layout(shell)
     UiHandles::layout(1180.0, 760.0)
     expect_shell_frame(not shell.compact_mode and UiHandles::is_visible(shell.left_pane) and UiHandles::is_visible(shell.center_pane) and UiHandles::is_visible(shell.right_pane), 68)
+    expect_shell_frame(UiHandles::is_visible(shell.new_project_button) and not UiHandles::is_visible(shell.compact_new_project_button), 75)
 
     # A splitter release saves the ratios atomically. A dirty layout left at
     # shutdown is saved through the same function used by main_native.
@@ -182,12 +203,12 @@ def app_frame() -> void:
         expect_shell_frame(UiHandles::is_valid(shell.root), 24)
 
 def main() -> i64:
-    # One frame is enough to exercise app_init, event-loop setup, retained
-    # layout/paint, present, and native teardown while keeping CI bounded.
-    result: i64 = UiSdl3::run("Elisa IDE shell frame test", 1180, 760, 1)
-    if result != 0:
-        shell_frame_report_i64("shell-frame SDL failure=", result)
-        return result
+    # One deterministic frame exercises app_init, retained layout/paint, and
+    # lifecycle teardown while keeping CI bounded and window-free.
+    UiHarness::start(1180.0, 760.0)
+    UiHarness::focus_gained()
+    UiHarness::frame()
+    UiHarness::stop()
     if shell_frame_failure != 0:
         shell_frame_report_i64("shell-frame assertion failure=", shell_frame_failure)
         return 1

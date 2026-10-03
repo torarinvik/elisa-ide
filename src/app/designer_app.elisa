@@ -41,8 +41,9 @@ module DesignerApp:
             return status_label
 
         def status_text() -> sview:
-            return "" if status_length == 0
-            return sview(&status_storage[0], 0, status_length)
+            return "" if status_length <= 0 or status_length > STATUS_CAPACITY.i64()
+            can Unsafe.PointerCast:
+                return UiText::unsafe_sview_bounded_bytes(&status_storage[0], status_length.usize())
 
         def action_count_value() -> i32:
             return action_count

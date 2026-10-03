@@ -1,0 +1,37 @@
+{
+  "format": "elisa-ide-form",
+  "schemaVersion": 1,
+  "id": "form-counter",
+  "name": "Counter",
+  "moduleSymbol": "counter_view",
+  "root": "node-root",
+  "nodes": [
+    {
+      "id": "node-root",
+      "type": "elisa.ui.column",
+      "name": "Counter layout",
+      "symbol": "counter_layout",
+      "properties": {"padding": 24, "spacing": 12},
+      "children": ["node-count", "node-increment"],
+      "events": {}
+    },
+    {
+      "id": "node-count",
+      "type": "elisa.ui.label",
+      "name": "Count",
+      "symbol": "count_label",
+      "properties": {"text": "Count: 0", "size": 24},
+      "children": [],
+      "events": {}
+    },
+    {
+      "id": "node-increment",
+      "type": "elisa.ui.button",
+      "name": "Increment",
+      "symbol": "increment_button",
+      "properties": {"text": "Increment"},
+      "children": [],
+      "events": {"click": {"handler": "CounterHandlers::increment"}}
+    }
+  ]
+}

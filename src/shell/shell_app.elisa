@@ -4,12 +4,13 @@
 # toolbar/command actions to host requests, and refreshes the panels after each
 # action. All shell state lives in the `Shell` record passed by reference.
 
-include "../../framework/src/platform/sdl3/ui_sdl3_flat.elisa"
 include "host_client.elisa"
 include "shell_state.elisa"
 include "shell_layout.elisa"
 include "shell_preview.elisa"
 include "shell_panels.elisa"
+include "../source/external_editor.elisa"
+include "../build/build_job.elisa"
 include "../../framework/src/widgets/ui_shortcuts.elisa"
 
 @link_name("designer_workspace_preferences_load_ratios")
@@ -17,8 +18,11 @@ extern designer_workspace_preferences_load_ratios(left: mutable f64&, right: mut
 @link_name("designer_workspace_preferences_save_ratios")
 extern designer_workspace_preferences_save_ratios(left: f64, right: f64, bottom: f64) -> i64 can[Blocking.IO]
 
-const HOST_PATH: cstr = "build/document_host"
+const PROJECT_BUILD_SCRIPT: cstr = "scripts/build_project.sh"
+const PROJECT_RUN_BINARY: cstr = "build/elisa_project_app"
 const COMMAND_KEY_CAPACITY: usize = 512
+const BUILD_PATH_CAPACITY: usize = 1024
+const PROCESS_OUTPUT_CAPACITY: usize = 4096
 
 const enum ShellCommand of u32:
     NewDocument = 1
@@ -29,8 +33,32 @@ const enum ShellCommand of u32:
     Redo = 6
     DeleteSelection = 7
     DuplicateSelection = 8
+    NewProject = 9
+    MoveSelectionBackward = 10
+    MoveSelectionForward = 11
+    InsertSelection = 17
+    IndentSelection = 15
+    OutdentSelection = 16
+    BuildProject = 12
+    RunProject = 13
+    StopProject = 14
+    CopySelection = 18
+    CutSelection = 19
+    PasteSelection = 20
+    WrapRow = 21
+    WrapColumn = 22
+    UnwrapSelection = 23
+    ConvertOrientation = 24
+    SelectAncestor = 25
 
 global mutable host_process: mutable PosixProcess::Process = PosixProcess::Process{handle: null}
+global mutable host_path_storage: mutable u8[BUILD_PATH_CAPACITY] = zeroed
+global mutable build_process: mutable PosixProcess::Process = PosixProcess::Process{handle: null}
+global mutable run_process: mutable PosixProcess::Process = PosixProcess::Process{handle: null}
+global mutable build_job: BuildJob::Job = zeroed
+global mutable build_revision: u64 = 0
+global mutable build_run_after: bool = false
+global mutable run_active: bool = false
 global mutable shell_command_key_latched: bool[512] = zeroed
 
 def toolbar_button(shell: mutable Shell&, parent: UiHandles::Handle, label: sview, width: f32) -> UiHandles::Handle:
@@ -42,11 +70,43 @@ def toolbar_button(shell: mutable Shell&, parent: UiHandles::Handle, label: svie
 def start_host(shell: mutable Shell&) -> void:
     if shell.host_running:
         return
+    if host_path_storage[0] == 0 and shell_preview_helper_path("document_host", &host_path_storage[0], BUILD_PATH_CAPACITY) != 0:
+        set_status_view(shell, "Document host is missing from this app bundle")
+        return
     _ = PosixFile::remove("build/host_reply.bin")
-    host_process <- HostClient::start(HOST_PATH)
+    host_executable: mutable cstr = ""
+    can Unsafe.PointerCast:
+        host_executable <- (&host_path_storage[0]).cast[cstr] can Unsafe.PointerCast
+    host_process <- HostClient::start(host_executable)
     shell.host_running <- PosixProcess::valid(host_process)
     if shell.host_running:
         _ = HostClient::request(host_process, 10, 0, 0)
+
+def source_path_for_external_action(process: mutable PosixProcess::Process&) -> darray[u8]:
+    path_reply: HostClient::HostReply = HostClient::request(process, 114, 0, 0)
+    return [] if path_reply.result != 1 or path_reply.text.count == 0 or path_reply.text.count > 4096
+    path_buffer: mutable darray[u8] = []
+    path_index: mutable i64 = 0
+    while path_index < path_reply.text.count.i64():
+        byte: u8 = path_reply.text[path_index.usize()]
+        return [] if byte == 0 or byte < 32 or byte == 127
+        path_buffer.push(byte)
+        path_index <- path_index + 1
+    path_buffer.push(0)
+    return path_buffer
+
+def copy_selected_problem(shell: mutable Shell&) -> void:
+    if shell.problem_copy_length <= 0:
+        set_status_view(shell, "Select a diagnostic before copying")
+        return
+    copied: bool = ui_clipboard_write(&shell.problem_copy_bytes[0], shell.problem_copy_length.usize())
+    if copied:
+        if shell.problem_copy_truncated:
+            set_status_view(shell, "Copied the selected diagnostic, truncated to 16 KiB")
+        else:
+            set_status_view(shell, "Copied the selected diagnostic")
+    else:
+        set_status_view(shell, "The system clipboard is unavailable")
 
 def register_shortcuts() -> void:
     UiShortcuts::reset()
@@ -64,6 +124,22 @@ def bind_primary_shortcuts(primary: u32) -> void:
     _ = UiShortcuts::bind_application(UiCore::Key.Z.i32(), primary | UiShortcuts::MOD_SHIFT, ShellCommand.Redo.u32(), false)
     _ = UiShortcuts::bind_application(UiCore::Key.Y.i32(), primary, ShellCommand.Redo.u32(), false)
     _ = UiShortcuts::bind_application(UiCore::Key.D.i32(), primary, ShellCommand.DuplicateSelection.u32(), false)
+    _ = UiShortcuts::bind_application(UiCore::Key.C.i32(), primary, ShellCommand.CopySelection.u32(), false)
+    _ = UiShortcuts::bind_application(UiCore::Key.X.i32(), primary, ShellCommand.CutSelection.u32(), false)
+    _ = UiShortcuts::bind_application(UiCore::Key.V.i32(), primary, ShellCommand.PasteSelection.u32(), false)
+    _ = UiShortcuts::bind_application(UiCore::Key.R.i32(), primary | UiShortcuts::MOD_SHIFT, ShellCommand.WrapRow.u32(), false)
+    _ = UiShortcuts::bind_application(UiCore::Key.W.i32(), primary | UiShortcuts::MOD_SHIFT, ShellCommand.WrapColumn.u32(), false)
+    _ = UiShortcuts::bind_application(UiCore::Key.U.i32(), primary | UiShortcuts::MOD_SHIFT, ShellCommand.UnwrapSelection.u32(), false)
+    _ = UiShortcuts::bind_application(UiCore::Key.O.i32(), primary | UiShortcuts::MOD_SHIFT, ShellCommand.ConvertOrientation.u32(), false)
+    _ = UiShortcuts::bind_application(UiCore::Key.Up.i32(), primary | UiShortcuts::MOD_ALT, ShellCommand.SelectAncestor.u32(), false)
+    _ = UiShortcuts::bind_application(UiCore::Key.I.i32(), primary, ShellCommand.InsertSelection.u32(), false)
+    _ = UiShortcuts::bind_application(UiCore::Key.Up.i32(), primary | UiShortcuts::MOD_SHIFT, ShellCommand.MoveSelectionBackward.u32(), false)
+    _ = UiShortcuts::bind_application(UiCore::Key.Down.i32(), primary | UiShortcuts::MOD_SHIFT, ShellCommand.MoveSelectionForward.u32(), false)
+    _ = UiShortcuts::bind_application(UiCore::Key.RightBracket.i32(), primary | UiShortcuts::MOD_CONTROL | UiShortcuts::MOD_SHIFT, ShellCommand.IndentSelection.u32(), false)
+    _ = UiShortcuts::bind_application(UiCore::Key.LeftBracket.i32(), primary | UiShortcuts::MOD_CONTROL | UiShortcuts::MOD_SHIFT, ShellCommand.OutdentSelection.u32(), false)
+    _ = UiShortcuts::bind_application(UiCore::Key.B.i32(), primary, ShellCommand.BuildProject.u32(), false)
+    _ = UiShortcuts::bind_application(UiCore::Key.R.i32(), primary, ShellCommand.RunProject.u32(), false)
+    _ = UiShortcuts::bind_application(UiCore::Key.C.i32(), primary | UiShortcuts::MOD_SHIFT, ShellCommand.StopProject.u32(), false)
     _ = UiShortcuts::bind_application(UiCore::Key.Delete.i32(), 0, ShellCommand.DeleteSelection.u32(), false)
 
 def apply_shell_layout(shell: mutable Shell&) -> void:
@@ -77,8 +153,13 @@ def apply_shell_layout(shell: mutable Shell&) -> void:
     UiHandles::set_visible(shell.open_path_field, not compact)
     UiHandles::set_visible(shell.open_button, not compact)
     UiHandles::set_visible(shell.save_as_button, not compact)
+    UiHandles::set_visible(shell.new_project_button, not compact)
     UiHandles::set_visible(shell.delete_button, not compact)
     UiHandles::set_visible(shell.duplicate_button, not compact)
+    UiHandles::set_visible(shell.surface_pane, not shell.source_mode)
+    UiHandles::set_visible(shell.source_pane, shell.source_mode)
+    UiHandles::set_grow(shell.surface_pane, 0.0 if shell.source_mode else 1.0)
+    UiHandles::set_grow(shell.source_pane, 1.0 if shell.source_mode else 0.0)
     if compact:
         shell.compact_panel <- 0 if shell.compact_panel < 0 or shell.compact_panel > 2
         UiHandles::set_visible(shell.left_pane, shell.compact_panel == 1)
@@ -130,6 +211,360 @@ def update_split_from_pointer(shell: mutable Shell&, at: UiCore::Vec2) -> void:
     apply_shell_layout(shell)
     UiHandles::layout(UiCore::viewport_width(), UiCore::viewport_height())
 
+def pointer_over_handle(handle: UiHandles::Handle, at: UiCore::Vec2) -> bool:
+    UiHandles::ensure_layout()
+    if UiHandles::widget(handle) is widget:
+        return at.x >= widget.x and at.x <= widget.x + widget.width and at.y >= widget.y and at.y <= widget.y + widget.height
+    return false
+
+def source_row_at(shell: Shell&, at: UiCore::Vec2) -> i32:
+    index: mutable i32 = 0
+    while index < shell.source_line_count:
+        if pointer_over_handle(shell.source_line_rows[index.usize()], at):
+            return index
+        index <- index + 1
+    return -1
+
+def focused_source_row(shell: Shell&) -> i32:
+    index: mutable i32 = 0
+    while index < shell.source_line_count:
+        if UiHandles::is_focused(shell.source_line_rows[index.usize()]):
+            return index
+        index <- index + 1
+    return -1
+
+def indent_source_line(shell: mutable Shell&, outdent: bool) -> bool:
+    return false if not shell.source_mode or not shell.host_running or HostClient::request(host_process, 113, 0, 0).result != 1
+    row_index: i32 = focused_source_row(shell)
+    return false if row_index < 0 or row_index >= shell.source_line_count
+    row: UiHandles::Handle = shell.source_line_rows[row_index.usize()]
+    return false if not UiHandles::is_enabled(row)
+    line_number: i64 = shell.source_line_offsets[row_index.usize()]
+    line_start: i64 = HostClient::request(host_process, 118, line_number, 0).result
+    line_reply: HostClient::HostReply = HostClient::request(host_process, 116, line_number, 0)
+    return false if line_start < 0 or line_reply.result != 1
+    line: sview = ShellBytes::view_of(&line_reply.text)
+    leading: mutable i64 = 0
+    while leading < line.len and (line[leading] == 32 or line[leading] == 9):
+        leading <- leading + 1
+    remove_count: mutable i64 = 0
+    insertion: mutable sview = "    "
+    edit_start: mutable i64 = line_start + leading
+    edit_finish: mutable i64 = edit_start
+    if outdent:
+        insertion <- ""
+        edit_start <- line_start
+        if line.len > 0 and line[0] == 9:
+            remove_count <- 1
+        else:
+            remove_count <- leading if leading < 4 else 4
+        return true if remove_count == 0
+        edit_finish <- line_start + remove_count
+    prefix: darray[u8] = source_line_prefix(line_number + 1)
+    caret_byte: usize = UiFlat::selection_end(row.widget_id.usize())
+    caret_column: mutable i64 = caret_byte.i64() - prefix.count.i64()
+    caret_column <- 0 if caret_column < 0
+    next_column: mutable i64 = caret_column
+    if outdent:
+        next_column <- caret_column - remove_count if caret_column >= remove_count else 0
+    elif caret_column >= leading:
+        next_column <- caret_column + 4
+    changed: HostClient::HostReply = HostClient::request_text(host_process, 133, edit_start, edit_finish, insertion)
+    if changed.result != 1:
+        set_status(shell, HostClient::request(host_process, 56, 0, 0).text)
+        return true
+    shell.source_page_start <- (line_number / MAX_SOURCE_LINES.i64()) * MAX_SOURCE_LINES.i64()
+    refresh_source_view(shell, host_process)
+    target_index: i32 = (line_number - shell.source_page_start).i32()
+    if target_index >= 0 and target_index < shell.source_line_count:
+        target_row: UiHandles::Handle = shell.source_line_rows[target_index.usize()]
+        if UiHandles::request_focus(target_row):
+            target_prefix: darray[u8] = source_line_prefix(line_number + 1)
+            target_value: sview = UiHandles::text_value(target_row)
+            available_bytes: mutable i64 = target_value.len - target_prefix.count.i64()
+            available_bytes <- 0 if available_bytes < 0
+            next_column <- available_bytes if next_column > available_bytes
+            cursor_byte: usize = (target_prefix.count.i64() + next_column).usize()
+            cursor_units: usize = UiFlat::text_utf16_offset(target_row.widget_id.usize(), cursor_byte)
+            UiHandles::set_selection_utf16(target_row, cursor_units, 0)
+            shell.source_selected_line <- line_number + 1
+    set_status(shell, HostClient::request(host_process, 56, 0, 0).text)
+    return true
+
+def insert_source_line_break(shell: mutable Shell&) -> bool:
+    return false if not shell.source_mode or not shell.host_running
+    return false if HostClient::request(host_process, 113, 0, 0).result != 1
+    row_index: mutable i32 = focused_source_row(shell)
+    return false if row_index < 0
+    row: UiHandles::Handle = shell.source_line_rows[row_index.usize()]
+    line_number: i64 = shell.source_line_offsets[row_index.usize()]
+    prefix: darray[u8] = source_line_prefix(line_number + 1)
+    value: sview = UiHandles::text_value(row)
+    content_length: mutable i64 = value.len - prefix.count.i64()
+    content_length <- 0 if content_length < 0
+    selection_start: mutable i64 = UiFlat::selection_start(row.widget_id.usize()).i64() - prefix.count.i64()
+    selection_end: mutable i64 = UiFlat::selection_end(row.widget_id.usize()).i64() - prefix.count.i64()
+    selection_start <- 0 if selection_start < 0
+    selection_end <- 0 if selection_end < 0
+    selection_start <- content_length if selection_start > content_length
+    selection_end <- content_length if selection_end > content_length
+    line_start: i64 = HostClient::request(host_process, 118, line_number, 0).result
+    if line_start < 0:
+        set_status_view(shell, "The selected source line is no longer available")
+        return true
+    edited: HostClient::HostReply = HostClient::request_text(host_process, 133, line_start + selection_start, line_start + selection_end, "\n")
+    if edited.result != 1:
+        set_status(shell, HostClient::request(host_process, 56, 0, 0).text)
+        return true
+    target_line: i64 = line_number + 1
+    shell.source_page_start <- (target_line / MAX_SOURCE_LINES.i64()) * MAX_SOURCE_LINES.i64()
+    refresh_source_view(shell, host_process)
+    target_index: i32 = (target_line - shell.source_page_start).i32()
+    if target_index >= 0 and target_index < shell.source_line_count:
+        target_row: UiHandles::Handle = shell.source_line_rows[target_index.usize()]
+        if UiHandles::request_focus(target_row):
+            target_prefix: darray[u8] = source_line_prefix(target_line + 1)
+            cursor: usize = UiFlat::text_utf16_offset(target_row.widget_id.usize(), target_prefix.count)
+            UiHandles::set_selection_utf16(target_row, cursor, 0)
+            shell.source_selected_line <- target_line + 1
+    set_status(shell, HostClient::request(host_process, 56, 0, 0).text)
+    return true
+
+def merge_source_lines(shell: mutable Shell&, direction: i32) -> bool:
+    return false if not shell.source_mode or not shell.host_running or (direction != -1 and direction != 1)
+    return false if HostClient::request(host_process, 113, 0, 0).result != 1
+    row_index: i32 = focused_source_row(shell)
+    return false if row_index < 0
+    row: UiHandles::Handle = shell.source_line_rows[row_index.usize()]
+    line_number: i64 = shell.source_line_offsets[row_index.usize()]
+    value: sview = UiHandles::text_value(row)
+    prefix: darray[u8] = source_line_prefix(line_number + 1)
+    content_length: mutable i64 = value.len - prefix.count.i64()
+    content_length <- 0 if content_length < 0
+    selection_start: usize = UiFlat::selection_start(row.widget_id.usize())
+    selection_end: usize = UiFlat::selection_end(row.widget_id.usize())
+    return false if selection_start != selection_end
+    caret_column: mutable i64 = selection_start.i64() - prefix.count.i64()
+    caret_column <- 0 if caret_column < 0
+    caret_column <- content_length if caret_column > content_length
+    return false if direction < 0 and caret_column != 0
+    return false if direction > 0 and caret_column != content_length
+    neighbor_line: i64 = line_number + direction.i64()
+    total: i64 = HostClient::request(host_process, 115, 0, 0).result
+    return false if neighbor_line < 0 or neighbor_line >= total
+    current_start: i64 = HostClient::request(host_process, 118, line_number, 0).result
+    current_text: HostClient::HostReply = HostClient::request(host_process, 116, line_number, 0)
+    return false if current_start < 0 or current_text.result != 1
+    neighbor_start: i64 = HostClient::request(host_process, 118, neighbor_line, 0).result
+    neighbor_text: HostClient::HostReply = HostClient::request(host_process, 116, neighbor_line, 0)
+    if neighbor_start < 0 or neighbor_text.result != 1:
+        set_status_view(shell, "Cannot merge with a clipped, read-only source line")
+        return true
+    delete_start: mutable i64 = current_start + current_text.text.count.i64()
+    delete_end: mutable i64 = neighbor_start
+    target_line: mutable i64 = line_number
+    target_column: mutable i64 = current_text.text.count.i64()
+    if direction < 0:
+        delete_start <- neighbor_start + neighbor_text.text.count.i64()
+        delete_end <- current_start
+        target_line <- neighbor_line
+        target_column <- neighbor_text.text.count.i64()
+    if delete_end <= delete_start:
+        set_status_view(shell, "The adjacent source lines do not have a removable line ending")
+        return true
+    merged: HostClient::HostReply = HostClient::request_text(host_process, 133, delete_start, delete_end, "")
+    if merged.result != 1:
+        set_status(shell, HostClient::request(host_process, 56, 0, 0).text)
+        return true
+    shell.source_page_start <- (target_line / MAX_SOURCE_LINES.i64()) * MAX_SOURCE_LINES.i64()
+    refresh_source_view(shell, host_process)
+    target_index: i32 = (target_line - shell.source_page_start).i32()
+    if target_index >= 0 and target_index < shell.source_line_count:
+        target_row: UiHandles::Handle = shell.source_line_rows[target_index.usize()]
+        if UiHandles::request_focus(target_row):
+            target_prefix: darray[u8] = source_line_prefix(target_line + 1)
+            target_bytes: mutable i64 = target_prefix.count.i64() + target_column
+            target_text: sview = UiHandles::text_value(target_row)
+            target_bytes <- target_text.len if target_bytes > target_text.len
+            cursor: usize = UiFlat::text_utf16_offset(target_row.widget_id.usize(), target_bytes.usize())
+            UiHandles::set_selection_utf16(target_row, cursor, 0)
+            shell.source_selected_line <- target_line + 1
+    set_status(shell, HostClient::request(host_process, 56, 0, 0).text)
+    return true
+
+def move_source_caret(shell: mutable Shell&, direction: i32, page_jump: bool) -> bool:
+    return false if not shell.source_mode or not shell.host_running or (direction != -1 and direction != 1)
+    return false if HostClient::request(host_process, 113, 0, 0).result != 1
+    current_index: i32 = focused_source_row(shell)
+    return false if current_index < 0
+    current_row: UiHandles::Handle = shell.source_line_rows[current_index.usize()]
+    current_prefix: darray[u8] = source_line_prefix(shell.source_line_offsets[current_index.usize()] + 1)
+    current_caret: usize = UiFlat::selection_end(current_row.widget_id.usize())
+    source_column: mutable i64 = current_caret.i64() - current_prefix.count.i64()
+    source_column <- 0 if source_column < 0
+    total: i64 = HostClient::request(host_process, 115, 0, 0).result
+    current_line: i64 = shell.source_line_offsets[current_index.usize()]
+    step: i64 = MAX_SOURCE_LINES.i64() if page_jump else 1
+    target_line: mutable i64 = current_line + direction.i64() * step
+    if page_jump and target_line < 0:
+        target_line <- 0
+    if page_jump and target_line >= total:
+        target_line <- total - 1
+    return false if target_line < 0 or target_line >= total
+    target_page: i64 = (target_line / MAX_SOURCE_LINES.i64()) * MAX_SOURCE_LINES.i64()
+    if target_page != shell.source_page_start:
+        shell.source_page_start <- target_page
+        refresh_source_view(shell, host_process)
+    target_index: mutable i32 = (target_line - shell.source_page_start).i32()
+    while target_index >= 0 and target_index < shell.source_line_count and not UiHandles::is_enabled(shell.source_line_rows[target_index.usize()]):
+        target_index <- target_index + direction
+    return false if target_index < 0 or target_index >= shell.source_line_count
+    target_row: UiHandles::Handle = shell.source_line_rows[target_index.usize()]
+    return false if not UiHandles::request_focus(target_row)
+    target_prefix: darray[u8] = source_line_prefix(shell.source_line_offsets[target_index.usize()] + 1)
+    target_value: sview = UiHandles::text_value(target_row)
+    target_column: mutable i64 = target_value.len - target_prefix.count.i64()
+    target_column <- source_column if source_column < target_column
+    target_byte: usize = (target_prefix.count.i64() + target_column).usize()
+    target_utf16: usize = UiFlat::text_utf16_offset(target_row.widget_id.usize(), target_byte)
+    UiHandles::set_selection_utf16(target_row, target_utf16, 0)
+    shell.source_selected_line <- shell.source_line_offsets[target_index.usize()] + 1
+    return true
+
+def move_source_caret_vertically(shell: mutable Shell&, direction: i32) -> bool:
+    return move_source_caret(shell, direction, false)
+
+def move_source_caret_by_page(shell: mutable Shell&, direction: i32) -> bool:
+    return move_source_caret(shell, direction, true)
+
+def hierarchy_row_at(shell: Shell&, at: UiCore::Vec2) -> i64:
+    index: mutable i32 = 0
+    while index < shell.hierarchy_count:
+        if pointer_over_handle(shell.hierarchy_rows[index.usize()], at):
+            return shell.hierarchy_page.i64() * MAX_HIERARCHY_ROWS.i64() + index.i64()
+        index <- index + 1
+    return -1
+
+def palette_source_at(shell: Shell&, at: UiCore::Vec2) -> i64:
+    index: mutable i32 = 0
+    while index < shell.palette_count:
+        if pointer_over_handle(shell.palette_rows[index.usize()], at):
+            return shell.palette_source_indices[index.usize()].i64()
+        index <- index + 1
+    return -1
+
+def clear_drag_feedback(shell: mutable Shell&, process: mutable PosixProcess::Process&) -> void:
+    had_feedback: bool = shell.drag_feedback_target >= 0
+    shell.drag_kind <- 0
+    shell.drag_palette_index <- -1
+    shell.drag_source_row <- -1
+    shell.drag_target_row <- -1
+    shell.drag_start_x <- 0.0
+    shell.drag_start_y <- 0.0
+    shell.drag_moved <- false
+    shell.drag_feedback_target <- -1
+    shell.drag_feedback_valid <- false
+    if had_feedback and shell.host_running:
+        refresh_hierarchy(shell, process)
+
+def update_drag_feedback(shell: mutable Shell&, process: mutable PosixProcess::Process&, target_row: i64) -> void:
+    if target_row == shell.drag_feedback_target:
+        return
+    if shell.drag_feedback_target >= 0 and shell.host_running:
+        refresh_hierarchy(shell, process)
+    shell.drag_feedback_target <- target_row
+    shell.drag_target_row <- target_row
+    if target_row < 0 or not shell.host_running:
+        shell.drag_feedback_valid <- false
+        set_status_view(shell, "Drop outside the hierarchy")
+        return
+    valid: mutable i64 = 0
+    if shell.drag_kind == 1:
+        valid <- HostClient::request(process, 86, shell.drag_palette_index.i64(), target_row).result
+    elif shell.drag_kind == 2:
+        valid <- HostClient::request(process, 88, target_row, 0).result
+    shell.drag_feedback_valid <- valid == 1
+    visible_row: i64 = target_row - shell.hierarchy_page.i64() * MAX_HIERARCHY_ROWS.i64()
+    if visible_row >= 0 and visible_row < shell.hierarchy_count.i64():
+        row: UiHandles::Handle = shell.hierarchy_rows[visible_row.usize()]
+        if shell.drag_feedback_valid:
+            UiHandles::set_colors(row, shell_color(42, 92, 66), shell_color(56, 116, 80), shell_color(30, 72, 50))
+            UiHandles::set_help(row, "Release to drop here")
+            set_status_view(shell, "Drop to insert/reparent")
+        else:
+            UiHandles::set_colors(row, shell_color(104, 48, 54), shell_color(132, 60, 68), shell_color(82, 36, 42))
+            UiHandles::set_help(row, "This component cannot accept the drop")
+            set_status_view(shell, "Cannot drop here")
+
+def begin_drag(shell: mutable Shell&, at: UiCore::Vec2, button: i32) -> void:
+    return if button != UiCore::PointerButton.Primary.i32() or shell.active_split > 0
+    palette_index: i64 = palette_source_at(shell, at)
+    if palette_index >= 0:
+        shell.drag_kind <- 1
+        shell.drag_palette_index <- palette_index.i32()
+        shell.drag_source_row <- -1
+        shell.drag_target_row <- -1
+        shell.drag_start_x <- at.x
+        shell.drag_start_y <- at.y
+        shell.drag_moved <- false
+        shell.drag_feedback_target <- -1
+        shell.drag_feedback_valid <- false
+        return
+    hierarchy_row: i64 = hierarchy_row_at(shell, at)
+    if hierarchy_row >= 0:
+        shell.drag_kind <- 2
+        shell.drag_palette_index <- -1
+        shell.drag_source_row <- hierarchy_row
+        shell.drag_target_row <- -1
+        shell.drag_start_x <- at.x
+        shell.drag_start_y <- at.y
+        shell.drag_moved <- false
+        shell.drag_feedback_target <- -1
+        shell.drag_feedback_valid <- false
+
+def update_drag(shell: mutable Shell&, process: mutable PosixProcess::Process&, at: UiCore::Vec2) -> bool:
+    return false if shell.drag_kind == 0
+    dx: f32 = at.x - shell.drag_start_x
+    dy: f32 = at.y - shell.drag_start_y
+    if not shell.drag_moved:
+        shell.drag_moved <- true if dx > 4.0 or dx < -4.0 or dy > 4.0 or dy < -4.0
+    return false if not shell.drag_moved
+    update_drag_feedback(shell, process, hierarchy_row_at(shell, at))
+    return true
+
+def pointer_over_preview(shell: Shell&, at: UiCore::Vec2) -> bool:
+    if UiHandles::widget(shell.preview_canvas) is canvas:
+        return at.x >= canvas.x and at.y >= canvas.y and at.x < canvas.x + canvas.width and at.y < canvas.y + canvas.height
+    return false
+
+def begin_canvas_marquee(shell: mutable Shell&, at: UiCore::Vec2, button: i32) -> void:
+    return if button != UiCore::PointerButton.Primary.i32() or not pointer_over_preview(shell, at)
+    shell.canvas_marquee_active <- true
+    shell.canvas_marquee_moved <- false
+    shell.canvas_marquee_start_x <- at.x
+    shell.canvas_marquee_start_y <- at.y
+    shell.canvas_marquee_end_x <- at.x
+    shell.canvas_marquee_end_y <- at.y
+
+def clear_canvas_marquee(shell: mutable Shell&) -> void:
+    shell.canvas_marquee_active <- false
+    shell.canvas_marquee_moved <- false
+    shell.canvas_marquee_start_x <- 0.0
+    shell.canvas_marquee_start_y <- 0.0
+    shell.canvas_marquee_end_x <- 0.0
+    shell.canvas_marquee_end_y <- 0.0
+
+def update_canvas_marquee(shell: mutable Shell&, at: UiCore::Vec2) -> bool:
+    return false if not shell.canvas_marquee_active
+    shell.canvas_marquee_end_x <- at.x
+    shell.canvas_marquee_end_y <- at.y
+    dx: f32 = at.x - shell.canvas_marquee_start_x
+    dy: f32 = at.y - shell.canvas_marquee_start_y
+    if not shell.canvas_marquee_moved and (dx > 4.0 or dx < -4.0 or dy > 4.0 or dy < -4.0):
+        shell.canvas_marquee_moved <- true
+        set_status_view(shell, "Drag across the design surface to select components")
+    return shell.canvas_marquee_moved
+
 def load_pane_preferences(shell: mutable Shell&) -> void:
     can Blocking.IO:
         left: mutable f64 = shell.left_ratio.f64()
@@ -162,13 +597,31 @@ def build_shell(shell: mutable Shell&) -> void:
     shell.toolbar <- UiHandles::row(shell.root, 2.0, 6.0, shell_color(30, 33, 40))
     UiHandles::set_grow(shell.toolbar, 0.0)
     shell.new_button <- toolbar_button(shell, shell.toolbar, "New", 64.0)
+    shell.new_project_button <- toolbar_button(shell, shell.toolbar, "New Project", 92.0)
+    shell.build_button <- toolbar_button(shell, shell.toolbar, "Build", 64.0)
+    UiHandles::set_help(shell.build_button, "Generate and compile the project in the path field")
+    shell.run_button <- toolbar_button(shell, shell.toolbar, "Run", 58.0)
+    UiHandles::set_help(shell.run_button, "Run the artifact from the latest successful build")
+    shell.stop_button <- toolbar_button(shell, shell.toolbar, "Stop", 58.0)
+    UiHandles::set_help(shell.stop_button, "Cancel the active build or stop the running application")
     shell.save_button <- toolbar_button(shell, shell.toolbar, "Save", 64.0)
+    shell.source_button <- toolbar_button(shell, shell.toolbar, "Source", 72.0)
+    UiHandles::set_help(shell.source_button, "Show an opened Elisa source file or the generated view")
+    shell.reload_button <- toolbar_button(shell, shell.toolbar, "Reload", 72.0)
+    UiHandles::set_help(shell.reload_button, "Reload the on-disk form after an external change when the document is clean")
+    UiHandles::set_visible(shell.reload_button, false)
+    shell.recovery_restore_button <- toolbar_button(shell, shell.toolbar, "Restore", 72.0)
+    UiHandles::set_help(shell.recovery_restore_button, "Restore the last autosaved working copy without overwriting the project file")
+    shell.recovery_discard_button <- toolbar_button(shell, shell.toolbar, "Discard", 72.0)
+    UiHandles::set_help(shell.recovery_discard_button, "Discard the autosaved working copy and keep the on-disk document")
+    UiHandles::set_visible(shell.recovery_restore_button, false)
+    UiHandles::set_visible(shell.recovery_discard_button, false)
     shell.undo_button <- toolbar_button(shell, shell.toolbar, "Undo", 64.0)
     shell.redo_button <- toolbar_button(shell, shell.toolbar, "Redo", 64.0)
     shell.delete_button <- toolbar_button(shell, shell.toolbar, "Delete", 72.0)
     shell.duplicate_button <- toolbar_button(shell, shell.toolbar, "Duplicate", 84.0)
-    shell.open_path_field <- UiHandles::text_field(shell.toolbar, "Document path", "Type a form/project path", "", 250.0, 24.0, 12.0, shell_color(232, 236, 246), shell_color(27, 32, 43))
-    UiHandles::set_help(shell.open_path_field, "Path to a .elisaform.json or .elisaproject.json file")
+    shell.open_path_field <- UiHandles::text_field(shell.toolbar, "Document path", "Document path or new project folder", "", 250.0, 24.0, 12.0, shell_color(232, 236, 246), shell_color(27, 32, 43))
+    UiHandles::set_help(shell.open_path_field, "Open an .elisa source file, .elisaform.json, or .elisaproject.json; save a form or create a project here")
     UiHandles::set_grow(shell.open_path_field, 1.0)
     shell.open_button <- toolbar_button(shell, shell.toolbar, "Open", 58.0)
     shell.save_as_button <- toolbar_button(shell, shell.toolbar, "Save As", 72.0)
@@ -184,11 +637,13 @@ def build_shell(shell: mutable Shell&) -> void:
 
     shell.compact_path_row <- UiHandles::row(shell.root, 2.0, 6.0, shell_color(30, 33, 40))
     UiHandles::set_grow(shell.compact_path_row, 0.0)
-    shell.compact_open_path_field <- UiHandles::text_field(shell.compact_path_row, "Document path", "Type a form/project path", "", 120.0, 24.0, 12.0, shell_color(232, 236, 246), shell_color(27, 32, 43))
-    UiHandles::set_help(shell.compact_open_path_field, "Path to a .elisaform.json or .elisaproject.json file")
+    shell.compact_open_path_field <- UiHandles::text_field(shell.compact_path_row, "Document path", "Document path or project folder", "", 96.0, 24.0, 12.0, shell_color(232, 236, 246), shell_color(27, 32, 43))
+    UiHandles::set_help(shell.compact_open_path_field, "Open a document, save a form, or create a project in this folder")
     UiHandles::set_grow(shell.compact_open_path_field, 1.0)
     shell.compact_open_button <- toolbar_button(shell, shell.compact_path_row, "Open", 58.0)
     shell.compact_save_as_button <- toolbar_button(shell, shell.compact_path_row, "Save As", 72.0)
+    shell.compact_new_project_button <- toolbar_button(shell, shell.compact_path_row, "New Proj", 66.0)
+    UiHandles::set_help(shell.compact_new_project_button, "Create a project in the folder shown in the path field")
 
     shell.body <- UiHandles::row(shell.root, 2.0, 4.0, shell_color(17, 20, 27))
     UiHandles::set_grow(shell.body, 1.0)
@@ -204,16 +659,92 @@ def build_shell(shell: mutable Shell&) -> void:
     UiHandles::set_grow(shell.right_pane, 0.0)
 
     left_parent: UiHandles::Handle = shell.left_pane
+    build_files(shell, left_parent)
     build_palette(shell, left_parent)
 
     shell.surface_pane <- UiHandles::column(shell.center_pane, 6.0, 4.0, shell_color(22, 25, 31))
     UiHandles::set_grow(shell.surface_pane, 1.0)
-    _ = UiHandles::label(shell.surface_pane, "Design surface", 18.0, shell_color(230, 234, 242))
-    shell.preview_status <- UiHandles::label(shell.surface_pane, "Waiting for form preview", 11.0, shell_color(148, 158, 180))
-    UiHandles::set_grow(shell.preview_status, 0.0)
+    preview_toolbar: UiHandles::Handle = UiHandles::row(shell.surface_pane, 6.0, 0.0, shell_color(22, 25, 31))
+    UiHandles::set_grow(preview_toolbar, 0.0)
+    shell.preview_status <- UiHandles::label(preview_toolbar, "Waiting for form preview", 11.0, shell_color(148, 158, 180))
+    UiHandles::set_grow(shell.preview_status, 1.0)
+    shell.preview_retry_button <- toolbar_button(shell, preview_toolbar, "Rebuild Preview", 112.0)
+    UiHandles::set_help(shell.preview_retry_button, "Stop the current preview job and render the latest form again")
     shell.preview_canvas <- UiHandles::panel(shell.surface_pane, UiConst::Axis.Column, 0.0, 0.0, shell_color(11, 14, 20))
     UiHandles::set_grow(shell.preview_canvas, 1.0)
     UiHandles::set_image_fit(shell.preview_canvas, UiCore::PictureFit.Contain)
+    shell.source_pane <- UiHandles::column(shell.center_pane, 6.0, 4.0, shell_color(22, 25, 31))
+    UiHandles::set_grow(shell.source_pane, 0.0)
+    source_header: UiHandles::Handle = UiHandles::row(shell.source_pane, 6.0, 0.0, shell_color(22, 25, 31))
+    UiHandles::set_grow(source_header, 0.0)
+    shell.source_title <- UiHandles::label(source_header, "Generated Elisa source (read-only)", 15.0, shell_color(230, 234, 242))
+    shell.source_open_editor_button <- toolbar_button(shell, source_header, "Open in Editor", 112.0)
+    UiHandles::set_help(shell.source_open_editor_button, "Open the selected handwritten source line in the editor configured by ELISA_IDE_EDITOR")
+    UiHandles::set_visible(shell.source_open_editor_button, false)
+    UiHandles::set_enabled(shell.source_open_editor_button, false)
+    shell.source_reveal_button <- toolbar_button(shell, source_header, "Reveal", 62.0)
+    UiHandles::set_help(shell.source_reveal_button, "Reveal the opened handwritten source file in the filesystem")
+    UiHandles::set_visible(shell.source_reveal_button, false)
+    UiHandles::set_enabled(shell.source_reveal_button, false)
+    shell.source_previous_button <- toolbar_button(shell, source_header, "Prev", 42.0)
+    shell.source_next_button <- toolbar_button(shell, source_header, "Next", 42.0)
+    UiHandles::set_enabled(shell.source_previous_button, false)
+    UiHandles::set_enabled(shell.source_next_button, false)
+    shell.source_ownership <- UiHandles::label(source_header, "Form: (unsaved) | generated view is read-only | visible rows: 32", 10.0, shell_color(148, 158, 180))
+    UiHandles::set_cross_alignment(shell.source_ownership, UiConst::CrossAlignment.End)
+    UiHandles::set_grow(shell.source_ownership, 1.0)
+    UiHandles::set_help(shell.source_ownership, "Generated source is owned by the form file shown here; edit the form or handwritten handler source instead")
+    source_find_row: UiHandles::Handle = UiHandles::row(shell.source_pane, 5.0, 2.0, shell_color(22, 25, 31))
+    UiHandles::set_grow(source_find_row, 0.0)
+    shell.source_find_field <- UiHandles::text_field(source_find_row, "Find in source", "Search source text", "", 120.0, 22.0, 11.0, shell_color(232, 236, 246), shell_color(27, 32, 43))
+    UiHandles::set_grow(shell.source_find_field, 1.0)
+    UiHandles::set_help(shell.source_find_field, "Find a case-sensitive UTF-8 text match in the open source file")
+    shell.source_find_previous_button <- toolbar_button(shell, source_find_row, "Prev", 48.0)
+    shell.source_find_next_button <- toolbar_button(shell, source_find_row, "Next", 48.0)
+    source_replace_row: UiHandles::Handle = UiHandles::row(shell.source_pane, 5.0, 2.0, shell_color(22, 25, 31))
+    UiHandles::set_grow(source_replace_row, 0.0)
+    shell.source_replace_field <- UiHandles::text_field(source_replace_row, "Replace source text", "Replacement text", "", 120.0, 22.0, 11.0, shell_color(232, 236, 246), shell_color(27, 32, 43))
+    UiHandles::set_grow(shell.source_replace_field, 1.0)
+    UiHandles::set_help(shell.source_replace_field, "Replace the selected Find match; inserted text is limited to one source line")
+    shell.source_replace_next_button <- toolbar_button(shell, source_replace_row, "Replace Next", 94.0)
+    shell.source_replace_all_button <- toolbar_button(shell, source_replace_row, "Replace All", 82.0)
+    source_navigation_row: UiHandles::Handle = UiHandles::row(shell.source_pane, 5.0, 2.0, shell_color(22, 25, 31))
+    UiHandles::set_grow(source_navigation_row, 0.0)
+    shell.source_goto_field <- UiHandles::text_field(source_navigation_row, "Go to source line", "Line number", "", 120.0, 22.0, 11.0, shell_color(232, 236, 246), shell_color(27, 32, 43))
+    UiHandles::set_help(shell.source_goto_field, "Enter a one-based source line number and press Enter or Go")
+    shell.source_goto_button <- toolbar_button(shell, source_navigation_row, "Go", 48.0)
+    shell.source_conflict_bar <- UiHandles::row(shell.source_pane, 5.0, 2.0, shell_color(74, 56, 28))
+    UiHandles::set_grow(shell.source_conflict_bar, 0.0)
+    shell.source_conflict_message <- UiHandles::label(shell.source_conflict_bar, "The source file changed on disk", 10.0, shell_color(246, 210, 145))
+    UiHandles::set_grow(shell.source_conflict_message, 1.0)
+    shell.source_compare_button <- toolbar_button(shell, shell.source_conflict_bar, "Compare", 68.0)
+    UiHandles::set_help(shell.source_compare_button, "Compare local source lines against the current disk version, or return to the editor")
+    shell.source_keep_buffer_button <- toolbar_button(shell, shell.source_conflict_bar, "Keep Buffer", 86.0)
+    shell.source_reload_external_button <- toolbar_button(shell, shell.source_conflict_bar, "Discard + Reload", 112.0)
+    UiHandles::set_help(shell.source_reload_external_button, "Discard local source edits and replace this buffer with the current disk version")
+    UiHandles::set_visible(shell.source_conflict_bar, false)
+    UiHandles::set_enabled(shell.source_compare_button, false)
+    UiHandles::set_enabled(shell.source_keep_buffer_button, false)
+    UiHandles::set_enabled(shell.source_reload_external_button, false)
+    shell.source_scroll <- UiHandles::scroll(shell.source_pane, UiConst::Axis.Column, 6.0, 6.0, shell_color(11, 14, 20))
+    UiHandles::set_grow(shell.source_scroll, 1.0)
+    shell.source_text <- UiHandles::label(shell.source_scroll, "Open a form to inspect generated source.", 11.0, shell_color(205, 214, 232))
+    UiHandles::set_cross_alignment(shell.source_text, UiConst::CrossAlignment.Start)
+    # Keep the complete generated bytes on a retained label for exact source
+    # inspection and protocol tests, while the visible rows below provide a
+    # bounded clickable projection for source-to-form ownership navigation.
+    UiHandles::set_visible(shell.source_text, false)
+    UiHandles::set_grow(shell.source_text, 0.0)
+    source_line_index: mutable i32 = 0
+    while source_line_index < MAX_SOURCE_LINES:
+        source_line: UiHandles::Handle = UiHandles::text_field(shell.source_scroll, "", "", "", 360.0, 20.0, 11.0, shell_color(205, 214, 232), shell_color(11, 14, 20))
+        UiHandles::set_cross_alignment(source_line, UiConst::CrossAlignment.Start)
+        UiHandles::set_grow(source_line, 0.0)
+        UiHandles::set_visible(source_line, false)
+        UiHandles::set_enabled(source_line, false)
+        shell.source_line_rows[source_line_index.usize()] <- source_line
+        shell.source_line_offsets[source_line_index.usize()] <- 0
+        source_line_index <- source_line_index + 1
     shell.bottom_splitter <- UiHandles::panel(shell.center_pane, UiConst::Axis.Row, 0.0, 0.0, shell_color(68, 74, 88))
     UiHandles::set_grow(shell.bottom_splitter, 0.0)
     shell.bottom_pane <- UiHandles::column(shell.center_pane, 4.0, 2.0, shell_color(24, 27, 33))
@@ -221,9 +752,14 @@ def build_shell(shell: mutable Shell&) -> void:
     _ = UiHandles::label(shell.bottom_pane, "Problems", 13.0, shell_color(148, 158, 180))
     bottom_parent: UiHandles::Handle = shell.bottom_pane
     build_problems(shell, bottom_parent)
+    shell.build_output <- UiHandles::label(shell.bottom_pane, "", 11.0, shell_color(172, 184, 204))
+    UiHandles::set_cross_alignment(shell.build_output, UiConst::CrossAlignment.Start)
+    UiHandles::set_visible(shell.build_output, false)
+    UiHandles::set_grow(shell.build_output, 0.0)
 
     right_parent: UiHandles::Handle = shell.right_pane
     build_inspector(shell, right_parent)
+    build_events(shell, right_parent)
 
     shell.status_line <- UiHandles::label(shell.root, "Starting document host...", 12.0, shell_color(148, 158, 180))
     UiHandles::set_grow(shell.status_line, 0.0)
@@ -242,9 +778,9 @@ def command(shell: mutable Shell&, opcode: i64, arg0: i64) -> void:
     # ask the host for fresh dirty state instead of relying on the last panel
     # refresh. Otherwise New/Open could commit a value and immediately discard
     # it while the shell still believes the document is clean.
-    if (opcode == 10 or opcode == 11) and HostClient::request(host_process, 40, 0, 0).result == 1:
-        set_status_view(shell, "Save this document before creating or opening another")
+    if (opcode == 10 or opcode == 11 or opcode == 19) and HostClient::request(host_process, 40, 0, 0).result == 1:
         refresh_all(shell, host_process)
+        set_status_view(shell, "Save this document before creating or opening another")
         return
     _ = HostClient::request(host_process, opcode, arg0, 0)
     refresh_all(shell, host_process)
@@ -253,7 +789,7 @@ def commit_pending_inspector_edits(shell: mutable Shell&, process: mutable Posix
     index: mutable i32 = 0
     while index < MAX_INSPECTOR_ROWS:
         tag: i32 = shell.inspector_tags[index.usize()]
-        editable: bool = tag == 1 or tag == 2 or tag == 3 or tag == 6
+        editable: bool = tag == 1 or tag == 2 or tag == 3 or tag == 6 or tag == 7
         if index.i64() < shell.projection.inspector_count and editable and shell.inspector_edit_dirty[index.usize()]:
             editor: UiHandles::Handle = shell.inspector_editors[index.usize()]
             current: sview = UiHandles::text_value(editor)
@@ -266,17 +802,53 @@ def commit_pending_inspector_edits(shell: mutable Shell&, process: mutable Posix
         index <- index + 1
     return true
 
+def path_has_suffix(path: sview, suffix: sview) -> bool:
+    return false if path.len < suffix.len
+    offset: i64 = path.len - suffix.len
+    index: mutable i64 = 0
+    while index < suffix.len:
+        return false if path[offset + index] != suffix[index]
+        index <- index + 1
+    return true
+
 def open_document(shell: mutable Shell&) -> void:
     return if not shell.host_running
     if not commit_pending_inspector_edits(shell, host_process):
         set_status(shell, HostClient::request(host_process, 56, 0, 0).text)
         return
     if HostClient::request(host_process, 40, 0, 0).result == 1:
-        set_status_view(shell, "Save this document before opening another")
         refresh_all(shell, host_process)
+        set_status_view(shell, "Save this document before opening another")
         return
     path: sview = UiHandles::text_value(shell.compact_open_path_field) if shell.compact_mode else UiHandles::text_value(shell.open_path_field)
-    _ = HostClient::request_text(host_process, 11, 0, 0, path)
+    if path_has_suffix(path, ".elisa"):
+        opened_source: HostClient::HostReply = HostClient::request_text(host_process, 112, 0, 0, path)
+        if opened_source.result == 1:
+            shell.source_page_start <- 0
+            shell.source_mode <- true
+            apply_shell_layout(shell)
+            refresh_all(shell, host_process)
+        else:
+            set_status(shell, HostClient::request(host_process, 56, 0, 0).text)
+        return
+    opened_form: HostClient::HostReply = HostClient::request_text(host_process, 11, 0, 0, path)
+    if opened_form.result == 1:
+        shell.source_mode <- false
+        shell.source_page_start <- 0
+        apply_shell_layout(shell)
+    refresh_all(shell, host_process)
+
+def create_project(shell: mutable Shell&) -> void:
+    return if not shell.host_running
+    if not commit_pending_inspector_edits(shell, host_process):
+        set_status(shell, HostClient::request(host_process, 56, 0, 0).text)
+        return
+    if HostClient::request(host_process, 40, 0, 0).result == 1:
+        refresh_all(shell, host_process)
+        set_status_view(shell, "Save this document before creating a project")
+        return
+    path: sview = UiHandles::text_value(shell.compact_open_path_field) if shell.compact_mode else UiHandles::text_value(shell.open_path_field)
+    _ = HostClient::request_text(host_process, 19, 0, 0, path)
     refresh_all(shell, host_process)
 
 def save_as_form(shell: mutable Shell&) -> void:
@@ -288,23 +860,263 @@ def save_as_form(shell: mutable Shell&) -> void:
     _ = HostClient::request_text(host_process, 18, 0, 0, path)
     refresh_all(shell, host_process)
 
+def build_project_path(shell: mutable Shell&) -> cstr:
+    path: mutable cstr = ""
+    can Unsafe.PointerCast:
+        path <- (&shell.build_project_path_storage[0]).cast[cstr] can Unsafe.PointerCast
+    return path
+
+def copy_build_project_path(shell: mutable Shell&) -> bool:
+    source: sview = UiHandles::text_value(shell.compact_open_path_field) if shell.compact_mode else UiHandles::text_value(shell.open_path_field)
+    shell.build_project_path_length <- 0
+    while shell.build_project_path_length < source.len and shell.build_project_path_length < BUILD_PATH_CAPACITY.i64() - 1:
+        shell.build_project_path_storage[shell.build_project_path_length.usize()] <- source[shell.build_project_path_length]
+        shell.build_project_path_length <- shell.build_project_path_length + 1
+    shell.build_project_path_storage[shell.build_project_path_length.usize()] <- 0
+    return shell.build_project_path_length > 0
+
+def refresh_build_output(shell: mutable Shell&) -> void:
+    output: sview = BuildJob::output_view(&build_job)
+    if output.len > 0:
+        UiHandles::set_text(shell.build_output, output, 11.0, shell_color(172, 184, 204))
+        UiHandles::set_visible(shell.build_output, true)
+    diagnostic_count: i32 = build_diagnostic_count(output)
+    if diagnostic_count != shell.build_problem_count:
+        shell.build_problem_count <- diagnostic_count
+        if shell.host_running:
+            refresh_problems(shell, host_process)
+
+def start_run_process(shell: mutable Shell&) -> void can[Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast]:
+    return if run_active
+    arguments: mutable darray[cstr] = []
+    arguments.push(PROJECT_RUN_BINARY)
+    run_process <- PosixProcess::start(&arguments)
+    run_active <- PosixProcess::valid(run_process)
+    if run_active:
+        set_status_view(shell, "Running generated application...")
+    else:
+        set_status_view(shell, "Run could not start; build the project again")
+
+def start_build_process(shell: mutable Shell&, run_after: bool) -> void can[Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast]:
+    if BuildJob::is_running(&build_job):
+        set_status_view(shell, "A build is already running")
+        return
+    if run_active:
+        set_status_view(shell, "Stop the running application before building")
+        return
+    if not copy_build_project_path(shell):
+        set_status_view(shell, "Choose a project folder or .elisaproject.json in the path field")
+        return
+    build_revision <- build_revision + 1
+    if not BuildJob::begin(&build_job, build_revision):
+        set_status_view(shell, "Build could not start")
+        return
+    build_run_after <- run_after
+    shell.build_problem_count <- 0
+    arguments: mutable darray[cstr] = []
+    arguments.push(PROJECT_BUILD_SCRIPT)
+    arguments.push(build_project_path(shell))
+    arguments.push("--name")
+    arguments.push("elisa_project_app")
+    build_process <- PosixProcess::start(&arguments)
+    if not PosixProcess::valid(build_process):
+        _ = BuildJob::finish(&build_job, build_revision, -1)
+        build_run_after <- false
+        set_status_view(shell, "Build could not start")
+        return
+    UiHandles::set_text(shell.build_output, "Building project...", 11.0, shell_color(172, 184, 204))
+    UiHandles::set_visible(shell.build_output, true)
+    set_status_view(shell, "Building project...")
+
+def poll_build_process(shell: mutable Shell&) -> void can[Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast]:
+    return if not BuildJob::is_running(&build_job)
+    _ = PosixProcess::poll(&build_process, 0)
+    output: mutable darray[u8] = []
+    amount: usize = PosixProcess::read_stdout(&build_process, &output, PROCESS_OUTPUT_CAPACITY)
+    if amount > 0:
+        BuildJob::append_output(&build_job, bytes_view_range(output, 0, amount))
+    error_output: mutable darray[u8] = []
+    error_amount: usize = PosixProcess::read_stderr(&build_process, &error_output, PROCESS_OUTPUT_CAPACITY)
+    if error_amount > 0:
+        BuildJob::append_output(&build_job, bytes_view_range(error_output, 0, error_amount))
+    refresh_build_output(shell)
+    status: PosixProcess::Status = PosixProcess::status(&build_process)
+    return if not status.finished
+    exit_code: i64 = status.exit_code.i64()
+    if status.cancelled:
+        _ = BuildJob::request_cancel(&build_job)
+    _ = BuildJob::finish(&build_job, build_revision, exit_code)
+    PosixProcess::dispose(&build_process)
+    if build_job.state == BuildJob::State.Succeeded:
+        set_status_view(shell, "Build succeeded")
+        if build_run_after:
+            build_run_after <- false
+            start_run_process(shell)
+    elif build_job.state == BuildJob::State.Cancelled:
+        build_run_after <- false
+        set_status_view(shell, "Build cancelled")
+    else:
+        build_run_after <- false
+        set_status_view(shell, "Build failed; inspect the Problems panel or build log")
+    refresh_build_output(shell)
+
+def poll_run_process(shell: mutable Shell&) -> void can[Blocking.IO, Memory.Release]:
+    return if not run_active
+    _ = PosixProcess::poll(&run_process, 0)
+    status: PosixProcess::Status = PosixProcess::status(&run_process)
+    return if not status.finished
+    exit_code: i32 = status.exit_code
+    PosixProcess::dispose(&run_process)
+    run_active <- false
+    if status.cancelled:
+        set_status_view(shell, "Application stopped")
+    elif exit_code == 0:
+        set_status_view(shell, "Application finished")
+    else:
+        set_status_view(shell, "Application exited with an error")
+
+def stop_build_run(shell: mutable Shell&) -> void can[Blocking.IO, Memory.Release]:
+    if BuildJob::is_running(&build_job):
+        _ = BuildJob::request_cancel(&build_job)
+        _ = PosixProcess::cancel(&build_process)
+        _ = PosixProcess::poll(&build_process, 1000)
+        PosixProcess::dispose(&build_process)
+        _ = BuildJob::finish(&build_job, build_revision, -1)
+        build_run_after <- false
+        set_status_view(shell, "Build cancelled")
+    if run_active:
+        _ = PosixProcess::cancel(&run_process)
+        _ = PosixProcess::poll(&run_process, 1000)
+        PosixProcess::dispose(&run_process)
+        run_active <- false
+        set_status_view(shell, "Application stopped")
+
+def run_project(shell: mutable Shell&) -> void can[Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast]:
+    if BuildJob::is_running(&build_job):
+        set_status_view(shell, "Wait for the build to finish")
+        return
+    if build_job.state != BuildJob::State.Succeeded:
+        set_status_view(shell, "Build the project before running it")
+        return
+    start_run_process(shell)
+
+def source_history_action(shell: mutable Shell&, opcode: i64) -> bool:
+    return false if not shell.host_running or not shell.source_mode or HostClient::request(host_process, 113, 0, 0).result != 1
+    row_index: mutable i32 = focused_source_row(shell)
+    if row_index < 0:
+        wanted_line: i64 = shell.source_selected_line - 1
+        scan: mutable i32 = 0
+        while scan < shell.source_line_count:
+            if shell.source_line_offsets[scan.usize()] == wanted_line and UiHandles::is_enabled(shell.source_line_rows[scan.usize()]):
+                row_index <- scan
+                break
+            scan <- scan + 1
+    target_line: mutable i64 = shell.source_selected_line - 1
+    column_units: mutable usize = 0
+    if row_index >= 0 and row_index < shell.source_line_count:
+        row: UiHandles::Handle = shell.source_line_rows[row_index.usize()]
+        target_line <- shell.source_line_offsets[row_index.usize()]
+        prefix: darray[u8] = source_line_prefix(target_line + 1)
+        caret_byte: usize = UiFlat::selection_end(row.widget_id.usize())
+        caret_utf16: usize = UiFlat::text_utf16_offset(row.widget_id.usize(), caret_byte)
+        column_units <- caret_utf16 - prefix.count if caret_utf16 > prefix.count else 0
+    changed: HostClient::HostReply = HostClient::request(host_process, opcode, 0, 0)
+    if changed.result != 1:
+        set_status(shell, HostClient::request(host_process, 56, 0, 0).text)
+        refresh_history_buttons(shell, host_process)
+        return true
+    total: i64 = HostClient::request(host_process, 115, 0, 0).result
+    if total <= 0:
+        target_line <- 0
+    elif target_line >= total:
+        target_line <- total - 1
+    elif target_line < 0:
+        target_line <- 0
+    shell.source_page_start <- (target_line / MAX_SOURCE_LINES.i64()) * MAX_SOURCE_LINES.i64()
+    refresh_source_view(shell, host_process)
+    target_index: i32 = (target_line - shell.source_page_start).i32()
+    if target_index >= 0 and target_index < shell.source_line_count:
+        target_row: UiHandles::Handle = shell.source_line_rows[target_index.usize()]
+        if UiHandles::request_focus(target_row):
+            target_prefix: darray[u8] = source_line_prefix(target_line + 1)
+            text_units: usize = UiFlat::text_utf16_length(target_row.widget_id.usize())
+            available_units: usize = text_units - target_prefix.count if text_units > target_prefix.count else 0
+            column_units <- available_units if column_units > available_units
+            UiHandles::set_selection_utf16(target_row, target_prefix.count + column_units, 0)
+            shell.source_selected_line <- target_line + 1
+    set_status(shell, HostClient::request(host_process, 56, 0, 0).text)
+    refresh_history_buttons(shell, host_process)
+    return true
+
 def run_shell_command(shell: mutable Shell&, command_id: u32) -> void:
     if command_id == ShellCommand.NewDocument.u32():
         command(shell, 10, 0)
     elif command_id == ShellCommand.OpenDocument.u32():
         open_document(shell)
+    elif command_id == ShellCommand.NewProject.u32():
+        create_project(shell)
     elif command_id == ShellCommand.SaveDocument.u32():
-        command(shell, 15, 0)
+        if shell.host_running and shell.source_mode and HostClient::request(host_process, 113, 0, 0).result == 1:
+            _ = HostClient::request(host_process, 131, 0, 0)
+            status: HostClient::HostReply = HostClient::request(host_process, 56, 0, 0)
+            set_status(shell, status.text)
+            refresh_source_view(shell, host_process)
+            UiHandles::layout(UiCore::viewport_width(), UiCore::viewport_height())
+        else:
+            command(shell, 15, 0)
     elif command_id == ShellCommand.SaveAs.u32():
-        save_as_form(shell)
+        if shell.host_running and shell.source_mode and HostClient::request(host_process, 113, 0, 0).result == 1:
+            path: sview = UiHandles::text_value(shell.compact_open_path_field) if shell.compact_mode else UiHandles::text_value(shell.open_path_field)
+            saved: HostClient::HostReply = HostClient::request_text(host_process, 146, 0, 0, path)
+            set_status(shell, HostClient::request(host_process, 56, 0, 0).text)
+            if saved.result == 1:
+                shell.source_compare_mode <- false
+                refresh_source_view(shell, host_process)
+                UiHandles::layout(UiCore::viewport_width(), UiCore::viewport_height())
+        else:
+            save_as_form(shell)
     elif command_id == ShellCommand.Undo.u32():
-        command(shell, 13, 0)
+        if not source_history_action(shell, 134):
+            command(shell, 13, 0)
     elif command_id == ShellCommand.Redo.u32():
-        command(shell, 14, 0)
+        if not source_history_action(shell, 135):
+            command(shell, 14, 0)
     elif command_id == ShellCommand.DeleteSelection.u32():
         command(shell, 12, 0)
     elif command_id == ShellCommand.DuplicateSelection.u32():
         command(shell, 16, 0)
+    elif command_id == ShellCommand.CopySelection.u32():
+        command(shell, 120, 0)
+    elif command_id == ShellCommand.CutSelection.u32():
+        command(shell, 121, 0)
+    elif command_id == ShellCommand.PasteSelection.u32():
+        command(shell, 122, 0)
+    elif command_id == ShellCommand.WrapRow.u32():
+        command(shell, 123, 0)
+    elif command_id == ShellCommand.WrapColumn.u32():
+        command(shell, 123, 1)
+    elif command_id == ShellCommand.UnwrapSelection.u32():
+        command(shell, 124, 0)
+    elif command_id == ShellCommand.ConvertOrientation.u32():
+        command(shell, 125, 1)
+    elif command_id == ShellCommand.SelectAncestor.u32():
+        command(shell, 126, 0)
+    elif command_id == ShellCommand.InsertSelection.u32():
+        command(shell, 30, 0)
+    elif command_id == ShellCommand.MoveSelectionBackward.u32():
+        command(shell, 17, 0)
+    elif command_id == ShellCommand.MoveSelectionForward.u32():
+        command(shell, 17, 1)
+    elif command_id == ShellCommand.IndentSelection.u32():
+        command(shell, 84, 0)
+    elif command_id == ShellCommand.OutdentSelection.u32():
+        command(shell, 85, 0)
+    elif command_id == ShellCommand.BuildProject.u32():
+        start_build_process(shell, false)
+    elif command_id == ShellCommand.RunProject.u32():
+        run_project(shell)
+    elif command_id == ShellCommand.StopProject.u32():
+        stop_build_run(shell)
 
 def shell_text_focus(shell: Shell&) -> bool:
     return true if UiFlat::accepts_text()
@@ -313,6 +1125,10 @@ def shell_text_focus(shell: Shell&) -> bool:
     index: mutable i32 = 0
     while index < shell.inspector_count:
         return true if UiHandles::is_focused(shell.inspector_editors[index.usize()])
+        index <- index + 1
+    index <- 0
+    while index < shell.event_count:
+        return true if UiHandles::is_focused(shell.event_editors[index.usize()])
         index <- index + 1
     return false
 
@@ -328,6 +1144,14 @@ def handle_shell_event(shell: mutable Shell&, incoming: UiCore::Event) -> void:
             UiHandles::layout(UiCore::viewport_width(), UiCore::viewport_height())
             return
         UiCore::PointerEvent.Down(at, button):
+            if shell.source_mode and shell.host_running and button == UiCore::PointerButton.Primary.i32() and HostClient::request(host_process, 113, 0, 0).result == 1:
+                source_row: i32 = source_row_at(shell, at)
+                if source_row >= 0:
+                    shell.source_selected_line <- shell.source_line_offsets[source_row.usize()] + 1
+                    selected_status: mutable darray[u8] = []
+                    append_panel_text(&selected_status, "Selected source line ")
+                    append_nonnegative(&selected_status, shell.source_selected_line)
+                    set_status(shell, selected_status)
             if not shell.compact_mode and button == UiCore::PointerButton.Primary.i32():
                 if pointer_over_splitter(shell.left_splitter, at):
                     shell.active_split <- 1
@@ -338,10 +1162,16 @@ def handle_shell_event(shell: mutable Shell&, incoming: UiCore::Event) -> void:
                 if pointer_over_splitter(shell.bottom_splitter, at):
                     shell.active_split <- 3
                     return
+            begin_canvas_marquee(shell, at, button)
+            begin_drag(shell, at, button)
             UiHandles::handle(incoming)
         UiCore::PointerEvent.Move(at):
             if shell.active_split > 0:
                 update_split_from_pointer(shell, at)
+                return
+            if update_canvas_marquee(shell, at):
+                return
+            if update_drag(shell, host_process, at):
                 return
             UiHandles::handle(incoming)
         UiCore::PointerEvent.Up(at, button):
@@ -349,13 +1179,59 @@ def handle_shell_event(shell: mutable Shell&, incoming: UiCore::Event) -> void:
                 shell.active_split <- 0
                 _ = save_pane_preferences(shell)
                 return
+            if shell.canvas_marquee_active and button == UiCore::PointerButton.Primary.i32():
+                shell.canvas_marquee_end_x <- at.x
+                shell.canvas_marquee_end_y <- at.y
+                if shell.canvas_marquee_moved:
+                    selected: mutable bool = false
+                    if shell.host_running:
+                        selected <- ShellPreview::select_rect(shell, host_process, UiCore::Vec2{x: shell.canvas_marquee_start_x, y: shell.canvas_marquee_start_y}, UiCore::Vec2{x: shell.canvas_marquee_end_x, y: shell.canvas_marquee_end_y})
+                    clear_canvas_marquee(shell)
+                    if selected:
+                        refresh_all(shell, host_process)
+                    else:
+                        set_status_view(shell, "Marquee did not intersect a selectable component")
+                    return
+                clear_canvas_marquee(shell)
+            if shell.drag_kind != 0 and button == UiCore::PointerButton.Primary.i32():
+                if shell.drag_moved:
+                    kind: i32 = shell.drag_kind
+                    palette_index: i64 = shell.drag_palette_index.i64()
+                    target: i64 = shell.drag_target_row
+                    valid: bool = shell.drag_feedback_valid and target >= 0
+                    clear_drag_feedback(shell, host_process)
+                    if valid and shell.host_running:
+                        if kind == 1:
+                            _ = HostClient::request(host_process, 87, palette_index, target)
+                        else:
+                            _ = HostClient::request(host_process, 89, target, 0)
+                        refresh_all(shell, host_process)
+                    else:
+                        set_status_view(shell, "Drop cancelled")
+                    return
+                clear_drag_feedback(shell, host_process)
+            if shell.source_mode and shell.host_running and button == UiCore::PointerButton.Primary.i32() and HostClient::request(host_process, 113, 0, 0).result != 1:
+                source_row: i32 = source_row_at(shell, at)
+                if source_row >= 0:
+                    result: HostClient::HostReply = HostClient::request(host_process, 108, shell.source_line_offsets[source_row.usize()], 0)
+                    if result.result == 1:
+                        refresh_all(shell, host_process)
+                    else:
+                        set_status_view(shell, "This generated source line has no selectable form owner")
+                    return
             UiHandles::handle(incoming)
+            if button == UiCore::PointerButton.Primary.i32() and ShellPreview::select_at(shell, host_process, at):
+                refresh_all(shell, host_process)
         UiCore::PointerEvent.Leave:
             shell.active_split <- 0
+            clear_canvas_marquee(shell)
+            clear_drag_feedback(shell, host_process)
             _ = save_pane_preferences(shell)
             UiHandles::handle(incoming)
         UiCore::Event.FocusLost:
             shell.active_split <- 0
+            clear_canvas_marquee(shell)
+            clear_drag_feedback(shell, host_process)
             _ = save_pane_preferences(shell)
             UiHandles::handle(incoming)
         UiCore::KeyEvent.Up(code):
@@ -364,6 +1240,47 @@ def handle_shell_event(shell: mutable Shell&, incoming: UiCore::Event) -> void:
             return
         UiCore::KeyEvent.Down(code):
             raw_key: i32 = code.i32()
+            if shell.source_mode and shell.host_running and HostClient::request(host_process, 113, 0, 0).result == 1 and focused_source_row(shell) >= 0:
+                source_modifiers: UiFlat::Modifiers = UiHandles::modifiers()
+                source_primary: bool = source_modifiers.control or source_modifiers.super
+                if source_primary and not source_modifiers.shift and not source_modifiers.alt and raw_key == UiCore::Key.F.i32():
+                    _ = UiHandles::request_focus(shell.source_find_field)
+                    UiHandles::set_selection_utf16(shell.source_find_field, 0, UiFlat::text_utf16_length(shell.source_find_field.widget_id.usize()))
+                    return
+                if source_primary and raw_key == UiCore::Key.A.i32() and select_source_line_body(shell):
+                    return
+                if source_primary and raw_key == UiCore::Key.Z.i32():
+                    run_shell_command(shell, ShellCommand.Redo.u32() if source_modifiers.shift else ShellCommand.Undo.u32())
+                    return
+                if source_primary and not source_modifiers.shift and raw_key == UiCore::Key.Y.i32():
+                    run_shell_command(shell, ShellCommand.Redo.u32())
+                    return
+            if raw_key == UiCore::Key.Tab.i32():
+                held: UiFlat::Modifiers = UiHandles::modifiers()
+                if indent_source_line(shell, held.shift):
+                    return
+            if raw_key == UiCore::Key.Backspace.i32() and merge_source_lines(shell, -1):
+                return
+            if raw_key == UiCore::Key.Delete.i32() and merge_source_lines(shell, 1):
+                return
+            if raw_key == UiCore::Key.Enter.i32() and insert_source_line_break(shell):
+                return
+            if raw_key == UiCore::Key.Escape.i32() and shell.drag_kind != 0:
+                clear_drag_feedback(shell, host_process)
+                set_status_view(shell, "Drop cancelled")
+                return
+            if raw_key == UiCore::Key.Escape.i32() and shell.canvas_marquee_active:
+                clear_canvas_marquee(shell)
+                set_status_view(shell, "Marquee cancelled")
+                return
+            if raw_key == UiCore::Key.Up.i32() and move_source_caret_vertically(shell, -1):
+                return
+            if raw_key == UiCore::Key.Down.i32() and move_source_caret_vertically(shell, 1):
+                return
+            if raw_key == UiCore::Key.PageUp.i32() and move_source_caret_by_page(shell, -1):
+                return
+            if raw_key == UiCore::Key.PageDown.i32() and move_source_caret_by_page(shell, 1):
+                return
             if raw_key >= 0 and raw_key.i64() < COMMAND_KEY_CAPACITY.i64():
                 if shell_command_key_latched[raw_key.usize()]:
                     return
@@ -382,12 +1299,291 @@ def handle_shell_event(shell: mutable Shell&, incoming: UiCore::Event) -> void:
         _:
             UiHandles::handle(incoming)
 
+def source_line_prefix(line_number: i64) -> darray[u8]:
+    prefix: mutable darray[u8] = []
+    append_nonnegative(&prefix, line_number)
+    append_panel_text(&prefix, ": ")
+    return prefix
+
+def parse_source_line_number(value: sview) -> i64:
+    return -1 if value.len == 0 or value.len > 7
+    parsed: mutable i64 = 0
+    index: mutable i64 = 0
+    while index < value.len:
+        return -1 if value[index] < 48 or value[index] > 57
+        parsed <- parsed * 10 + (value[index] - 48)
+        return -1 if parsed > 1048576
+        index <- index + 1
+    return parsed if parsed > 0 else -1
+
+def reveal_source_row(shell: mutable Shell&, target: UiHandles::Handle) -> void:
+    if UiHandles::widget(shell.source_scroll) is scroll_widget and UiHandles::widget(target) is target_widget:
+        relative_top: f32 = target_widget.y - scroll_widget.y
+        current_offset: f32 = UiHandles::scroll_offset(shell.source_scroll)
+        requested_offset: mutable f32 = current_offset
+        if relative_top < 0.0:
+            requested_offset <- current_offset + relative_top - 18.0
+        elif relative_top + target_widget.height > scroll_widget.height:
+            requested_offset <- current_offset + relative_top + target_widget.height - scroll_widget.height + 18.0
+        _ = UiHandles::set_scroll_offset(shell.source_scroll, requested_offset)
+    UiHandles::layout(UiCore::viewport_width(), UiCore::viewport_height())
+
+def go_to_source_line(shell: mutable Shell&, requested_line: i64) -> bool:
+    return false if not shell.host_running or not shell.source_mode or HostClient::request(host_process, 113, 0, 0).result != 1
+    total: i64 = HostClient::request(host_process, 115, 0, 0).result
+    if requested_line < 1 or requested_line > total:
+        set_status_view(shell, "Enter a source line from 1 to the displayed file length")
+        return false
+    target_line: i64 = requested_line - 1
+    shell.source_compare_mode <- false
+    shell.source_page_start <- (target_line / MAX_SOURCE_LINES.i64()) * MAX_SOURCE_LINES.i64()
+    refresh_source_view(shell, host_process)
+    target_index: i32 = (target_line - shell.source_page_start).i32()
+    return false if target_index < 0 or target_index >= shell.source_line_count
+    target: UiHandles::Handle = shell.source_line_rows[target_index.usize()]
+    return false if not UiHandles::request_focus(target)
+    shell.source_selected_line <- requested_line
+    prefix: darray[u8] = source_line_prefix(requested_line)
+    UiHandles::set_selection(target, prefix.count, prefix.count)
+    reveal_source_row(shell, target)
+    status: mutable darray[u8] = []
+    append_panel_text(&status, "Moved to source line ")
+    append_nonnegative(&status, requested_line)
+    set_status_view(shell, ShellBytes::view_of(&status))
+    return true
+
+def submit_source_line_navigation(shell: mutable Shell&) -> bool:
+    requested: i64 = parse_source_line_number(UiHandles::text_value(shell.source_goto_field))
+    return go_to_source_line(shell, requested)
+
+def find_source_text(shell: mutable Shell&, forward: bool) -> bool:
+    return false if not shell.host_running or not shell.source_mode or HostClient::request(host_process, 113, 0, 0).result != 1
+    query: sview = UiHandles::text_value(shell.source_find_field)
+    if query.len == 0:
+        set_status_view(shell, "Enter text to find in the open source file")
+        return false
+    byte_count: i64 = HostClient::request(host_process, 148, 0, 0).result
+    start: mutable i64 = 0 if forward else byte_count
+    if shell.source_find_match_valid:
+        start <- shell.source_find_match_start + query.len if forward else shell.source_find_match_start - 1
+    else:
+        row_index: i32 = focused_source_row(shell)
+        if row_index >= 0 and row_index < shell.source_line_count and UiHandles::is_enabled(shell.source_line_rows[row_index.usize()]):
+            row: UiHandles::Handle = shell.source_line_rows[row_index.usize()]
+            prefix: darray[u8] = source_line_prefix(shell.source_line_offsets[row_index.usize()] + 1)
+            line_start: i64 = HostClient::request(host_process, 118, shell.source_line_offsets[row_index.usize()], 0).result
+            selection_start: usize = UiFlat::selection_start(row.widget_id.usize())
+            selection_end: usize = UiFlat::selection_end(row.widget_id.usize())
+            if forward:
+                relative_caret: usize = selection_end - prefix.count if selection_end > prefix.count else 0
+                start <- line_start + relative_caret.i64()
+            else:
+                relative_caret: usize = selection_start - prefix.count if selection_start > prefix.count else 0
+                relative_byte: i64 = relative_caret.i64()
+                start <- line_start + relative_byte - query.len
+                start <- 0 if start < 0
+    match_offset: mutable i64 = HostClient::request_text(host_process, 147, start, 1 if forward else 0, query).result
+    if match_offset < 0:
+        if forward and start > 0:
+            match_offset <- HostClient::request_text(host_process, 147, 0, 1, query).result
+        elif not forward and start < byte_count:
+            match_offset <- HostClient::request_text(host_process, 147, byte_count, 0, query).result
+    if match_offset < 0:
+        set_status_view(shell, "No source match found")
+        return false
+    target_line: i64 = HostClient::request(host_process, 149, match_offset, 0).result
+    if target_line < 0:
+        set_status_view(shell, "The source match is no longer available")
+        return false
+    shell.source_compare_mode <- false
+    shell.source_page_start <- (target_line / MAX_SOURCE_LINES.i64()) * MAX_SOURCE_LINES.i64()
+    refresh_source_view(shell, host_process)
+    target_index: i32 = (target_line - shell.source_page_start).i32()
+    if target_index < 0 or target_index >= shell.source_line_count:
+        set_status_view(shell, "The source match could not be projected into the visible page")
+        return false
+    target: UiHandles::Handle = shell.source_line_rows[target_index.usize()]
+    shell.source_selected_line <- target_line + 1
+    shell.source_find_match_start <- match_offset
+    shell.source_find_match_valid <- true
+    if not UiHandles::is_enabled(target):
+        reveal_source_row(shell, target)
+        set_status_view(shell, "Match is on a clipped line; use Open in Editor to inspect it")
+        return true
+    _ = UiHandles::request_focus(target)
+    line_start: i64 = HostClient::request(host_process, 118, target_line, 0).result
+    column: usize = (match_offset - line_start).usize()
+    prefix: darray[u8] = source_line_prefix(target_line + 1)
+    UiHandles::set_selection(target, prefix.count + column, prefix.count + column + query.len.usize())
+    reveal_source_row(shell, target)
+    status: mutable darray[u8] = []
+    append_panel_text(&status, "Found source match on line ")
+    append_nonnegative(&status, target_line + 1)
+    set_status_view(shell, ShellBytes::view_of(&status))
+    return true
+
+def replace_next_source_text(shell: mutable Shell&) -> bool:
+    return false if not shell.host_running or not shell.source_mode or HostClient::request(host_process, 113, 0, 0).result != 1
+    query: sview = UiHandles::text_value(shell.source_find_field)
+    replacement: sview = UiHandles::text_value(shell.source_replace_field)
+    if query.len == 0:
+        set_status_view(shell, "Enter text to find before replacing")
+        return false
+    if not shell.source_find_match_valid:
+        return false if not find_source_text(shell, true)
+    scan: mutable i64 = 0
+    while scan < replacement.len:
+        if replacement[scan] == 10 or replacement[scan] == 13:
+            set_status_view(shell, "Replace Next accepts single-line replacement text")
+            return false
+        scan <- scan + 1
+    match_offset: i64 = shell.source_find_match_start
+    verified_offset: i64 = HostClient::request_text(host_process, 147, match_offset, 1, query).result
+    if verified_offset != match_offset:
+        shell.source_find_match_valid <- false
+        set_status_view(shell, "The selected source match changed; find it again before replacing")
+        return false
+    target_line: i64 = HostClient::request(host_process, 149, match_offset, 0).result
+    if target_line < 0:
+        shell.source_find_match_valid <- false
+        set_status_view(shell, "The source match is no longer available")
+        return false
+    shell.source_page_start <- (target_line / MAX_SOURCE_LINES.i64()) * MAX_SOURCE_LINES.i64()
+    refresh_source_view(shell, host_process)
+    target_index: mutable i32 = (target_line - shell.source_page_start).i32()
+    if target_index < 0 or target_index >= shell.source_line_count:
+        set_status_view(shell, "The source match could not be projected into the visible page")
+        return false
+    if not UiHandles::is_enabled(shell.source_line_rows[target_index.usize()]):
+        set_status_view(shell, "The match is on a clipped line; open the source in an editor to replace it")
+        return false
+    updated: HostClient::HostReply = HostClient::request_text(host_process, 133, match_offset, match_offset + query.len, replacement)
+    if updated.result != 1:
+        set_status(shell, HostClient::request(host_process, 56, 0, 0).text)
+        return false
+    shell.source_find_match_valid <- false
+    refresh_source_view(shell, host_process)
+    current_line: i64 = HostClient::request(host_process, 149, match_offset, 0).result
+    target_index <- (current_line - shell.source_page_start).i32()
+    if target_index < 0 or target_index >= shell.source_line_count:
+        set_status_view(shell, "Replaced the match; the updated row is outside the visible source page")
+        return true
+    target: UiHandles::Handle = shell.source_line_rows[target_index.usize()]
+    if UiHandles::is_enabled(target):
+        _ = UiHandles::request_focus(target)
+        line_start: i64 = HostClient::request(host_process, 118, current_line, 0).result
+        prefix: darray[u8] = source_line_prefix(current_line + 1)
+        begin: usize = prefix.count + (match_offset - line_start).usize()
+        UiHandles::set_selection(target, begin, begin + replacement.len.usize())
+        shell.source_selected_line <- current_line + 1
+        reveal_source_row(shell, target)
+    status: mutable darray[u8] = []
+    append_panel_text(&status, "Replaced source match on line ")
+    append_nonnegative(&status, current_line + 1)
+    set_status_view(shell, ShellBytes::view_of(&status))
+    return true
+
+def replace_all_source_text(shell: mutable Shell&) -> bool:
+    return false if not shell.host_running or not shell.source_mode or HostClient::request(host_process, 113, 0, 0).result != 1
+    query: sview = UiHandles::text_value(shell.source_find_field)
+    replacement: sview = UiHandles::text_value(shell.source_replace_field)
+    if query.len == 0:
+        set_status_view(shell, "Enter text to find before replacing")
+        return false
+    payload: mutable darray[u8] = []
+    append_panel_text(&payload, query)
+    append_panel_text(&payload, replacement)
+    result: HostClient::HostReply = HostClient::request_text(host_process, 150, query.len, 0, ShellBytes::view_of(&payload))
+    if result.result < 0:
+        set_status(shell, HostClient::request(host_process, 56, 0, 0).text)
+        return false
+    if result.result == 0:
+        set_status_view(shell, "No source matches to replace")
+        return false
+    shell.source_find_match_valid <- false
+    refresh_source_view(shell, host_process)
+    status: mutable darray[u8] = []
+    append_panel_text(&status, "Replaced ")
+    append_nonnegative(&status, result.result)
+    append_panel_text(&status, " source matches")
+    set_status_view(shell, ShellBytes::view_of(&status))
+    return true
+
+def select_source_line_body(shell: mutable Shell&) -> bool:
+    row_index: i32 = focused_source_row(shell)
+    return false if row_index < 0 or row_index >= shell.source_line_count
+    row: UiHandles::Handle = shell.source_line_rows[row_index.usize()]
+    return false if not UiHandles::is_enabled(row)
+    prefix: darray[u8] = source_line_prefix(shell.source_line_offsets[row_index.usize()] + 1)
+    value: sview = UiHandles::text_value(row)
+    source_start: mutable usize = prefix.count
+    source_finish: usize = value.len.usize()
+    source_start <- source_finish if source_start > source_finish
+    UiHandles::set_selection(row, source_start, source_finish)
+    shell.source_selected_line <- shell.source_line_offsets[row_index.usize()] + 1
+    return true
+
+def source_line_prefix_matches(value: sview, prefix: darray[u8]&) -> bool:
+    return false if value.len < prefix.count.i64()
+    index: mutable i64 = 0
+    while index < prefix.count.i64():
+        return false if value[index] != prefix[index.usize()]
+        index <- index + 1
+    return true
+
+def source_line_changed(shell: mutable Shell&, index: i32) -> void:
+    return if not shell.host_running or index < 0 or index >= shell.source_line_count
+    shell.source_find_match_valid <- false
+    return if HostClient::request(host_process, 113, 0, 0).result != 1
+    row: UiHandles::Handle = shell.source_line_rows[index.usize()]
+    value: sview = UiHandles::text_value(row)
+    line_index: i64 = shell.source_line_offsets[index.usize()]
+    prefix: darray[u8] = source_line_prefix(line_index + 1)
+    body: mutable sview = ""
+    copied_body: mutable darray[u8] = []
+    if source_line_prefix_matches(value, prefix):
+        body <- string_view_slice(value, prefix.count.i64(), value.len)
+    else:
+        # Keep the line number visible even if the user replaces the full
+        # field contents. The edited text remains intact after the restored
+        # prefix and is sent as the line body.
+        append_panel_text(&copied_body, value)
+        body <- ShellBytes::view_of(&copied_body)
+        display: mutable darray[u8] = []
+        append_panel_text(&display, ShellBytes::view_of(&prefix))
+        append_panel_text(&display, body)
+        shell.refreshing_source <- true
+        UiHandles::replace_text(row, ShellBytes::view_of(&display))
+        shell.refreshing_source <- false
+    result: HostClient::HostReply = HostClient::request_text(host_process, 132, line_index, 0, body)
+    if result.result == 1:
+        shell.source_find_match_valid <- false
+        dirty: bool = HostClient::request(host_process, 130, 0, 0).result == 1
+        UiHandles::set_text(shell.source_title, "Elisa source (modified)" if dirty else "Elisa source", 15.0, shell_color(230, 234, 242))
+        refresh_history_buttons(shell, host_process)
+        refresh_source_conflict_bar(shell, host_process)
+        set_status_view(shell, "Elisa source has unsaved changes" if dirty else "Elisa source matches the saved file")
+    else:
+        status: HostClient::HostReply = HostClient::request(host_process, 56, 0, 0)
+        set_status(shell, status.text)
+        refresh_source_file_lines(shell, host_process)
+
 def widget_event(shell: mutable Shell&, widget: usize, event: i32) -> void:
     if UiHandles::event_is(event, UiConst::WidgetEvent.Change) and UiHandles::callback_matches(widget, shell.palette_search):
         if shell.host_running:
             refresh_palette(shell, host_process)
             UiHandles::layout(UiCore::viewport_width(), UiCore::viewport_height())
         return
+    if UiHandles::event_is(event, UiConst::WidgetEvent.Change) and not shell.refreshing_source:
+        if UiHandles::callback_matches(widget, shell.source_find_field):
+            shell.source_find_match_valid <- false
+            return
+        index: mutable i32 = 0
+        while index < shell.source_line_count:
+            if UiHandles::callback_matches(widget, shell.source_line_rows[index.usize()]):
+                source_line_changed(shell, index)
+                return
+            index <- index + 1
     if UiHandles::event_is(event, UiConst::WidgetEvent.Change) and not shell.refreshing_inspector:
         index: mutable i32 = 0
         while index < MAX_INSPECTOR_ROWS:
@@ -395,8 +1591,23 @@ def widget_event(shell: mutable Shell&, widget: usize, event: i32) -> void:
                 shell.inspector_edit_dirty[index.usize()] <- true
                 return
             index <- index + 1
+    if UiHandles::event_is(event, UiConst::WidgetEvent.Change) and not shell.refreshing_events:
+        index: mutable i32 = 0
+        while index < MAX_EVENT_ROWS:
+            if UiHandles::callback_matches(widget, shell.event_editors[index.usize()]):
+                shell.event_edit_dirty[index.usize()] <- true
+                return
+            index <- index + 1
     if UiHandles::event_is(event, UiConst::WidgetEvent.Submit):
+        if widget_event_events(shell, widget, event):
+            return
         if widget_event_inspector(shell, widget, event):
+            return
+        if UiHandles::callback_matches(widget, shell.source_goto_field):
+            _ = submit_source_line_navigation(shell)
+            return
+        if UiHandles::callback_matches(widget, shell.source_find_field):
+            _ = find_source_text(shell, true)
             return
         if UiHandles::callback_matches(widget, shell.open_path_field) or UiHandles::callback_matches(widget, shell.compact_open_path_field):
             run_shell_command(shell, ShellCommand.OpenDocument.u32())
@@ -408,11 +1619,20 @@ def widget_event(shell: mutable Shell&, widget: usize, event: i32) -> void:
     delete_handle: UiHandles::Handle = shell.delete_button
     duplicate_handle: UiHandles::Handle = shell.duplicate_button
     save_handle: UiHandles::Handle = shell.save_button
+    reload_handle: UiHandles::Handle = shell.reload_button
+    recovery_restore_handle: UiHandles::Handle = shell.recovery_restore_button
+    recovery_discard_handle: UiHandles::Handle = shell.recovery_discard_button
     new_handle: UiHandles::Handle = shell.new_button
+    build_handle: UiHandles::Handle = shell.build_button
+    run_handle: UiHandles::Handle = shell.run_button
+    stop_handle: UiHandles::Handle = shell.stop_button
     open_handle: UiHandles::Handle = shell.open_button
     save_as_handle: UiHandles::Handle = shell.save_as_button
+    new_project_handle: UiHandles::Handle = shell.new_project_button
     compact_open_handle: UiHandles::Handle = shell.compact_open_button
     compact_save_as_handle: UiHandles::Handle = shell.compact_save_as_button
+    compact_new_project_handle: UiHandles::Handle = shell.compact_new_project_button
+    preview_retry_handle: UiHandles::Handle = shell.preview_retry_button
     if UiHandles::callback_matches(widget, undo_handle):
         run_shell_command(shell, ShellCommand.Undo.u32())
         return
@@ -428,8 +1648,53 @@ def widget_event(shell: mutable Shell&, widget: usize, event: i32) -> void:
     if UiHandles::callback_matches(widget, save_handle):
         run_shell_command(shell, ShellCommand.SaveDocument.u32())
         return
+    if UiHandles::callback_matches(widget, shell.source_button):
+        shell.compact_panel <- 0 if shell.compact_mode
+        shell.source_mode <- not shell.source_mode
+        apply_shell_layout(shell)
+        if shell.source_mode and shell.host_running:
+            refresh_source_view(shell, host_process)
+        if shell.host_running:
+            refresh_history_buttons(shell, host_process)
+        UiHandles::layout(UiCore::viewport_width(), UiCore::viewport_height())
+        return
+    if UiHandles::callback_matches(widget, shell.event_handler_source_button):
+        if shell.host_running:
+            opened: HostClient::HostReply = HostClient::request(host_process, 117, 0, 0)
+            if opened.result == 1:
+                shell.source_mode <- true
+                shell.source_page_start <- 0
+                apply_shell_layout(shell)
+                refresh_all(shell, host_process)
+            else:
+                set_status(shell, HostClient::request(host_process, 56, 0, 0).text)
+        return
+    if UiHandles::callback_matches(widget, reload_handle):
+        if shell.host_running:
+            _ = HostClient::request(host_process, 105, 0, 0)
+            refresh_all(shell, host_process)
+        return
+    if UiHandles::callback_matches(widget, recovery_restore_handle):
+        if shell.host_running:
+            _ = HostClient::request(host_process, 102, 0, 0)
+            refresh_all(shell, host_process)
+        return
+    if UiHandles::callback_matches(widget, recovery_discard_handle):
+        if shell.host_running:
+            _ = HostClient::request(host_process, 103, 0, 0)
+            refresh_all(shell, host_process)
+        return
     if UiHandles::callback_matches(widget, new_handle):
         run_shell_command(shell, ShellCommand.NewDocument.u32())
+        return
+    if UiHandles::callback_matches(widget, build_handle):
+        run_shell_command(shell, ShellCommand.BuildProject.u32())
+        return
+    if UiHandles::callback_matches(widget, run_handle):
+        run_shell_command(shell, ShellCommand.RunProject.u32())
+        return
+    if UiHandles::callback_matches(widget, stop_handle):
+        run_shell_command(shell, ShellCommand.StopProject.u32())
         return
     if UiHandles::callback_matches(widget, open_handle):
         run_shell_command(shell, ShellCommand.OpenDocument.u32())
@@ -437,11 +1702,20 @@ def widget_event(shell: mutable Shell&, widget: usize, event: i32) -> void:
     if UiHandles::callback_matches(widget, save_as_handle):
         run_shell_command(shell, ShellCommand.SaveAs.u32())
         return
+    if UiHandles::callback_matches(widget, new_project_handle):
+        run_shell_command(shell, ShellCommand.NewProject.u32())
+        return
     if UiHandles::callback_matches(widget, compact_open_handle):
         run_shell_command(shell, ShellCommand.OpenDocument.u32())
         return
     if UiHandles::callback_matches(widget, compact_save_as_handle):
         run_shell_command(shell, ShellCommand.SaveAs.u32())
+        return
+    if UiHandles::callback_matches(widget, compact_new_project_handle):
+        run_shell_command(shell, ShellCommand.NewProject.u32())
+        return
+    if UiHandles::callback_matches(widget, preview_retry_handle):
+        ShellPreview::retry(shell, host_process)
         return
     if UiHandles::callback_matches(widget, shell.compact_palette_button):
         shell.compact_panel <- 1
@@ -450,12 +1724,18 @@ def widget_event(shell: mutable Shell&, widget: usize, event: i32) -> void:
         return
     if UiHandles::callback_matches(widget, shell.compact_canvas_button):
         shell.compact_panel <- 0
+        shell.source_mode <- false
         apply_shell_layout(shell)
+        if shell.host_running:
+            refresh_history_buttons(shell, host_process)
         UiHandles::layout(UiCore::viewport_width(), UiCore::viewport_height())
         return
     if UiHandles::callback_matches(widget, shell.compact_inspector_button):
         shell.compact_panel <- 2
+        shell.source_mode <- false
         apply_shell_layout(shell)
+        if shell.host_running:
+            refresh_history_buttons(shell, host_process)
         UiHandles::layout(UiCore::viewport_width(), UiCore::viewport_height())
         return
     if UiHandles::callback_matches(widget, shell.compact_palette_button):
@@ -495,6 +1775,8 @@ def widget_event(shell: mutable Shell&, widget: usize, event: i32) -> void:
         return
     if widget_event_inspector(shell, widget, event):
         return
+    if widget_event_events(shell, widget, event):
+        return
     _ = widget_event_rows(shell, widget)
 
 def widget_event_inspector(shell: mutable Shell&, widget: usize, event: i32) -> bool:
@@ -512,7 +1794,8 @@ def widget_event_inspector(shell: mutable Shell&, widget: usize, event: i32) -> 
         if UiHandles::event_is(event, UiConst::WidgetEvent.Click) and UiHandles::callback_matches(widget, action):
             if shell.host_running:
                 if commit_pending_inspector_edits(shell, host_process):
-                    opcode: i64 = 32 if shell.inspector_tags[index.usize()] == 0 else 33
+                    tag: i32 = shell.inspector_tags[index.usize()]
+                    opcode: i64 = 32 if tag == 0 else (33 if tag == 4 else 34)
                     _ = HostClient::request(host_process, opcode, index.i64(), 0)
                     refresh_all(shell, host_process)
                 else:
@@ -521,13 +1804,199 @@ def widget_event_inspector(shell: mutable Shell&, widget: usize, event: i32) -> 
         index <- index + 1
     return false
 
-def widget_event_rows(shell: mutable Shell&, widget: usize) -> bool:
-    palette_total: i32 = shell.palette_count
+def widget_event_events(shell: mutable Shell&, widget: usize, event: i32) -> bool:
     index: mutable i32 = 0
+    while index < shell.event_count:
+        editor: UiHandles::Handle = shell.event_editors[index.usize()]
+        clear: UiHandles::Handle = shell.event_clear_buttons[index.usize()]
+        if UiHandles::event_is(event, UiConst::WidgetEvent.Submit) and UiHandles::callback_matches(widget, editor):
+            if shell.host_running:
+                value: sview = UiHandles::text_value(editor)
+                if HostClient::request_text(host_process, 94, index.i64(), 0, value).result == 1:
+                    refresh_all(shell, host_process)
+                else:
+                    set_status(shell, HostClient::request(host_process, 56, 0, 0).text)
+            return true
+        if UiHandles::event_is(event, UiConst::WidgetEvent.Click) and UiHandles::callback_matches(widget, clear):
+            if shell.host_running:
+                if HostClient::request(host_process, 95, index.i64(), 0).result == 1:
+                    refresh_all(shell, host_process)
+                else:
+                    set_status(shell, HostClient::request(host_process, 56, 0, 0).text)
+            return true
+        index <- index + 1
+    return false
+
+def widget_event_rows(shell: mutable Shell&, widget: usize) -> bool:
+    if UiHandles::callback_matches(widget, shell.problem_copy_button):
+        copy_selected_problem(shell)
+        return true
+    if UiHandles::callback_matches(widget, shell.source_goto_button):
+        _ = submit_source_line_navigation(shell)
+        return true
+    if UiHandles::callback_matches(widget, shell.source_find_previous_button):
+        _ = find_source_text(shell, false)
+        return true
+    if UiHandles::callback_matches(widget, shell.source_find_next_button):
+        _ = find_source_text(shell, true)
+        return true
+    if UiHandles::callback_matches(widget, shell.source_replace_next_button):
+        _ = replace_next_source_text(shell)
+        return true
+    if UiHandles::callback_matches(widget, shell.source_replace_all_button):
+        _ = replace_all_source_text(shell)
+        return true
+    if UiHandles::callback_matches(widget, shell.source_compare_button):
+        if shell.host_running and HostClient::request(host_process, 140, 0, 0).result == 1:
+            shell.source_compare_mode <- not shell.source_compare_mode
+            refresh_source_view(shell, host_process)
+            UiHandles::layout(UiCore::viewport_width(), UiCore::viewport_height())
+        return true
+    if UiHandles::callback_matches(widget, shell.source_keep_buffer_button):
+        if shell.host_running and HostClient::request(host_process, 145, 0, 0).result == 1:
+            shell.source_compare_mode <- false
+            refresh_source_view(shell, host_process)
+            set_status(shell, HostClient::request(host_process, 56, 0, 0).text)
+            UiHandles::layout(UiCore::viewport_width(), UiCore::viewport_height())
+        else:
+            set_status(shell, HostClient::request(host_process, 56, 0, 0).text)
+        return true
+    if UiHandles::callback_matches(widget, shell.source_reload_external_button):
+        if shell.host_running and HostClient::request(host_process, 144, 0, 0).result == 1:
+            shell.source_compare_mode <- false
+            shell.source_page_start <- 0
+            refresh_source_view(shell, host_process)
+            set_status(shell, HostClient::request(host_process, 56, 0, 0).text)
+            UiHandles::layout(UiCore::viewport_width(), UiCore::viewport_height())
+        else:
+            set_status(shell, HostClient::request(host_process, 56, 0, 0).text)
+        return true
+    if UiHandles::callback_matches(widget, shell.source_open_editor_button):
+        if shell.host_running and HostClient::request(host_process, 113, 0, 0).result == 1:
+            editor_opt: cstr? = getenv("ELISA_IDE_EDITOR")
+            if editor_opt is value:
+                path_buffer: mutable darray[u8] = source_path_for_external_action(host_process)
+                if path_buffer.count > 1:
+                    path_c: mutable cstr = ""
+                    can Unsafe.PointerCast:
+                        path_c <- (&path_buffer[0]).cast[cstr] can Unsafe.PointerCast
+                    editor_status: i64 = ExternalEditor::launch(value, path_c, shell.source_selected_line)
+                    if editor_status == 0:
+                        set_status_view(shell, "Opened the selected source line in the configured editor")
+                    else:
+                        set_status_view(shell, "Could not launch ELISA_IDE_EDITOR; check that it names an executable")
+                else:
+                    set_status_view(shell, "The open source file could not be resolved for the editor")
+            else:
+                set_status_view(shell, "Set ELISA_IDE_EDITOR to an editor executable to open source externally")
+        return true
+    if UiHandles::callback_matches(widget, shell.source_reveal_button):
+        if shell.host_running and HostClient::request(host_process, 113, 0, 0).result == 1:
+            path_buffer: mutable darray[u8] = source_path_for_external_action(host_process)
+            if path_buffer.count > 1:
+                path_c: mutable cstr = ""
+                can Unsafe.PointerCast:
+                    path_c <- (&path_buffer[0]).cast[cstr] can Unsafe.PointerCast
+                reveal_status: i64 = ExternalEditor::reveal_file(path_c)
+                if reveal_status == 0:
+                    set_status_view(shell, "Revealed the source file in the filesystem")
+                else:
+                    set_status_view(shell, "Could not reveal this file on the current platform")
+            else:
+                set_status_view(shell, "The open source file could not be resolved")
+        return true
+    if UiHandles::callback_matches(widget, shell.source_previous_button):
+        if shell.source_mode and HostClient::request(host_process, 113, 0, 0).result == 1:
+            shell.source_page_start <- shell.source_page_start - MAX_SOURCE_LINES.i64()
+            shell.source_page_start <- 0 if shell.source_page_start < 0
+            refresh_source_view(shell, host_process)
+        return true
+    if UiHandles::callback_matches(widget, shell.source_next_button):
+        if shell.source_mode and HostClient::request(host_process, 113, 0, 0).result == 1:
+            shell.source_page_start <- shell.source_page_start + MAX_SOURCE_LINES.i64()
+            refresh_source_view(shell, host_process)
+        return true
+    breadcrumb_index: mutable i32 = 0
+    while breadcrumb_index < shell.hierarchy_breadcrumb_count:
+        breadcrumb: UiHandles::Handle = shell.hierarchy_breadcrumb_segments[breadcrumb_index.usize()]
+        if UiHandles::callback_matches(widget, breadcrumb):
+            if shell.host_running:
+                ancestor_index: mutable i64 = breadcrumb_index.i64()
+                if shell.hierarchy_breadcrumb_truncated:
+                    ancestor_index <- shell.hierarchy_breadcrumb_first - 1 if breadcrumb_index == 0
+                    ancestor_index <- shell.hierarchy_breadcrumb_first + breadcrumb_index.i64() - 1 if breadcrumb_index > 0
+                ancestor_row: i64 = HostClient::request(host_process, 65, ancestor_index, 0).result
+                if ancestor_row >= 0:
+                    command(shell, 31, ancestor_row)
+            return true
+        breadcrumb_index <- breadcrumb_index + 1
+    source_total: i32 = shell.source_line_count
+    index: mutable i32 = 0
+    while index < source_total:
+        source_row: UiHandles::Handle = shell.source_line_rows[index.usize()]
+        if UiHandles::callback_matches(widget, source_row):
+            if shell.host_running:
+                if HostClient::request(host_process, 113, 0, 0).result == 1:
+                    shell.source_selected_line <- shell.source_line_offsets[index.usize()] + 1
+                    selected_status: mutable darray[u8] = []
+                    append_panel_text(&selected_status, "Selected source line ")
+                    append_nonnegative(&selected_status, shell.source_selected_line)
+                    append_panel_text(&selected_status, "; use Open in Editor")
+                    set_status_view(shell, ShellBytes::view_of(&selected_status))
+                else:
+                    result: HostClient::HostReply = HostClient::request(host_process, 108, shell.source_line_offsets[index.usize()], 0)
+                    if result.result == 1:
+                        refresh_all(shell, host_process)
+                    else:
+                        set_status_view(shell, "This generated source line has no selectable form owner")
+            return true
+        index <- index + 1
+    file_total: i32 = shell.file_count
+    index <- 0
+    while index < file_total:
+        candidate: UiHandles::Handle = shell.file_rows[index.usize()]
+        if UiHandles::callback_matches(widget, candidate):
+            if index >= 2:
+                shell.source_mode <- true
+                apply_shell_layout(shell)
+                if shell.host_running:
+                    refresh_source_view(shell, host_process)
+                UiHandles::layout(UiCore::viewport_width(), UiCore::viewport_height())
+            else:
+                set_status_view(shell, "Project file view is read-only; use the project actions to open or save files")
+            return true
+        index <- index + 1
+    palette_total: i32 = shell.palette_count
+    index <- 0
     while index < palette_total:
         candidate: UiHandles::Handle = shell.palette_rows[index.usize()]
         if UiHandles::callback_matches(widget, candidate):
             command(shell, 30, shell.palette_source_indices[index.usize()].i64())
+            return true
+        index <- index + 1
+    problem_total: i32 = shell.problem_count
+    index <- 0
+    while index < problem_total:
+        candidate: UiHandles::Handle = shell.problem_rows[index.usize()]
+        if UiHandles::callback_matches(widget, candidate):
+            diagnostic_text: sview = UiFlat::widget(candidate.widget_id.usize()).text
+            copied_length: mutable i64 = diagnostic_text.len
+            copied_length <- 16384 if copied_length > 16384
+            copied_length <- UiText::valid_utf8_prefix(diagnostic_text, copied_length.usize()).i64()
+            copy_index: mutable i64 = 0
+            while copy_index < copied_length:
+                shell.problem_copy_bytes[copy_index.usize()] <- diagnostic_text[copy_index]
+                copy_index <- copy_index + 1
+            shell.problem_copy_length <- copied_length
+            shell.problem_copy_truncated <- diagnostic_text.len > copied_length
+            UiHandles::set_enabled(shell.problem_copy_button, copied_length > 0)
+            logical_row: i64 = shell.problem_page.i64() * MAX_PROBLEM_ROWS.i64() + index.i64()
+            if logical_row < shell.projection.problem_count:
+                target_row: i64 = HostClient::request(host_process, 100, logical_row, 0).result
+                if target_row >= 0:
+                    command(shell, 31, target_row)
+            else:
+                set_status_view(shell, "Build diagnostic source mapping is unavailable for this output line")
             return true
         index <- index + 1
     hierarchy_total: i32 = shell.hierarchy_count
@@ -535,12 +2004,16 @@ def widget_event_rows(shell: mutable Shell&, widget: usize) -> bool:
     while index < hierarchy_total:
         candidate: UiHandles::Handle = shell.hierarchy_rows[index.usize()]
         if UiHandles::callback_matches(widget, candidate):
-            command(shell, 31, shell.hierarchy_page.i64() * MAX_HIERARCHY_ROWS.i64() + index.i64())
+            row: i64 = shell.hierarchy_page.i64() * MAX_HIERARCHY_ROWS.i64() + index.i64()
+            held: UiFlat::Modifiers = UiHandles::modifiers()
+            opcode: i64 = 83 if held.shift else (82 if held.control or held.super else 31)
+            command(shell, opcode, row)
             return true
         index <- index + 1
     return false
 
 def init(shell: mutable Shell&) -> void:
+    build_job <- BuildJob::empty()
     register_shortcuts()
     load_pane_preferences(shell)
     build_shell(shell)
@@ -549,7 +2022,9 @@ def init(shell: mutable Shell&) -> void:
     if shell.host_running:
         refresh_all(shell, host_process)
 
-def frame(shell: mutable Shell&) -> void:
+def frame(shell: mutable Shell&) -> void can[Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast, Ui.Draw]:
+    poll_build_process(shell)
+    poll_run_process(shell)
     ShellPreview::poll_and_bind(shell)
     UiCore::clear(shell_color(12, 14, 20))
     UiHandles::paint()
@@ -557,6 +2032,6 @@ def frame(shell: mutable Shell&) -> void:
 
 def update_status(shell: mutable Shell&) -> void:
     if shell.status_length > 0:
-        UiHandles::set_text(shell.status_line, sview(&shell.status_storage[0], 0, shell.status_length), 12.0, shell_color(148, 158, 180))
+        UiHandles::set_text(shell.status_line, UiText::fixed_bytes_view_range[1024](shell.status_storage, 0, shell.status_length.usize()), 12.0, shell_color(148, 158, 180))
     if shell.form_title_length > 0:
-        UiHandles::set_text(shell.title_label, sview(&shell.form_title_storage[0], 0, shell.form_title_length), 15.0, shell_color(244, 246, 252))
+        UiHandles::set_text(shell.title_label, UiText::fixed_bytes_view_range[256](shell.form_title_storage, 0, shell.form_title_length.usize()), 15.0, shell_color(244, 246, 252))

@@ -29,7 +29,7 @@ module DesignRecovery:
             path.push(0)
             return path
 
-        def as_cstr(buffer: mutable darray[u8]&) -> cstr:
+        def as_cstr(buffer: mutable darray[u8]&) -> cstr can[Unsafe.PointerCast]:
             return (&buffer[0]).cast[cstr] can Unsafe.PointerCast
 
     public:

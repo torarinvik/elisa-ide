@@ -16,8 +16,15 @@ const HOST_REPLY_CAPACITY: usize = PreviewWire::MAX_PAYLOAD_BYTES + 8
 module ShellBytes:
     public:
         def view_of(bytes: darray[u8]&) -> sview:
-            return "" if bytes.count == 0
-            return sview(&bytes[0], 0, bytes.count.i64())
+            return "" if bytes.count == 0 or bytes.items == null or bytes.count > bytes.capacity
+            count: i64 = bytes.count.i64()
+            return "" if count < 0 or count.usize() != bytes.count
+            # The reference and checked count prove that the view borrows a
+            # live byte range. The direct bridge avoids a stage1 decline when
+            # a dynamic-array reference is passed through bytes_view_range.
+            trusted Unsafe.UncheckedIndex:
+                can Unsafe.PointerCast:
+                    return UiText::unsafe_sview_bounded_bytes(&bytes[0], bytes.count)
 
         def equal(left: sview, right: sview) -> bool:
             return false if left.len != right.len
@@ -54,7 +61,8 @@ module HostClient:
             b: i64 = bytes[(offset + 1).usize()].i32().i64()
             c: i64 = bytes[(offset + 2).usize()].i32().i64()
             d: i64 = bytes[(offset + 3).usize()].i32().i64()
-            return a | (b << 8) | (c << 16) | (d << 24)
+            value: i64 = a | (b << 8) | (c << 16) | (d << 24)
+            return value - 4294967296 if d >= 128 else value
 
         def append_hex_bytes(buffer: mutable darray[u8]&, text: sview) -> void:
             index: mutable i64 = 0
@@ -79,7 +87,7 @@ module HostClient:
                     request.push(32)
                     append_hex_bytes(&request, text)
                 request.push(10)
-                view: sview = sview(&request[0], 0, request.count.i64())
+                view: sview = ShellBytes::view_of(&request)
                 if PosixFile::write_plain("build/host_request.txt", view) < 0:
                     return HostReply{result: -1, text: []}
                 # Remove the previous reply so a stale file cannot be read as
@@ -87,7 +95,7 @@ module HostClient:
                 _ = PosixFile::remove("build/host_reply.bin")
                 one_byte: mutable darray[u8] = []
                 one_byte.push(10)
-                _ = PosixProcess::write_stdin(process, sview(&one_byte[0], 0, 1))
+                _ = PosixProcess::write_stdin(process, ShellBytes::view_of(&one_byte))
 
                 reply: mutable darray[u8] = []
                 waited: mutable i64 = 0

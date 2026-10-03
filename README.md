@@ -19,33 +19,149 @@ typed project/form models, validation, stable design IDs, commands with
 undo/redo, safe save and recovery primitives, deterministic source generation,
 and a headless CLI. The shell already has a palette, hierarchy, inspector,
 Problems panel, keyboard commands, split-pane persistence, and form open/save
-controls.
+controls. The inspector includes a descriptor-backed Events section for Button
+and TextField connections; handler edits and disconnects are undoable and
+accept qualified Elisa symbols. Recovery snapshots are written after semantic
+mutations, and the shell exposes Restore, Discard, and external-change Reload
+actions without overwriting a newer file. The **New Project** action creates a fresh project folder containing
+a relative `forms/main.elisaform.json` and a matching
+`<folder-name>.elisaproject.json` manifest, then opens the starter form. Enter
+the destination directory in the path field; the parent directory must
+already exist, and the destination itself must be new. Paths with spaces and
+UTF-8 names are supported. The same action is available in the compact layout.
+The left Project files view lists the active manifest, project-relative form,
+and virtual generated view/source-map paths without executing project files;
+generated entries open the read-only source projection.
 
-The current preview path serializes the unsaved form and constructs the
-supported Elisa-ui controls in an isolated AppKit worker. The SDL3 framework
-also has a retained RGBA image upload/draw bridge. The product still needs to
-connect the worker frame to the shell canvas and route canvas selection back to
-the document host. The source and test are in progress; the UI integration
-test currently reports that its spawned preview worker did not exit, although
-the worker exits successfully when launched directly with the same snapshot.
+The preview worker serializes the unsaved form, constructs the supported
+Elisa-ui controls in an isolated process, and renders a PNG. The process wrapper
+reaps an exited child even while a descendant keeps its output pipes open, and
+a regression test covers that case. The selected desktop host profile is a
+native AppKit shell with elisa-ui's retained drawing commands rasterized by the
+pinned Skia CPU backend. The Skia pin, archive, and IDE image bridge have been
+built and verified. `scripts/build_ide.sh` verifies the compiler/runtime and
+Skia provenance, then builds and signs the product. The IDE defaults to Elisa
+`-O0` while the current full-shell `-O1`/`-O2` compile stalls in LLVM's
+optimization passes; `ELISA_IDE_OPT_LEVEL` remains available for explicit
+optimization trials. The preview worker compiles with Elisa `-O2` by default;
+`build/provenance-ide.json` records the compiler revision and selected product
+optimization level alongside the Skia build identity.
+`build/provenance-preview-worker.json` records its compiler and optimization
+level.
+The ignored `compiler` symlink points at the newest available stage1 checkout,
+`../Elisa-compiler`, revision `d8b5d305ec99a9d2238e035b871d9fd4e9835603` on
+`main`, three commits ahead of `origin/main`. Its compiler product, runtime,
+and current source fingerprint pass the toolchain freshness check. The verified
+source fingerprint is
+`3cc391e9af957026132334bbacb90321a6b1285a720bb45c16cc2b583ecd2248`, stage1
+SHA256 `c9120725bde202e70ea9ff94c9b87ab2026770eb5b29e95bfc1bc285f76eb9cf`,
+and runtime SHA256 `4a25cda85e118d59355bc437cb4e6ca15cbd96212d861198dc003bb3a3d733cb`.
+The current AppKit + Skia bundle builds and signs with that compiler at `-O0`.
+Focused document-host, source-editor, and shell-frame tests pass. The full core
+and UI suites were last verified with the previous stage1 revision; the updated
+shell integration still needs its generated-source pointer-selection assertion
+resolved before the suite can be reported green. Live Skia preview image
+binding has been verified; native-canvas selection still needs its live-product
+acceptance pass. The SDL3 integration harness waits for the isolated preview
+worker, decodes its PNG, checks snapshot-correlated stable-ID geometry, and
+selects the rendered button through the canvas fit mapping before verifying
+the hierarchy and inspector. That harness uses a validating headless image
+adapter, so it does not verify the native window's canvas-selection route.
+An untouched form explains that a change is needed to start its live preview.
 
-Code generation and the headless CLI form a foundation for full projects, not
-a complete project build/run workflow. Elisa LSP, debugger, profiler, compiler,
+SDL3 remains available for headless and UI-test harnesses and for generated-app
+profiles that explicitly select it. It is not the IDE's default desktop host.
+The initial Skia build profile is macOS arm64 CPU raster: it does not require a
+GPU and does not enable Metal. Other architectures or raster/GPU configurations
+need their own pinned and verified build profile.
+
+The project generator and headless scripts cover the standalone workflow, and
+the desktop shell now exposes a revision-aware Build/Run/Stop job path that
+uses the same structured process service. Build Output is visible in the
+bottom pane and receives incremental stdout/stderr without duplicating retained
+bytes; the captured log is bounded and remains available after a successful or
+failed build. Recognized compiler/package diagnostic lines are also projected
+into the paged Problems panel while the raw log remains intact. The bounded LSP
+transport foundation
+in `src/lsp/lsp_client.py` handles strict Content-Length framing, UTF-8 JSON,
+subprocess deadlines, lifecycle messages, document versions, and version-gated
+diagnostics; `DiagnosticStore.typed()` preserves version, severity, source, code,
+ranges, related information, and raw payloads for future Problems/source views.
+Interactive source panes and the debugger/profiler adapters remain
+planned; the DAP transport and profiler artifact reader now provide the bounded
+process/data foundations. `src/lsp/server_resolution.py` selects and hashes the
+configured server, trusted nearby build, `ELISA_LSP`, or `PATH` executable in
+that order. Elisa LSP, debugger, profiler, compiler,
 and package-manager connections are required parts of the IDE plan. The local
 tool interfaces and capability limits are recorded in
 [`docs/product-vision.md`](docs/product-vision.md); unsupported functionality
 is never treated as available merely because it appears in a protocol spec.
+`src/build/build_diagnostics.py` provides a bounded typed projection for
+compiler-wrapper and `elisapkg` lines while preserving the raw Build Output;
+source-buffer and generated-form mapping remains planned.
+The shell's Source view displays the generated Elisa view read-only beside the
+RAD canvas; generated ownership remains explicit and edits continue to target
+the form or handwritten handler source.
+The document host also exposes the exact-byte generated source map (opcode
+107) and a fail-closed UTF-8 byte navigation request (opcode 108), so source
+navigation can verify the map hash before selecting its owning form node. The
+Source pane presents a bounded 32-line clickable generated-source projection
+that uses this route to refresh the hierarchy and inspector; larger generated
+files remain explicitly truncated until the virtualized editor lands. Its
+header displays the relative owning form path and states that the generated
+view is read-only with a bounded visible-row count.
+Handwritten `.elisa` files open in a paged line editor. Visible lines up to
+768 bytes can be edited and saved atomically from the Source pane; longer
+lines stay locked so clipped text cannot replace hidden bytes. Save checks
+that the on-disk file still matches the version opened by the IDE. When the
+file changes, the Source pane offers **Compare**, **Keep Buffer**, and
+**Discard + Reload**. Keep Buffer explicitly selects the local version for the
+next Save; Reload discards local edits and adopts the disk version. If the disk
+copy is missing or cannot be read, use **Save As** with a new `.elisa` path in
+the document path field; Save As refuses to replace an existing file. Set
+`ELISA_IDE_EDITOR` to an executable that accepts `<file-path> <one-based-line>`
+to enable **Open in Editor**; the file and line are passed as separate process
+arguments without shell parsing. **Reveal** asks Finder to show the open source
+file. Use Up and Down to move between editable source rows and PageUp/PageDown
+to move by 32 lines; navigation retains the code-column position across pages.
+Enter a one-based line number in **Go to Line** and press Enter or **Go** to
+move to that line, focus it, and scroll it into view.
+Use **Find**, **Prev**, and **Next** to search the complete open source buffer
+for an exact UTF-8 query of up to 256 bytes. Search starts from the caret (or
+continues past the last match even after focus moves to a search button), wraps
+at the file boundary, and moves the matching row into view. A match on a clipped,
+read-only row is reported, with **Open in Editor** available for inspection.
+**Replace Next** replaces the active match, or finds the next match first, as
+one undoable edit; replacement text must stay on one line. **Replace All** applies
+the exact UTF-8 query to the complete open buffer, reports the number of
+non-overlapping matches, and records the result as one undoable edit while
+preserving the file's LF or CRLF convention. Regular-expression search is not
+available yet. With an editable source row focused, press Ctrl/Cmd+F to focus
+Find and select its current query for replacement.
+Press Enter to split the focused line at the caret or replace its selection,
+preserving the source file's LF or CRLF convention. Backspace at a line start
+and Delete at a line end merge adjacent lines. Undo and Redo use a bounded
+source-edit history that stays separate from form-document history; the toolbar
+and Command/Ctrl+Z, Command/Ctrl+Shift+Z, or Command/Ctrl+Y use that source history
+while a source line has focus. Tab adds a four-space indent after the line's
+existing leading whitespace; Shift+Tab removes one indentation level from the
+active line.
+Command/Ctrl+A selects the current source row's code text and leaves its visible
+line-number prefix out of the selection.
+Select a Problems row and choose **Copy** to place its displayed
+diagnostic text on the system clipboard.
 
 ## Dependencies
 
 | Dependency | Purpose | Default resolution |
 | --- | --- | --- |
 | elisa-ui | IDE interface and generated application UI | `../elisa-ui`, also exposed as the `framework` symlink |
-| wasm-sdk-compiler | Elisa compiler and runtime used by the current native build | `../wasm-sdk-compiler` |
-| SDL3 + SDL3_ttf | Native window, input, and text rasterization | Homebrew (`/opt/homebrew/lib` on Apple silicon) |
+| Elisa-compiler | Current Elisa compiler and runtime used by the native build | ignored `compiler` symlink (fallback `../Elisa-compiler`) |
+| AppKit + pinned Skia | IDE desktop window and custom-canvas rasterization | macOS; see `SKIA_ROOT` and `SKIA_OUT` below |
+| SDL3 + SDL3_ttf | Headless/UI-test harnesses and generated-app profiles that select SDL3 | Homebrew (`/opt/homebrew/lib` on Apple silicon) |
 | clang | Links compiler objects, native services, and runtime | `clang` on `PATH` |
 | python3 | Compiler wrapper and development tooling | `python3` on `PATH` |
-| Elisa-LSP | Planned language service process | Local tool discovery; see product vision |
+| Elisa-LSP | Language service process for the planned source workspace | Local tool discovery; transport foundation is in `src/lsp/` |
 | elisa-debugger | Planned DAP debug adapter | Local tool discovery; EDIR support is currently restricted |
 | elisa-profiler | Planned profiling command-line tool | Local tool discovery; runs as a managed job |
 | elisa-pkg | Planned project/package task backend | Local tool discovery; local dependency graphs currently gate build/run/test |
@@ -53,50 +169,121 @@ is never treated as available merely because it appears in a protocol spec.
 Current build environment overrides:
 
 - `ELISA_UI_ROOT` — elisa-ui checkout root (default `../elisa-ui`).
-- `ELISA_UI_STAGE1` — compiler checkout root (default `../wasm-sdk-compiler`).
-- `ELISA_UI_SDL_LIB` — directory holding `libSDL3` and `libSDL3_ttf`
-  (default `/opt/homebrew/lib`).
+- `ELISA_UI_STAGE1` — compiler checkout root (default the ignored `compiler` symlink, fallback `../Elisa-compiler`).
+- `ELISA_IDE_OPT_LEVEL` — Elisa optimization level for the IDE executable
+  (default `-O0`; accepts `-O0` through `-O3`).
+- `ELISA_PREVIEW_WORKER_OPT_LEVEL` — Elisa optimization level for the isolated
+  AppKit preview worker (default `-O2`; accepts `-O0` through `-O3`).
+- `SKIA_ROOT` — the Skia source checkout at the revision pinned by
+  `../elisa-ui/third_party/skia.lock` (currently Skia `chrome/m150`, revision
+  `9c7b2dffb2433f5a0cc2b77f06025a09126807ed`).
+- `SKIA_OUT` — the isolated GN build output containing `libskia.a`; defaults to
+  `$SKIA_ROOT/out/elisa`.
+- `ELISA_UI_SDL_LIB` — directory holding `libSDL3` and `libSDL3_ttf` for
+  SDL-based harnesses and generated-app profiles (default `/opt/homebrew/lib`).
 - `ELISA_UI_FONT` — font file for the native backend; the framework default is
   used when unset.
 - `ELISA_IDE_CONFIG` — explicit Elisa IDE preferences file. The former
   `ELISA_UI_DESIGNER_CONFIG` name remains a compatibility fallback.
+- `ELISA_IDE_EDITOR` — optional editor executable for the read-only Source pane;
+  it receives the selected file path and one-based line as separate arguments.
 
 When stage1 is stale, rebuild it from the compiler checkout:
 
 ```sh
-(cd ../wasm-sdk-compiler && scripts/elisac_stage1.sh --seed)
+(cd compiler && scripts/elisac_stage1.sh --seed)
 ```
 
 Build scripts reject stale compiler products. Do not set
 `ELISA_ALLOW_STALE_STAGE1=1` for acceptance builds. The `framework` symlink
 keeps source includes stable and `scripts/doctor.sh` checks its target. For a
 different checkout layout, set `ELISA_UI_ROOT` and repoint the symlink; do not
-commit personal absolute paths.
+commit personal absolute paths. The ignored `compiler` symlink must resolve to
+the same compiler checkout selected by `ELISA_UI_STAGE1`, because Elisa source
+files include standard-library modules through it.
+
+Each provenance JSON also records `stage1_sources_sha256`, a deterministic hash
+of every `.elisa` and `.elisai` source under the compiler's `src/` and
+`elisacore_std/` trees, including uncommitted and untracked files. Build scripts
+compare that fingerprint and the stage1/runtime binary hashes again after
+compilation, so a compiler or source change during a build rejects the result.
+The IDE build permits the intentionally dirty sibling compiler checkout while
+keeping the stale-source gate enabled; its source fingerprint makes that exact
+local compiler snapshot reviewable.
+
+The Skia dependency is not vendored. On macOS arm64, provision the pinned
+CPU-raster archive with the framework's lockfile-driven build script, then run
+its renderer checks:
+
+```sh
+export SKIA_ROOT=/path/to/elisa-skia
+export SKIA_OUT="$SKIA_ROOT/out/elisa"
+bash ../elisa-ui/scripts/build_skia.sh
+SKIA_ROOT="$SKIA_ROOT" SKIA_OUT="$SKIA_OUT" bash ../elisa-ui/scripts/check_appkit_skia.sh
+```
+
+The pin currently builds `target_os="mac"`, `target_cpu="arm64"`, with both
+OpenGL and Metal disabled. `build_skia.sh` needs Git, Python 3, and Ninja
+(`ninja` or `autoninja`); it fetches Skia's GN tool and dependencies. These
+commands provision and check the framework's Skia backend; they do not by
+themselves build or verify the Elisa IDE host. The IDE's AppKit+Skia build and
+interactive preview path remain acceptance work.
 
 ## Build and run
 
 ```sh
-scripts/doctor.sh          # resolve dependencies and write build provenance
-scripts/build_native.sh    # build document host and preview worker, then build/elisa_ide
-./build/elisa_ide
+scripts/doctor.sh       # verify the default macOS AppKit + Skia IDE profile
+scripts/build_ide.sh    # build and bundle Elisa IDE (requires the pinned Skia archive)
+open "build/Elisa IDE.app"
+scripts/run_core_tests.sh
+scripts/run_ui_tests.sh # SDL3-backed UI and headless harness checks
+python3 scripts/smoke_lsp.py # exercise the discovered local Elisa-LSP
 ```
 
-Headless native smoke check:
+`scripts/build_native.sh` is reserved for SDL3 tests and generated-app profiles.
+For one of those products, a headless smoke check is:
 
 ```sh
-SDL_VIDEODRIVER=dummy ELISA_UI_SMOKE_FRAMES=1 ./build/elisa_ide
+scripts/build_native.sh test/ui/designer_shell_test.elisa designer_shell_test
+scripts/smoke_native.sh designer_shell_test
 ```
 
-The `elisa_ide_cli` currently validates and migrates form/project files and
-generates the first view source:
+The `elisa_ide_cli` validates and migrates form/project files and generates a
+deterministic view source. Project-level generation is available through the
+staged Python publisher; it resolves every project form (with the entry form
+as the application root), emits view modules and an SDL3 application
+composition root, writes an ownership manifest, and refuses to
+replace modified generated files or collide with unowned output:
 
 ```sh
 scripts/run_core_tests.sh
 scripts/run_tests.sh
 ./build/elisa_ide_cli validate test/fixtures/settings-form.elisaform.json
 ./build/elisa_ide_cli migrate <input.json> <output.json>
+./build/elisa_ide_cli source <generated.elisa> <generated.map.json> <byte-offset>
+python3 scripts/generate_project.py <project.elisaproject.json> \
+  --handlers <path/to/handwritten_handlers.elisa> \
+  --framework-include <path/to/elisa-ui/src/platform/sdl3/ui_sdl3_flat.elisa>
+scripts/build_project.sh <project-folder-or-project.elisaproject.json> \
+  --handlers <path/to/handwritten_handlers.elisa> \
+  --framework-include <path/to/elisa-ui/src/platform/sdl3/ui_sdl3_flat.elisa>
+scripts/run_project.sh <project-folder-or-project.elisaproject.json> \
+  --handlers <path/to/handwritten_handlers.elisa> \
+  --framework-include <path/to/elisa-ui/src/platform/sdl3/ui_sdl3_flat.elisa>
+scripts/smoke_project_generation.sh
+scripts/smoke_counter_generation.sh
 scripts/run_spikes.sh
 ```
+
+The generated directory contains one `<namespace>_*.elisa` view per project
+form, a matching `.map.json` source map for each view,
+`<namespace>_app.elisa`, a generated README, and `.elisa-ide-generation.json`.
+The `source` CLI command validates a map against exact generated bytes and
+resolves a byte offset to its form/node/property/event origin; stale maps are
+rejected. Handler source stays outside that ownership manifest and is included
+by path. The generated app is
+the SDL3/headless profile used by the current compile/run smoke; the IDE
+desktop itself remains AppKit + Skia.
 
 Build, run, test, LSP, debugger, and profiler controls will converge on a
 shared job and toolchain manager as those integrations land. Opening a project
@@ -112,16 +299,19 @@ src/registry/     component and property metadata
 src/commands/     transactions, operations, undo/redo
 src/validation/   graph, property, target, diagnostic checks
 src/workspace/    projects, source documents, preferences, recovery
+src/lsp/          bounded Elisa-LSP framing, lifecycle, and document diagnostics
+src/source/       UTF-8-preserving source buffer, positions, and local undo
+src/debug/        bounded DAP transport and build/source session identity
+src/profile/      strict profile artifact validation and compiler/runtime identity
+src/toolchain/    hashed executable selection and compiler/runtime pairing records
 src/shell/        menus, toolbar, panes, status, command routing
 src/panels/       hierarchy, palette, inspector, diagnostics, tools
 src/canvas/       transforms, gestures, overlays, drop intent
 src/preview/      supervisor, protocol, scene correlation
 src/language/     planned source buffers, LSP sessions, code navigation
-src/debug/        planned DAP session and debug-state adapters
-src/profile/      planned profile jobs and result readers
 src/lowering/     canonical runtime-ready intermediate representation
 src/codegen/      Elisa emitter, symbols, source maps, output manifest
-src/build/        toolchain discovery, jobs, diagnostics, run supervision
+src/build/        revision-aware build-job policy and later toolchain supervision
 src/platform/     narrow desktop service adapters
 src/cli/          validation, generation, and later build/run entrypoints
 worker/           isolated preview and document-host processes

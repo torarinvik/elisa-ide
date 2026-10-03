@@ -227,7 +227,9 @@ module DesignSaveTest:
 
             # --- injected write failure --------------------------------------
             stale_temp: darray[u8] = PosixFile::temp_path(TARGET)
-            stale_temp_c: cstr = (&stale_temp[0]).cast[cstr] can Unsafe.PointerCast
+            stale_temp_c: mutable cstr = ""
+            can Unsafe.PointerCast:
+                stale_temp_c <- (&stale_temp[0]).cast[cstr] can Unsafe.PointerCast
             stale_written: i64 = catch write_entire_file(stale_temp_c, "stale"):
                 value:
                     value

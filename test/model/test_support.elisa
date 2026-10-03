@@ -44,7 +44,7 @@ module TestSupport:
 
         def view_of(bytes: darray[u8]) -> sview:
             return "" if bytes.count == 0
-            return sview(&bytes[0], 0, bytes.count.i64())
+            return bytes_view_range(bytes, 0, bytes.count)
 
         def text_contains(haystack: sview, needle: sview) -> bool:
             return DesignText::has_text(haystack, needle)

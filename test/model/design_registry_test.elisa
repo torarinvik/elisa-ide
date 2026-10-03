@@ -17,17 +17,28 @@ module DesignRegistryTest:
             label: i64 = DesignRegistry::find_component(registry, "elisa.ui.label")
             button: i64 = DesignRegistry::find_component(registry, "elisa.ui.button")
             field: i64 = DesignRegistry::find_component(registry, "elisa.ui.text_field")
+            check_box: i64 = DesignRegistry::find_component(registry, "elisa.ui.check_box")
+            radio_button: i64 = DesignRegistry::find_component(registry, "elisa.ui.radio_button")
+            slider: i64 = DesignRegistry::find_component(registry, "elisa.ui.slider")
+            progress_bar: i64 = DesignRegistry::find_component(registry, "elisa.ui.progress_bar")
+            scroll: i64 = DesignRegistry::find_component(registry, "elisa.ui.scroll")
             TestSupport::check("column registered", column >= 0)
             TestSupport::check("row registered", row >= 0)
             TestSupport::check("panel registered", panel >= 0)
             TestSupport::check("label registered", label >= 0)
             TestSupport::check("button registered", button >= 0)
             TestSupport::check("text field registered", field >= 0)
+            TestSupport::check("check box registered", check_box >= 0)
+            TestSupport::check("radio button registered", radio_button >= 0)
+            TestSupport::check("slider registered", slider >= 0)
+            TestSupport::check("progress bar registered", progress_bar >= 0)
+            TestSupport::check("scroll registered", scroll >= 0)
 
             # Containers can nest; leaves cannot.
             TestSupport::check("column can have children", registry.components[column.usize()].can_have_children)
             TestSupport::check("button cannot have children", not registry.components[button.usize()].can_have_children)
             TestSupport::check("label cannot have children", not registry.components[label.usize()].can_have_children)
+            TestSupport::check("scroll can have children", registry.components[scroll.usize()].can_have_children)
 
             # Property descriptors carry type, default, range, and effect flags.
             padding: i64 = DesignRegistry::find_property(registry, column, "padding")
@@ -62,6 +73,17 @@ module DesignRegistryTest:
             TestSupport::check("label has no events", DesignRegistry::find_event(registry, label, "click") < 0)
             change: i64 = DesignRegistry::find_event(registry, field, "change")
             TestSupport::check("text field has a change event", change >= 0)
+            help: i64 = DesignRegistry::find_property(registry, field, "help")
+            TestSupport::check("text field exposes help text", help >= 0)
+            if help >= 0:
+                help_descriptor: DesignRegistry::PropertyDescriptor = registry.components[field.usize()].properties[help.usize()]
+                TestSupport::check("text field help is descriptive text", help_descriptor.tag == DesignValues::ValueTag.Text and help_descriptor.affects_semantics)
+            TestSupport::check("check box has a change event", DesignRegistry::find_event(registry, check_box, "change") >= 0)
+            TestSupport::check("slider has a change event", DesignRegistry::find_event(registry, slider, "change") >= 0)
+            value: i64 = DesignRegistry::find_property(registry, slider, "value")
+            if value >= 0:
+                value_descriptor: DesignRegistry::PropertyDescriptor = registry.components[slider.usize()].properties[value.usize()]
+                TestSupport::check("slider value is a bounded scalar", value_descriptor.tag == DesignValues::ValueTag.Scalar and value_descriptor.min_value == 0.0 and value_descriptor.max_value == 1.0)
 
             # Unknown lookups fail closed.
             TestSupport::check("unknown component not found", DesignRegistry::find_component(registry, "elisa.ui.mystery") < 0)

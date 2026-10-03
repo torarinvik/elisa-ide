@@ -1,0 +1,36 @@
+# Stable task identity, bounded output, cancellation, and stale result policy.
+
+include "../../compiler/elisacore_std/elisacore_runtime.elisa"
+include "../../compiler/elisacore_std/collections.elisa"
+include "../../src/model/design_text.elisa"
+include "../../src/workspace/workspace_task.elisa"
+include "../model/test_support.elisa"
+
+module WorkspaceTaskTest:
+    public:
+        def run() -> i64:
+            task: mutable WorkspaceTask::TaskRecord = WorkspaceTask::empty(41, WorkspaceTask::Kind.Compiler, 9)
+            TestSupport::check("task identity is stable", WorkspaceTask::valid_identity(task) and task.id == 41 and task.input_revision == 9)
+            TestSupport::check("queued task starts", WorkspaceTask::start(&task) and WorkspaceTask::is_running(task))
+            WorkspaceTask::append_output(&task, "compiler output\n")
+            TestSupport::check("task output is retained", DesignText::equal(WorkspaceTask::output_view(task), "compiler output\n"))
+            TestSupport::check("stale task completion is refused", not WorkspaceTask::finish(&task, 40, 9, 0) and WorkspaceTask::is_running(task))
+            TestSupport::check("stale revision completion is refused", not WorkspaceTask::finish(&task, 41, 8, 0) and WorkspaceTask::is_running(task))
+            TestSupport::check("matching task completion succeeds", WorkspaceTask::finish(&task, 41, 9, 0) and task.state == WorkspaceTask::State.Succeeded)
+            TestSupport::check("completed result keeps task identity", WorkspaceTask::accepts_result(task, 41, 9) and not WorkspaceTask::accepts_result(task, 42, 9))
+            TestSupport::check("new task can be cancelled", WorkspaceTask::start(&task) == false)
+            task2: mutable WorkspaceTask::TaskRecord = WorkspaceTask::empty(42, WorkspaceTask::Kind.Run, 10)
+            TestSupport::check("second task starts independently", WorkspaceTask::start(&task2) and WorkspaceTask::request_cancel(&task2))
+            TestSupport::check("cancelled task is terminal", WorkspaceTask::finish(&task2, 42, 10, 0) and task2.state == WorkspaceTask::State.Cancelled)
+            huge: mutable darray[u8] = []
+            for index in 0..<WorkspaceTask::MAX_OUTPUT_BYTES.i64() + 16:
+                huge.push(120)
+            task3: mutable WorkspaceTask::TaskRecord = WorkspaceTask::empty(43, WorkspaceTask::Kind.Profiler, 11)
+            WorkspaceTask::start(&task3)
+            WorkspaceTask::append_output(&task3, TestSupport::view_of(huge))
+            TestSupport::check("task output is bounded", task3.output.count == WorkspaceTask::MAX_OUTPUT_BYTES and task3.output_truncated)
+            TestSupport::check("labels remain stable", DesignText::equal(WorkspaceTask::kind_label(WorkspaceTask::Kind.Debugger), "debugger") and DesignText::equal(WorkspaceTask::state_label(task3.state), "running"))
+            return TestSupport::report("workspace_task")
+
+def main() -> i64:
+    return WorkspaceTaskTest::run()

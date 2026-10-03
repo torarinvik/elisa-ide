@@ -1,0 +1,19 @@
+# SDL3 image adapter for the shell's isolated PNG preview.
+#
+# The editor shell calls PreviewImageBackend without depending on a renderer.
+# This adapter is used only by the SDL-based native test harnesses.
+
+module PreviewImageBackend:
+    public:
+        def is_bound(resource: UiResources::ResourceHandle, image: UiCore::ImageRef, native_image: usize) -> bool:
+            return UiSdl3Draw::is_image_bound(image)
+
+        def bind_rgba32(resource: UiResources::ResourceHandle, image: UiCore::ImageRef, pixels: u8&?, byte_length: usize, width: usize, height: usize, row_stride: usize, native_image: mutable usize&) -> bool can[Ui.Draw]:
+            native_image <- 0
+            return UiSdl3Draw::bind_image_rgba32(image, pixels, byte_length, width, height, row_stride)
+
+        def unbind(resource: UiResources::ResourceHandle, image: UiCore::ImageRef, native_image: usize) -> void can[Ui.Draw]:
+            _ = UiSdl3Draw::unbind_image(image)
+
+        def release(native_image: usize) -> void:
+            return

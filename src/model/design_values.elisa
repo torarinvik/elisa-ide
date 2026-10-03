@@ -145,9 +145,9 @@ module DesignValues:
                 index <- index + 1
             return string_ref(start, length.usize())
 
-        def text_of(pool: StringPool&, ref: StringRef) -> sview:
+        def text_of[@r](pool: StringPool& @r, ref: StringRef) -> sview @r:
             return "" if ref.length == 0
-            return sview(&pool.bytes[ref.offset], 0, ref.length.i64())
+            return bytes_view_range_ref(pool.bytes, ref.offset, ref.length)
 
         def equal_ref(pool: StringPool&, ref: StringRef, expected: sview) -> bool:
             return false if ref.length != expected.len.usize()

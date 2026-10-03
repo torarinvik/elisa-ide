@@ -1,0 +1,22 @@
+# Deterministic platform hooks for shell integration tests. These tests drive
+# UiHandles and UiHarness directly; native clipboard and font rendering belong
+# to backend-specific tests, so keep those hooks local and predictable here.
+
+include "../../framework/src/core/ui_core.elisa"
+include "../../framework/src/core/ui_paint.elisa"
+include "../../framework/src/widgets/ui_resources.elisa"
+
+def ui_clipboard_has_text() -> bool:
+    return false
+
+def ui_clipboard_write(bytes: u8&, length: usize) -> bool:
+    return false
+
+def ui_clipboard_read(buffer: mutable u8&, capacity: usize) -> usize:
+    return 0
+
+def ui_measure_text_width(text: sview, size: f32, weighted: bool) -> f32:
+    return text.len.f32() * size * 0.5
+
+def ui_text_line_height(size: f32) -> f32:
+    return size * 1.2

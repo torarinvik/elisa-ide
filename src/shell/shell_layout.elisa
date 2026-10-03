@@ -10,8 +10,6 @@
 # This module owns geometry and painting policy. Document truth lives in the
 # core unit and reaches the shell through `DesignerSession`.
 
-include "../../framework/src/platform/sdl3/ui_sdl3_flat.elisa"
-
 module ShellLayout:
     public:
         # Pane rectangles in logical shell coordinates, resolved from the live
@@ -34,7 +32,9 @@ module ShellLayout:
         const MENU_HEIGHT: f32 = 26.0
         const TOOLBAR_HEIGHT: f32 = 34.0
         const STATUS_HEIGHT: f32 = 22.0
-        const COMPACT_BREAKPOINT: f32 = 820.0
+        # Keep the full toolbar at its minimum preferred width after adding
+        # the distinct New Project action; narrower windows use compact rows.
+        const COMPACT_BREAKPOINT: f32 = 960.0
 
         # Split ratios are fractions of the body area. They are clamped so the
         # center always keeps MIN_CENTER and no side pane drops below its

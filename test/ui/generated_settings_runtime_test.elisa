@@ -1,0 +1,149 @@
+# Exercise an emitted settings view through Elisa-ui's normal pointer and
+# application callback path. The handwritten Save handler must update a
+# visible status label exactly once for one physical click.
+
+include "../../framework/src/platform/sdl3/ui_sdl3_flat.elisa"
+include "../../framework/src/test/ui_harness.elisa"
+include "../../build/generated_settings_view.elisa"
+include "../codegen/fixtures/settings_handlers.elisa"
+
+extern designer_report_text(text: cstr) -> void
+
+global mutable failures: i64 = 0
+global mutable generated_view_built: bool = false
+
+def app_init() -> void:
+    generated_view_built <- settings_view::build()
+
+def app_event(event: UiCore::Event) -> void:
+    UiHandles::handle(event)
+
+def app_widget_event(widget: usize, event: i32) -> void:
+    settings_view::dispatch_widget_event(widget, event)
+
+def app_text_input(text: sview) -> void:
+    UiHandles::insert_text(text)
+
+def app_text_editing(text: sview, selected_start: i32, selected_length: i32) -> void:
+    UiHandles::update_marked_text_utf8_characters(text, selected_start, selected_length)
+
+def app_frame() -> void can[Ui.Draw]:
+    UiCore::clear(UiCore::rgb(20, 22, 28))
+    UiHandles::layout(UiCore::viewport_width(), UiCore::viewport_height())
+    UiHandles::paint()
+
+def check(name: cstr, condition: bool) -> void:
+    if not condition:
+        failures <- failures + 1
+        designer_report_text(name)
+
+def same(left: sview, right: sview) -> bool:
+    return false if left.len != right.len
+    for index in 0..<left.len |left, right|:
+        return false if left[index] != right[index]
+    return true
+
+def find_button(caption: sview) -> UiHandles::Handle:
+    for index in 0..<UiHandles::count():
+        candidate: UiHandles::Handle = UiHandles::from_index(index)
+        if UiHandles::widget(candidate) is widget:
+            if widget.kind == UiConst::WidgetKind.Button and same(widget.text, caption):
+                return candidate
+    return UiHandles::invalid()
+
+def click(handle: UiHandles::Handle) -> bool:
+    return false if not UiHandles::is_valid(handle)
+    if UiHandles::widget(handle) is widget:
+        x: f32 = widget.x + widget.width * 0.5
+        y: f32 = widget.y + widget.height * 0.5
+        UiHarness::dispatch(UiCore::PointerEvent.Down(at: UiCore::Vec2(x, y), button: UiCore::PointerButton.Primary.i32()))
+        UiHarness::dispatch(UiCore::PointerEvent.Up(at: UiCore::Vec2(x, y), button: UiCore::PointerButton.Primary.i32()))
+        return true
+    return false
+
+def drag_slider_to(handle: UiHandles::Handle, fraction: f32) -> bool:
+    return false if not UiHandles::is_valid(handle)
+    if UiHandles::widget(handle) is widget:
+        return false if widget.kind != UiConst::WidgetKind.Slider or widget.width <= 0.0
+        start_x: f32 = widget.x + widget.width * 0.2
+        target_x: f32 = widget.x + widget.width * fraction
+        y: f32 = widget.y + widget.height * 0.5
+        UiHarness::dispatch(UiCore::PointerEvent.Down(at: UiCore::Vec2(start_x, y), button: UiCore::PointerButton.Primary.i32()))
+        UiHarness::dispatch(UiCore::PointerEvent.Move(UiCore::Vec2(target_x, y)))
+        UiHarness::dispatch(UiCore::PointerEvent.Up(at: UiCore::Vec2(target_x, y), button: UiCore::PointerButton.Primary.i32()))
+        return true
+    return false
+
+def approximately(left: f32, right: f32, tolerance: f32) -> bool:
+    return left >= right - tolerance and left <= right + tolerance
+
+def widget_text_matches(handle: UiHandles::Handle, expected: sview) -> bool:
+    return false if not UiHandles::is_valid(handle)
+    if UiHandles::widget(handle) is widget:
+        return same(widget.text, expected)
+    return false
+
+def main() -> i64:
+    UiHarness::start(640.0, 480.0)
+    UiHarness::focus_gained()
+    check("generated settings view builds", generated_view_built)
+    UiHarness::frame()
+
+    status: UiHandles::Handle = settings_view::widget_status_label()
+    check("generated symbol accessor returns the initial status label", widget_text_matches(status, "Changes are not saved"))
+    name: UiHandles::Handle = settings_view::widget_name_input()
+    check("sample name is editable and starts with Ada", same(UiHandles::text_value(name), "Ada"))
+    if UiHandles::widget(name) is name_widget:
+        check("name field exposes user guidance", same(name_widget.help, "Enter your display name"))
+    check("name field accepts focus for text entry", UiHandles::request_focus(name))
+    UiHandles::set_selection_utf16(name, 0, 3)
+    app_text_input("Grace")
+    UiHarness::frame()
+    check("editing the name routes its change handler", same(UiHandles::text_value(name), "Grace") and SettingsHandlers::name_change_count_value() == 1)
+    dark_mode: UiHandles::Handle = settings_view::widget_dark_mode()
+    blue: UiHandles::Handle = settings_view::widget_accent_blue()
+    green: UiHandles::Handle = settings_view::widget_accent_green()
+    check("appearance checkbox starts off", not UiHandles::selected(dark_mode))
+    check("accent radios start as one exclusive selection", UiHandles::selected(blue) and not UiHandles::selected(green))
+    slider: UiHandles::Handle = settings_view::widget_volume_slider()
+    progress: UiHandles::Handle = settings_view::widget_volume_progress()
+    display: UiHandles::Handle = settings_view::widget_volume_display()
+    check("volume slider and progress start at the same value", approximately(UiHandles::value(slider), 0.5, 0.001) and approximately(UiHandles::value(progress), 0.5, 0.001))
+    check("volume display describes the starting value", widget_text_matches(display, "Volume: Medium"))
+
+    check("dark mode checkbox receives a physical click", click(dark_mode))
+    UiHarness::frame()
+    check("dark mode checkbox toggles on", UiHandles::selected(dark_mode))
+    check("green accent receives a physical click", click(green))
+    UiHarness::frame()
+    check("radio choice is exclusive after green selection", not UiHandles::selected(blue) and UiHandles::selected(green))
+    check("slider accepts a physical drag", drag_slider_to(slider, 0.82))
+    UiHarness::frame()
+    check("slider dispatch updates its linked progress bar", UiHandles::value(slider) > 0.72 and approximately(UiHandles::value(progress), UiHandles::value(slider), 0.001))
+    check("slider dispatch updates the value label", widget_text_matches(display, "Volume: High") and SettingsHandlers::volume_change_count_value() > 0)
+
+    reset: UiHandles::Handle = find_button("Reset")
+    check("Reset control is present", UiHandles::is_valid(reset))
+    check("Reset receives a physical click", click(reset))
+    UiHarness::frame()
+    check("Reset restores sample field and checkbox", same(UiHandles::text_value(name), "Ada") and not UiHandles::selected(dark_mode))
+    check("Reset restores the original exclusive radio choice", UiHandles::selected(blue) and not UiHandles::selected(green))
+    check("Reset restores slider, progress, and label together", approximately(UiHandles::value(slider), 0.5, 0.001) and approximately(UiHandles::value(progress), 0.5, 0.001) and widget_text_matches(display, "Volume: Medium"))
+    check("Reset restores the unsaved status", widget_text_matches(status, "Changes are not saved"))
+
+    save: UiHandles::Handle = find_button("Save")
+    check("generated Save control is present in the live widget tree", UiHandles::is_valid(save))
+    check("one physical click reaches the generated handler", click(save))
+    UiHarness::frame()
+    check("handwritten Save handler runs exactly once for one click", SettingsHandlers::save_click_count_value() == 1)
+    check("handwritten handler changes the visible status label", widget_text_matches(status, "Saved"))
+
+    if UiHandles::widget(save) is save_widget:
+        UiHarness::dispatch(UiCore::PointerEvent.Up(at: UiCore::Vec2(save_widget.x + save_widget.width * 0.5, save_widget.y + save_widget.height * 0.5), button: UiCore::PointerButton.Primary.i32()))
+    check("unpaired pointer release does not dispatch a second click", SettingsHandlers::save_click_count_value() == 1)
+
+    UiHarness::stop()
+    if failures == 0:
+        designer_report_text("generated settings runtime assertions passed")
+        return 0
+    return failures

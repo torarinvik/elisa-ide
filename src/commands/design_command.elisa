@@ -92,6 +92,18 @@ module DesignCommand:
             prepare_set_property_into(&prepared, form, ids, key, value, sink)
             return prepared
 
+        def prepare_set_event_handler_into(prepared: mutable Prepared&, form: DesignForms::Form&, registry: DesignRegistry::Registry&, ids: darray[DesignIds::DesignId], event_key: sview, handler: sview, sink: mutable DesignDiagnostics::Sink&) -> void:
+            reset_prepared(prepared, form)
+            ok: bool = DesignOps::set_event_handler(&prepared.after, registry, ids, event_key, handler, sink)
+            if ok:
+                prepared.valid <- true
+                set_description(prepared, "Connect event handler" if handler.len > 0 else "Disconnect event handler")
+
+        def prepare_set_event_handler(form: DesignForms::Form&, registry: DesignRegistry::Registry&, ids: darray[DesignIds::DesignId], event_key: sview, handler: sview, sink: mutable DesignDiagnostics::Sink&) -> Prepared:
+            prepared: mutable Prepared = empty_prepared()
+            prepare_set_event_handler_into(&prepared, form, registry, ids, event_key, handler, sink)
+            return prepared
+
         def prepare_reorder_into(prepared: mutable Prepared&, form: DesignForms::Form&, parent: DesignIds::DesignId, from_index: i64, to_index: i64, sink: mutable DesignDiagnostics::Sink&) -> void:
             reset_prepared(prepared, form)
             ok: bool = DesignOps::reorder_child(&prepared.after, parent, from_index, to_index, sink)
@@ -120,13 +132,53 @@ module DesignCommand:
             reset_prepared(prepared, form)
             created: darray[DesignIds::DesignId] = DesignOps::duplicate(&prepared.after, ids, allocator, sink)
             if created.count > 0:
+                created_snapshot: mutable darray[DesignIds::DesignId] = []
+                DesignClone::clone_ids_into(&created_snapshot, created)
                 prepared.valid <- true
                 set_description(prepared, "Duplicate selection")
-                DesignClone::clone_ids_into(&prepared.created, created)
+                DesignClone::clone_ids_into(&prepared.created, created_snapshot)
 
         def prepare_duplicate(form: DesignForms::Form&, ids: darray[DesignIds::DesignId], allocator: mutable DesignIds::Allocator&, sink: mutable DesignDiagnostics::Sink&) -> Prepared:
             prepared: mutable Prepared = empty_prepared()
             prepare_duplicate_into(&prepared, form, ids, allocator, sink)
+            return prepared
+
+        def prepare_paste(form: DesignForms::Form&, registry: DesignRegistry::Registry&, source: DesignForms::Form&, roots: darray[DesignIds::DesignId], parent: DesignIds::DesignId, index: i64, allocator: mutable DesignIds::Allocator&, sink: mutable DesignDiagnostics::Sink&) -> Prepared:
+            prepared: mutable Prepared = empty_prepared()
+            reset_prepared(&prepared, form)
+            created: darray[DesignIds::DesignId] = DesignOps::paste(&prepared.after, registry, source, roots, parent, index, allocator, sink)
+            if created.count > 0:
+                created_snapshot: mutable darray[DesignIds::DesignId] = []
+                DesignClone::clone_ids_into(&created_snapshot, created)
+                prepared.valid <- true
+                set_description(&prepared, "Paste")
+                DesignClone::clone_ids_into(&prepared.created, created_snapshot)
+            return prepared
+
+        def prepare_wrap(form: DesignForms::Form&, registry: DesignRegistry::Registry&, ids: darray[DesignIds::DesignId], type_key: sview, allocator: mutable DesignIds::Allocator&, sink: mutable DesignDiagnostics::Sink&) -> Prepared:
+            prepared: mutable Prepared = empty_prepared()
+            reset_prepared(&prepared, form)
+            wrapped: mutable DesignIds::DesignId = DesignIds::empty()
+            if DesignOps::wrap_selection(&prepared.after, registry, ids, type_key, allocator, &wrapped, sink):
+                prepared.valid <- true
+                set_description(&prepared, "Wrap selection")
+                prepared.created.push(wrapped)
+            return prepared
+
+        def prepare_unwrap(form: DesignForms::Form&, ids: darray[DesignIds::DesignId], sink: mutable DesignDiagnostics::Sink&) -> Prepared:
+            prepared: mutable Prepared = empty_prepared()
+            reset_prepared(&prepared, form)
+            if DesignOps::unwrap_selection(&prepared.after, ids, sink):
+                prepared.valid <- true
+                set_description(&prepared, "Unwrap selection")
+            return prepared
+
+        def prepare_convert_container(form: DesignForms::Form&, registry: DesignRegistry::Registry&, ids: darray[DesignIds::DesignId], type_key: sview, sink: mutable DesignDiagnostics::Sink&) -> Prepared:
+            prepared: mutable Prepared = empty_prepared()
+            reset_prepared(&prepared, form)
+            if DesignOps::convert_container(&prepared.after, registry, ids, type_key, sink):
+                prepared.valid <- true
+                set_description(&prepared, "Convert container orientation")
             return prepared
 
         def prepare_rename_symbol_into(prepared: mutable Prepared&, form: DesignForms::Form&, id: DesignIds::DesignId, symbol: sview, sink: mutable DesignDiagnostics::Sink&) -> void:
@@ -139,6 +191,18 @@ module DesignCommand:
         def prepare_rename_symbol(form: DesignForms::Form&, id: DesignIds::DesignId, symbol: sview, sink: mutable DesignDiagnostics::Sink&) -> Prepared:
             prepared: mutable Prepared = empty_prepared()
             prepare_rename_symbol_into(&prepared, form, id, symbol, sink)
+            return prepared
+
+        def prepare_rename_display_name_into(prepared: mutable Prepared&, form: DesignForms::Form&, id: DesignIds::DesignId, name: sview, sink: mutable DesignDiagnostics::Sink&) -> void:
+            reset_prepared(prepared, form)
+            ok: bool = DesignOps::rename_display_name(&prepared.after, id, name, sink)
+            if ok:
+                prepared.valid <- true
+                set_description(prepared, "Rename display name")
+
+        def prepare_rename_display_name(form: DesignForms::Form&, id: DesignIds::DesignId, name: sview, sink: mutable DesignDiagnostics::Sink&) -> Prepared:
+            prepared: mutable Prepared = empty_prepared()
+            prepare_rename_display_name_into(&prepared, form, id, name, sink)
             return prepared
 
         # Commit a prepared command. False when it is invalid or the document

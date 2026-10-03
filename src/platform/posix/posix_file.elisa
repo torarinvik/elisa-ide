@@ -48,6 +48,10 @@ extern designer_file_link_no_replace(old_path: cstr, new_path: cstr) -> i64 can[
 extern designer_file_status_is_exists(status: i64) -> i64
 @link_name("designer_file_mkdir")
 extern designer_file_mkdir(path: cstr) -> i64 can[Blocking.IO]
+@link_name("designer_file_mkdir_exclusive")
+extern designer_file_mkdir_exclusive(path: cstr) -> i64 can[Blocking.IO]
+@link_name("designer_file_rmdir_empty")
+extern designer_file_rmdir_empty(path: cstr) -> i64 can[Blocking.IO]
 @link_name("designer_file_unlink")
 extern designer_file_unlink(path: cstr) -> i64 can[Blocking.IO]
 
@@ -100,7 +104,7 @@ module PosixFile:
             buffer.push(0)
             return buffer
 
-        def as_cstr(buffer: mutable darray[u8]&) -> cstr:
+        def as_cstr(buffer: mutable darray[u8]&) -> cstr can[Unsafe.PointerCast]:
             return (&buffer[0]).cast[cstr] can Unsafe.PointerCast
 
     public:
@@ -274,6 +278,19 @@ module PosixFile:
         def ensure_directory(path: cstr) -> bool:
             can Blocking.IO:
                 return designer_file_mkdir(path) >= 0
+
+        # Create `path` only if no filesystem entry already exists there. This
+        # reports true only when this call created the directory, which lets a
+        # multi-file save safely track ownership for rollback.
+        def create_directory_new(path: cstr) -> bool:
+            can Blocking.IO:
+                return designer_file_mkdir_exclusive(path) == 0
+
+        # Remove only an empty directory. This is deliberately separate from
+        # `remove` (unlink) and never descends into paths created by others.
+        def remove_directory_if_empty(path: cstr) -> bool:
+            can Blocking.IO:
+                return designer_file_rmdir_empty(path) == 0
 
         # Remove `path`; true when the file was removed. Used by fixtures and
         # recovery cleanup, not by the save path (which only removes its own

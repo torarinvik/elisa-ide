@@ -1,0 +1,116 @@
+# Revision-aware build job state shared by the IDE shell and tool adapters.
+#
+# Process launch and stdout/stderr transport belong to the POSIX adapter. This
+# module owns the policy around those observations: a job may publish only for
+# its current input revision, output is bounded, cancellation is terminal, and
+# a later job cannot be overwritten by a stale completion.
+
+include "../model/design_text.elisa"
+
+module BuildJob:
+    public:
+        const MAX_OUTPUT_BYTES: usize = 262144
+
+        const enum State of i32:
+            Idle = 0
+            Running = 1
+            Succeeded = 2
+            Failed = 3
+            Cancelled = 4
+
+        struct Job:
+            state: mutable State
+            input_revision: mutable u64
+            exit_code: mutable i64
+            output: mutable darray[u8]
+            output_cstr_storage: mutable u8[262145]
+            output_cstr_length: mutable usize
+            output_truncated: mutable bool
+            cancel_requested: mutable bool
+
+        def empty() -> Job:
+            return Job{
+                state: State.Idle,
+                input_revision: 0,
+                exit_code: 0,
+                output: [],
+                output_cstr_storage: zeroed,
+                output_cstr_length: 0,
+                output_truncated: false,
+                cancel_requested: false,
+            }
+
+        # Start a job for a monotonically identified document/project revision.
+        # A running job cannot be replaced until its owner has observed a
+        # terminal completion or explicitly cancelled it.
+        def begin(job: mutable Job&, revision: u64) -> bool:
+            return false if job.state == State.Running
+            return false if revision == 0
+            job.state <- State.Running
+            job.input_revision <- revision
+            job.exit_code <- 0
+            job.output.clear()
+            job.output_cstr_length <- 0
+            job.output_cstr_storage[0] <- 0
+            job.output_truncated <- false
+            job.cancel_requested <- false
+            return true
+
+        def is_running(job: Job&) -> bool:
+            return job.state == State.Running
+
+        # Append captured output without allowing an unbounded compiler log to
+        # consume the editor. The truncation bit remains visible to the UI.
+        def append_output(job: mutable Job&, bytes: sview) -> void:
+            return if bytes.len <= 0
+            remaining: i64 = MAX_OUTPUT_BYTES.i64() - job.output.count.i64()
+            if remaining <= 0:
+                job.output_truncated <- true
+                return
+            copy_count: i64 = bytes.len if bytes.len < remaining else remaining
+            index: mutable i64 = 0
+            while index < copy_count:
+                job.output.push(bytes[index])
+                job.output_cstr_storage[job.output_cstr_length] <- bytes[index]
+                job.output_cstr_length <- job.output_cstr_length + 1
+                index <- index + 1
+            job.output_cstr_storage[job.output_cstr_length] <- 0
+            job.output_truncated <- true if copy_count < bytes.len
+
+        # Request cancellation. The process adapter performs the signal and
+        # reap; this policy transition prevents a late success from appearing
+        # after the user has cancelled the build.
+        def request_cancel(job: mutable Job&) -> bool:
+            return false if job.state != State.Running
+            job.cancel_requested <- true
+            return true
+
+        # Complete only the revision that owns this job. A caller that has
+        # started a newer job must discard an old process completion first.
+        def finish(job: mutable Job&, revision: u64, exit_code: i64) -> bool:
+            return false if job.state != State.Running or revision != job.input_revision
+            job.exit_code <- exit_code
+            if job.cancel_requested:
+                job.state <- State.Cancelled
+            elif exit_code == 0:
+                job.state <- State.Succeeded
+            else:
+                job.state <- State.Failed
+            return true
+
+        def accepts_result(job: Job&, revision: u64) -> bool:
+            return revision != 0 and revision == job.input_revision and job.state != State.Idle
+
+        def output_view(job: Job&) -> sview:
+            return "" if job.output_cstr_length == 0
+            return "" if job.output_cstr_length > MAX_OUTPUT_BYTES
+            can Unsafe.PointerCast:
+                return unsafe_sview_bounded_bytes(&job.output_cstr_storage[0], job.output_cstr_length)
+
+        def state_label(state: State) -> sview:
+            return "idle" if state == State.Idle
+            return "running" if state == State.Running
+            return "succeeded" if state == State.Succeeded
+            return "failed" if state == State.Failed
+            return "cancelled" if state == State.Cancelled
+            return "idle"

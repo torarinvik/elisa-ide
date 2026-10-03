@@ -88,8 +88,19 @@ module DesignLower:
                 return true if DesignText::equal(key, "text") or DesignText::equal(key, "size") or DesignText::equal(key, "minimumWidth") or DesignText::equal(key, "minimumHeight") or DesignText::equal(key, "color")
                 return true if DesignText::equal(key, "textColor") or DesignText::equal(key, "hoverColor") or DesignText::equal(key, "pressColor") or DesignText::equal(key, "grow") or DesignText::equal(key, "margin") or DesignText::equal(key, "enabled") or DesignText::equal(key, "visible")
             if DesignText::equal(type_key, "elisa.ui.text_field"):
-                return true if DesignText::equal(key, "label") or DesignText::equal(key, "placeholder") or DesignText::equal(key, "initial") or DesignText::equal(key, "size") or DesignText::equal(key, "minimumWidth") or DesignText::equal(key, "minimumHeight")
+                return true if DesignText::equal(key, "label") or DesignText::equal(key, "placeholder") or DesignText::equal(key, "help") or DesignText::equal(key, "initial") or DesignText::equal(key, "size") or DesignText::equal(key, "minimumWidth") or DesignText::equal(key, "minimumHeight")
                 return true if DesignText::equal(key, "ink") or DesignText::equal(key, "fill") or DesignText::equal(key, "secure") or DesignText::equal(key, "grow") or DesignText::equal(key, "margin") or DesignText::equal(key, "visible")
+            if DesignText::equal(type_key, "elisa.ui.check_box") or DesignText::equal(type_key, "elisa.ui.radio_button"):
+                return true if DesignText::equal(key, "text") or DesignText::equal(key, "size") or DesignText::equal(key, "minimumWidth") or DesignText::equal(key, "minimumHeight") or DesignText::equal(key, "color")
+                return true if DesignText::equal(key, "textColor") or DesignText::equal(key, "hoverColor") or DesignText::equal(key, "pressColor") or DesignText::equal(key, "selected") or DesignText::equal(key, "enabled") or DesignText::equal(key, "grow") or DesignText::equal(key, "margin") or DesignText::equal(key, "visible")
+            if DesignText::equal(type_key, "elisa.ui.slider"):
+                return true if DesignText::equal(key, "label") or DesignText::equal(key, "size") or DesignText::equal(key, "minimumWidth") or DesignText::equal(key, "minimumHeight") or DesignText::equal(key, "value")
+                return true if DesignText::equal(key, "trackColor") or DesignText::equal(key, "fillColor") or DesignText::equal(key, "thumbColor") or DesignText::equal(key, "textColor") or DesignText::equal(key, "grow") or DesignText::equal(key, "margin") or DesignText::equal(key, "visible")
+            if DesignText::equal(type_key, "elisa.ui.progress_bar"):
+                return true if DesignText::equal(key, "label") or DesignText::equal(key, "size") or DesignText::equal(key, "minimumWidth") or DesignText::equal(key, "minimumHeight") or DesignText::equal(key, "value")
+                return true if DesignText::equal(key, "trackColor") or DesignText::equal(key, "fillColor") or DesignText::equal(key, "textColor") or DesignText::equal(key, "grow") or DesignText::equal(key, "margin") or DesignText::equal(key, "visible")
+            if DesignText::equal(type_key, "elisa.ui.scroll"):
+                return true if DesignText::equal(key, "axis") or DesignText::equal(key, "background") or DesignText::equal(key, "minimumWidth") or DesignText::equal(key, "minimumHeight") or DesignText::equal(key, "grow") or DesignText::equal(key, "margin") or DesignText::equal(key, "visible")
             return false
     
         def report_target_error(sink: mutable DesignDiagnostics::Sink&, node_index: i64, suffix: sview, message: sview) -> void:

@@ -11,8 +11,6 @@
 # projection; the shell copies what it needs into retained widget text before
 # returning to the frame loop.
 
-include "../../framework/src/platform/sdl3/ui_sdl3_flat.elisa"
-
 @link_name("designer_session_init")
 extern session_init() -> void
 @link_name("designer_session_open_project")
@@ -38,6 +36,8 @@ extern session_hierarchy_selected(row: i64) -> bool
 extern session_hierarchy_is_root(row: i64) -> bool
 @link_name("designer_session_select_hierarchy_row")
 extern session_select_hierarchy_row(row: i64) -> bool
+@link_name("designer_session_select_node_by_id")
+extern session_select_node_by_id(id: sview) -> bool
 
 @link_name("designer_session_palette_count")
 extern session_palette_count() -> i64
@@ -54,6 +54,10 @@ extern session_delete_selection() -> bool
 extern session_duplicate_selection() -> bool
 @link_name("designer_session_reorder_selection")
 extern session_reorder_selection(forward: bool) -> bool
+@link_name("designer_session_indent_selection")
+extern session_indent_selection() -> bool
+@link_name("designer_session_outdent_selection")
+extern session_outdent_selection() -> bool
 @link_name("designer_session_undo")
 extern session_undo() -> bool
 @link_name("designer_session_redo")
@@ -68,6 +72,32 @@ extern session_undo_label() -> sview
 extern session_is_dirty() -> bool
 @link_name("designer_session_save")
 extern session_save() -> bool
+@link_name("designer_session_generated_view_source")
+extern session_generated_view_source() -> sview
+@link_name("designer_session_generated_view_source_map")
+extern session_generated_view_source_map() -> sview
+@link_name("designer_session_select_generated_source_byte")
+extern session_select_generated_source_byte(byte_offset: i64) -> bool
+@link_name("designer_session_open_source")
+extern session_open_source(path: sview) -> bool
+@link_name("designer_session_source_view_is_open")
+extern session_source_view_is_open() -> bool
+@link_name("designer_session_source_view_path")
+extern session_source_view_path() -> sview
+@link_name("designer_session_source_view_line_count")
+extern session_source_view_line_count() -> i64
+@link_name("designer_session_source_view_dirty")
+extern session_source_view_dirty() -> bool
+@link_name("designer_session_source_view_line_truncated")
+extern session_source_view_line_truncated() -> bool
+@link_name("designer_session_source_view_line")
+extern session_source_view_line(line: i64) -> sview
+@link_name("designer_session_source_view_edit_line")
+extern session_source_view_edit_line(line: i64, replacement: sview) -> bool
+@link_name("designer_session_source_view_save")
+extern session_source_view_save() -> bool
+@link_name("designer_session_open_or_create_handlers")
+extern session_open_or_create_handlers() -> bool
 
 @link_name("designer_session_inspector_count")
 extern session_inspector_count() -> i64
@@ -83,6 +113,23 @@ extern session_set_inspector_text(row: i64, text: sview) -> bool
 extern session_toggle_inspector(row: i64) -> bool
 @link_name("designer_session_cycle_inspector")
 extern session_cycle_inspector(row: i64) -> bool
+@link_name("designer_session_reset_inspector")
+extern session_reset_inspector(row: i64) -> bool
+
+@link_name("designer_session_event_count")
+extern session_event_count() -> i64
+@link_name("designer_session_event_key")
+extern session_event_key(row: i64) -> sview
+@link_name("designer_session_event_label")
+extern session_event_label(row: i64) -> sview
+@link_name("designer_session_event_value")
+extern session_event_value(row: i64) -> sview
+@link_name("designer_session_event_signature")
+extern session_event_signature(row: i64) -> sview
+@link_name("designer_session_set_event_handler")
+extern session_set_event_handler(row: i64, text: sview) -> bool
+@link_name("designer_session_clear_event_handler")
+extern session_clear_event_handler(row: i64) -> bool
 
 @link_name("designer_session_problems_count_value")
 extern session_problems_count_value() -> i64
@@ -94,6 +141,18 @@ extern session_problem_message(index: i64) -> sview
 extern session_problem_path(index: i64) -> sview
 @link_name("designer_session_problem_is_error")
 extern session_problem_is_error(index: i64) -> bool
+@link_name("designer_session_problem_node_row")
+extern session_problem_node_row(index: i64) -> i64
+@link_name("designer_session_recovery_available")
+extern session_recovery_available() -> bool
+@link_name("designer_session_restore_recovery")
+extern session_restore_recovery() -> bool
+@link_name("designer_session_discard_recovery")
+extern session_discard_recovery() -> bool
+@link_name("designer_session_external_change")
+extern session_external_change() -> bool
+@link_name("designer_session_reload_document")
+extern session_reload_document() -> bool
 
 @link_name("designer_session_status")
 extern session_status() -> sview
@@ -101,6 +160,12 @@ extern session_status() -> sview
 extern session_title() -> sview
 @link_name("designer_session_form_title")
 extern session_form_title() -> sview
+@link_name("designer_session_form_path")
+extern session_form_path() -> sview
+@link_name("designer_session_file_count")
+extern session_file_count() -> i64
+@link_name("designer_session_file_path")
+extern session_file_path(index: i64) -> sview
 @link_name("designer_session_selection_name")
 extern session_selection_name() -> sview
 @link_name("designer_session_selection_type")

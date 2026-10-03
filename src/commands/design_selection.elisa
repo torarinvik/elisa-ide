@@ -48,7 +48,8 @@ module DesignSelection:
             read: mutable i64 = 0
             while read < selection.ids.count.i64():
                 if not DesignIds::equal(selection.ids[read.usize()], id):
-                    DesignIds::copy_into(&selection.ids[write.usize()], &selection.ids[read.usize()])
+                    retained_id: DesignIds::DesignId = selection.ids[read.usize()]
+                    DesignIds::copy_into(&selection.ids[write.usize()], &retained_id)
                     write <- write + 1
                 read <- read + 1
             selection.ids.resize(write.usize())
@@ -73,7 +74,8 @@ module DesignSelection:
             read: mutable i64 = 0
             while read < selection.ids.count.i64():
                 if DesignForms::find_node(form, selection.ids[read.usize()]) >= 0:
-                    DesignIds::copy_into(&selection.ids[write.usize()], &selection.ids[read.usize()])
+                    retained_id: DesignIds::DesignId = selection.ids[read.usize()]
+                    DesignIds::copy_into(&selection.ids[write.usize()], &retained_id)
                     write <- write + 1
                 read <- read + 1
             selection.ids.resize(write.usize())

@@ -34,7 +34,7 @@ def main() -> i64:
         failures <- failures + 1
     if HostClient::request(&process, 10, 0, 0).result != 1:
         failures <- failures + 1
-    if HostClient::request(&process, 21, 0, 0).result != 6:
+    if HostClient::request(&process, 21, 0, 0).result != 11:
         failures <- failures + 1
     if HostClient::request(&process, 30, 4, 0).result < 0:
         failures <- failures + 1

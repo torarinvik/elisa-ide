@@ -66,15 +66,15 @@ module DesignCodecTest:
             settings_sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
             settings: DesignForms::Form = DesignDecode::decode_form(TestSupport::view_of(settings_bytes), registry, &settings_sink)
             TestSupport::check("settings fixture decodes without errors", not DesignDiagnostics::has_errors(settings_sink))
-            TestSupport::check("settings fixture has eight nodes", settings.nodes.count == 8)
+            TestSupport::check("settings fixture has eighteen nodes", settings.nodes.count == 18)
             DesignValidate::validate_form(settings, registry, &settings_sink)
             TestSupport::check("settings fixture validates", not DesignDiagnostics::has_errors(settings_sink))
 
             settings_encoded: darray[u8] = DesignEncode::encode_form(settings)
             TestSupport::check("settings encoding keeps handler text", TestSupport::text_contains(TestSupport::view_of(settings_encoded), "SettingsHandlers::save_clicked"))
-            TestSupport::check("settings encoding keeps nesting", TestSupport::text_contains(TestSupport::view_of(settings_encoded), "\"children\":[\"node-heading\",\"node-profile\",\"node-actions\"]"))
+            TestSupport::check("settings encoding keeps nesting", TestSupport::text_contains(TestSupport::view_of(settings_encoded), "\"children\":[\"node-heading\",\"node-profile\",\"node-appearance\",\"node-volume-row\",\"node-volume-progress\",\"node-status\",\"node-actions\"]"))
             settings_reopened: DesignForms::Form = DesignDecode::decode_form(TestSupport::view_of(settings_encoded), registry, &settings_sink)
-            TestSupport::check("settings reopen keeps eight nodes", settings_reopened.nodes.count == 8)
+            TestSupport::check("settings reopen keeps eighteen nodes", settings_reopened.nodes.count == 18)
             TestSupport::check("settings reopen keeps parent links", DesignIds::equal(settings_reopened.nodes[3.usize()].parent, DesignIds::from_text("node-profile")))
 
             # --- project manifest --------------------------------------------

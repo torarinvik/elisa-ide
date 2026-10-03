@@ -7,7 +7,7 @@
 #
 #   * `start` launches one command with an explicit argument vector;
 #   * `poll` drains stdout/stderr without blocking and reports completion;
-#   * `read_stdout`/`read_stderr` copy the bounded capture out;
+#   * `read_stdout`/`read_stderr` copy newly captured bytes out exactly once;
 #   * `cancel` sends SIGTERM, escalates to SIGKILL, and reaps;
 #   * `dispose` never leaves a running child.
 #
@@ -96,8 +96,9 @@ module PosixProcess:
                 true return if process.handle == null
                 return designer_process_poll(process.handle, timeout_ms) == 1
 
-        # Copy captured stdout into `out`, replacing its contents. Never copies
-        # more than `capacity` bytes; the return value is the copied length.
+        # Copy newly captured stdout into `out`, replacing its contents. Bytes
+        # returned once are marked consumed, so polling cannot append the same
+        # compiler log repeatedly. Never copies more than `capacity` bytes.
         def read_stdout(process: Process&, out: mutable darray[u8]&, capacity: usize) -> usize:
             can Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast:
                 0 return if process.handle == null

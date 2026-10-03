@@ -1,0 +1,18 @@
+# Safe handoff from the bounded source line editor to a configured editor.
+# The editor receives the file path and one-based line as separate argv entries.
+
+@link_name("designer_editor_launch")
+extern designer_editor_launch(editor: cstr, path: cstr, line: i64) -> i64 can[Blocking.IO]
+@link_name("designer_reveal_file")
+extern designer_reveal_file(path: cstr) -> i64 can[Blocking.IO]
+
+module ExternalEditor:
+    public:
+        def launch(editor: cstr, path: cstr, line: i64) -> i64:
+            can Blocking.IO:
+                return -1 if line <= 0
+                return designer_editor_launch(editor, path, line)
+
+        def reveal_file(path: cstr) -> i64:
+            can Blocking.IO:
+                return designer_reveal_file(path)

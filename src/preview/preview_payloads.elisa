@@ -308,7 +308,7 @@ module PreviewPayloads:
             issue <- fixed_length_issue(bytes, expected_length)
             empty.code <- issue
             return empty if issue != Issue.None
-            frame: Frame = Frame{frame_id: frame_id, width: width, height: height, bytes_per_pixel: bytes_per_pixel, row_stride: row_stride, pixels: string_view_slice(bytes_view(bytes), FRAME_FIXED_BYTES, expected_length)}
+            frame: Frame = Frame{frame_id: frame_id, width: width, height: height, bytes_per_pixel: bytes_per_pixel, row_stride: row_stride, pixels: string_view_slice(bytes, FRAME_FIXED_BYTES, expected_length)}
             return FrameDecodeResult{code: Issue.None, value: frame}
 
         def encode_geometry(value: Geometry) -> GeometryEncodeResult:
@@ -365,7 +365,7 @@ module PreviewPayloads:
                 if offset + id_length > bytes.len:
                     empty.code <- Issue.Truncated
                     return empty
-                id: sview = string_view_slice(bytes_view(bytes), offset, offset + id_length)
+                id: sview = string_view_slice(bytes, offset, offset + id_length)
                 if not valid_id(id):
                     empty.code <- Issue.InvalidId
                     return empty

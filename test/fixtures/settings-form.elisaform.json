@@ -20,7 +20,15 @@
         "spacing": 8,
         "background": "#181b22ff"
       },
-      "children": ["node-heading", "node-profile", "node-actions"],
+      "children": [
+        "node-heading",
+        "node-profile",
+        "node-appearance",
+        "node-volume-row",
+        "node-volume-progress",
+        "node-status",
+        "node-actions"
+      ],
       "events": {}
     },
     {
@@ -45,7 +53,10 @@
         "padding": 4,
         "spacing": 8
       },
-      "children": ["node-name-label", "node-name-input"],
+      "children": [
+        "node-name-label",
+        "node-name-input"
+      ],
       "events": {}
     },
     {
@@ -68,6 +79,7 @@
       "properties": {
         "label": "Name",
         "placeholder": "Your name",
+        "help": "Enter your display name",
         "initial": "Ada",
         "minimumWidth": 220,
         "grow": 1
@@ -80,6 +92,141 @@
       }
     },
     {
+      "id": "node-appearance",
+      "type": "elisa.ui.column",
+      "name": "Appearance group",
+      "symbol": "appearance_group",
+      "properties": {
+        "spacing": 4
+      },
+      "children": [
+        "node-dark-mode",
+        "node-accent-choices"
+      ],
+      "events": {}
+    },
+    {
+      "id": "node-dark-mode",
+      "type": "elisa.ui.check_box",
+      "name": "Dark mode",
+      "symbol": "dark_mode",
+      "properties": {
+        "text": "Use dark appearance",
+        "selected": false
+      },
+      "children": [],
+      "events": {}
+    },
+    {
+      "id": "node-accent-choices",
+      "type": "elisa.ui.row",
+      "name": "Accent choices",
+      "symbol": "accent_choices",
+      "properties": {
+        "spacing": 8
+      },
+      "children": [
+        "node-accent-blue",
+        "node-accent-green"
+      ],
+      "events": {}
+    },
+    {
+      "id": "node-accent-blue",
+      "type": "elisa.ui.radio_button",
+      "name": "Blue accent",
+      "symbol": "accent_blue",
+      "properties": {
+        "text": "Blue accent",
+        "selected": true
+      },
+      "children": [],
+      "events": {}
+    },
+    {
+      "id": "node-accent-green",
+      "type": "elisa.ui.radio_button",
+      "name": "Green accent",
+      "symbol": "accent_green",
+      "properties": {
+        "text": "Green accent",
+        "selected": false
+      },
+      "children": [],
+      "events": {}
+    },
+    {
+      "id": "node-volume-row",
+      "type": "elisa.ui.row",
+      "name": "Volume row",
+      "symbol": "volume_row",
+      "properties": {
+        "spacing": 8,
+        "crossAlignment": "center"
+      },
+      "children": [
+        "node-volume-slider",
+        "node-volume-display"
+      ],
+      "events": {}
+    },
+    {
+      "id": "node-volume-slider",
+      "type": "elisa.ui.slider",
+      "name": "Volume",
+      "symbol": "volume_slider",
+      "properties": {
+        "label": "Volume",
+        "value": 0.5,
+        "minimumWidth": 280,
+        "grow": 1
+      },
+      "children": [],
+      "events": {
+        "change": {
+          "handler": "SettingsHandlers::volume_changed"
+        }
+      }
+    },
+    {
+      "id": "node-volume-display",
+      "type": "elisa.ui.label",
+      "name": "Volume display",
+      "symbol": "volume_display",
+      "properties": {
+        "text": "Volume: Medium",
+        "size": 13
+      },
+      "children": [],
+      "events": {}
+    },
+    {
+      "id": "node-volume-progress",
+      "type": "elisa.ui.progress_bar",
+      "name": "Volume progress",
+      "symbol": "volume_progress",
+      "properties": {
+        "label": "Level",
+        "value": 0.5,
+        "minimumHeight": 18
+      },
+      "children": [],
+      "events": {}
+    },
+    {
+      "id": "node-status",
+      "type": "elisa.ui.label",
+      "name": "Save status",
+      "symbol": "status_label",
+      "properties": {
+        "text": "Changes are not saved",
+        "size": 13,
+        "color": "#aeb8ccff"
+      },
+      "children": [],
+      "events": {}
+    },
+    {
       "id": "node-actions",
       "type": "elisa.ui.row",
       "name": "Actions",
@@ -88,7 +235,10 @@
         "spacing": 8,
         "mainAlignment": "end"
       },
-      "children": ["node-reset", "node-save"],
+      "children": [
+        "node-reset",
+        "node-save"
+      ],
       "events": {}
     },
     {

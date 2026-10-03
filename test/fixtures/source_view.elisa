@@ -1,0 +1,34 @@
+module source_view:
+    # Source editor paging fixture, line 2.
+    # Source editor paging fixture, line 3.
+    # Source editor paging fixture, line 4.
+    # Source editor paging fixture, line 5.
+    # Source editor paging fixture, line 6.
+    # Source editor paging fixture, line 7.
+    # Source editor paging fixture, line 8.
+    # Source editor paging fixture, line 9.
+    # Source editor paging fixture, line 10.
+    # Source editor paging fixture, line 11.
+    # Source editor paging fixture, line 12.
+    # Source editor paging fixture, line 13.
+    # Source editor paging fixture, line 14.
+    # Source editor paging fixture, line 15.
+    # Source editor paging fixture, line 16.
+    # Source editor paging fixture, line 17.
+    # Source editor paging fixture, line 18.
+    # Source editor paging fixture, line 19.
+    # Source editor paging fixture, line 20.
+    # Source editor paging fixture, line 21.
+    # Source editor paging fixture, line 22.
+    # Source editor paging fixture, line 23.
+    # Source editor paging fixture, line 24.
+    # Source editor paging fixture, line 25.
+    # Source editor paging fixture, line 26.
+    # Source editor paging fixture, line 27.
+    # Source editor paging fixture, line 28.
+    # Source editor paging fixture, line 29.
+    # Source editor paging fixture, line 30.
+    # Source editor paging fixture, line 31.
+    # Source editor paging fixture, line 32.
+    def source_view_marker() -> i64:
+        return 33

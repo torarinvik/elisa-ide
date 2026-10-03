@@ -1,0 +1,66 @@
+{
+  "format": "elisa-ide-form",
+  "schemaVersion": 1,
+  "id": "form-primitives",
+  "name": "Primitive controls",
+  "moduleSymbol": "primitives_view",
+  "viewport": {"width": 720, "height": 520},
+  "root": "node-root",
+  "nodes": [
+    {
+      "id": "node-root",
+      "type": "elisa.ui.column",
+      "name": "Root",
+      "symbol": "root_column",
+      "properties": {"padding": 16, "spacing": 8},
+      "children": ["node-check", "node-radio", "node-slider", "node-progress", "node-scroll"],
+      "events": {}
+    },
+    {
+      "id": "node-check",
+      "type": "elisa.ui.check_box",
+      "name": "Accept",
+      "symbol": "accept_check",
+      "properties": {"text": "Accept terms", "selected": true},
+      "children": [],
+      "events": {}
+    },
+    {
+      "id": "node-radio",
+      "type": "elisa.ui.radio_button",
+      "name": "Choice",
+      "symbol": "choice_radio",
+      "properties": {"text": "Use the default option"},
+      "children": [],
+      "events": {}
+    },
+    {
+      "id": "node-slider",
+      "type": "elisa.ui.slider",
+      "name": "Volume",
+      "symbol": "volume_slider",
+      "properties": {"label": "Volume", "value": 0.75},
+      "children": [],
+      "events": {}
+    },
+    {
+      "id": "node-progress",
+      "type": "elisa.ui.progress_bar",
+      "name": "Progress",
+      "symbol": "progress_bar",
+      "properties": {"label": "Progress", "value": 0.4},
+      "children": [],
+      "events": {}
+    },
+    {
+      "id": "node-scroll",
+      "type": "elisa.ui.scroll",
+      "name": "Viewport",
+      "symbol": "content_viewport",
+      "properties": {"axis": "column"},
+      "children": [],
+      "events": {}
+    }
+  ],
+  "extensions": {}
+}

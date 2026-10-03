@@ -32,44 +32,44 @@ module GenerationManifest:
                 index <- index + 1
             return result
 
-        def member_key(value: JsonValue, index: i64) -> sview:
-            return catch json_key_at(value, index):
+        def member_key[@r](value: JsonValueHandle[r], index: i64) -> sview @r:
+            return catch json_handle_key_at(value, index):
                 value:
                     value
                 error e:
                     ""
 
-        def member_value(value: JsonValue, index: i64) -> JsonValue:
-            return catch json_value_at(value, index):
+        def member_value[@r](value: JsonValueHandle[r], index: i64) -> JsonValueHandle[r]:
+            return catch json_handle_value_at(value, index):
                 value:
                     value
                 error e:
-                    JsonValue.Null
+                    json_handle_null(value)
 
-        def array_value(value: JsonValue, index: i64) -> JsonValue:
-            return catch json_at(value, index):
+        def array_value[@r](value: JsonValueHandle[r], index: i64) -> JsonValueHandle[r]:
+            return catch json_handle_at(value, index):
                 value:
                     value
                 error e:
-                    JsonValue.Null
+                    json_handle_null(value)
 
-        def member_at(value: JsonValue, key: sview) -> JsonValue:
-            return catch json_get(value, key):
+        def member_at[@r](value: JsonValueHandle[r], key: sview) -> JsonValueHandle[r]:
+            return catch json_handle_get(value, key):
                 value:
                     value
                 error e:
-                    JsonValue.Null
+                    json_handle_null(value)
 
-        def string_value(value: JsonValue) -> sview:
-            return catch json_as_string(value):
+        def string_value[@r](value: JsonValueHandle[r]) -> sview @r:
+            return catch json_handle_as_string(value):
                 value:
                     value
                 error e:
                     ""
 
-        def duplicate_members(value: JsonValue) -> bool:
-            return false if json_kind(value) != JsonKind.OBJECT
-            count: i64 = json_object_len(value)
+        def duplicate_members[@r](value: JsonValueHandle[r]) -> bool:
+            return false if json_handle_kind(value) != JsonKind.OBJECT
+            count: i64 = json_handle_object_len(value)
             index: mutable i64 = 0
             while index < count:
                 key: sview = member_key(value, index)
@@ -110,12 +110,32 @@ module GenerationManifest:
                 text.push((48 + nibble.u8()) if nibble < 10 else (87 + nibble.u8()))
             return text
 
-        def json_text_member(arena: mutable Arena&, members: mutable darray[JsonMember]&, key: sview, value: sview) -> void:
-            members.push(json_member(arena, key, json_string(arena, value)))
+        def append_handle_json[@j, @r](arena: mutable Arena& @r, output: mutable darray[u8]&, value: JsonValueHandle[j]) -> void:
+            in arena:
+                encoded: darray[u8] = json_handle_write(arena, value)
+                DesignText::push_view(output, DesignText::view_of(encoded))
 
-        def json_hash_member(arena: mutable Arena&, members: mutable darray[JsonMember]&, key: sview, value: u64) -> void:
+        def append_json_string[@r](arena: mutable Arena& @r, output: mutable darray[u8]&, value: sview) -> void:
+            in arena:
+                handle: JsonValueHandle[r] = json_handle_string(arena, value)
+                append_handle_json(arena, output, handle)
+
+        def append_json_number[@r](arena: mutable Arena& @r, output: mutable darray[u8]&, value: f64) -> void:
+            in arena:
+                handle: JsonValueHandle[r] = json_handle_number(arena, value)
+                append_handle_json(arena, output, handle)
+
+        def object_key[@r](arena: mutable Arena& @r, output: mutable darray[u8]&, first: mutable bool&, key: sview) -> void:
+            in arena:
+                if not first:
+                    output.push(44)
+                first <- false
+                append_json_string(arena, output, key)
+                output.push(58)
+
+        def append_hash[@r](arena: mutable Arena& @r, output: mutable darray[u8]&, value: u64) -> void:
             text: darray[u8] = hash_text(value)
-            json_text_member(arena, members, key, DesignText::view_of(text))
+            append_json_string(arena, output, DesignText::view_of(text))
 
         def report_manifest_error(sink: mutable DesignDiagnostics::Sink&, message: sview) -> void:
             _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.InvalidReference, "generation.manifest", message)
@@ -244,8 +264,8 @@ module GenerationManifest:
                 strings: DesignValues::empty_pool(),
                 files: [],
             }
-            manifest.target_id <- DesignValues::append(manifest.strings.bytes, target_id)
-            manifest.framework_id <- DesignValues::append(manifest.strings.bytes, framework_id)
+            manifest.target_id <- DesignValues::append(&manifest.strings.bytes, target_id)
+            manifest.framework_id <- DesignValues::append(&manifest.strings.bytes, framework_id)
             return manifest
 
         # Records ownership metadata for content already generated in memory.
@@ -255,7 +275,7 @@ module GenerationManifest:
             return false if manifest.files.count >= MAX_GENERATED_FILES
             reserve_entries(&manifest.files, manifest.files.count + 1)
             manifest.files.push(FileEntry{
-                relative_path: DesignValues::append(manifest.strings.bytes, relative_path),
+                relative_path: DesignValues::append(&manifest.strings.bytes, relative_path),
                 content_hash: Fingerprint::fnv1a64(content),
             })
             return true
@@ -266,7 +286,7 @@ module GenerationManifest:
             return false if manifest.files.count >= MAX_GENERATED_FILES
             reserve_entries(&manifest.files, manifest.files.count + 1)
             manifest.files.push(FileEntry{
-                relative_path: DesignValues::append(manifest.strings.bytes, relative_path),
+                relative_path: DesignValues::append(&manifest.strings.bytes, relative_path),
                 content_hash: content_hash,
             })
             return true
@@ -346,24 +366,40 @@ module GenerationManifest:
                 return []
 
             arena: mutable Arena = empty_arena()
-            members: mutable darray[JsonMember] = []
-            json_text_member(&arena, &members, "format", "elisa-ide-generation-manifest")
-            members.push(json_member(&arena, "version", json_number(manifest.version.f64())))
-            json_text_member(&arena, &members, "targetId", DesignValues::text_of(manifest.strings, manifest.target_id))
-            json_text_member(&arena, &members, "frameworkId", DesignValues::text_of(manifest.strings, manifest.framework_id))
-            json_hash_member(&arena, &members, "documentHash", manifest.document_hash)
-
-            files: mutable darray[JsonValue] = []
-            index: mutable i64 = 0
-            while index < manifest.files.count.i64():
-                entry: FileEntry = manifest.files[index.usize()]
-                file_members: mutable darray[JsonMember] = []
-                json_text_member(&arena, &file_members, "path", DesignValues::text_of(manifest.strings, entry.relative_path))
-                json_hash_member(&arena, &file_members, "contentHash", entry.content_hash)
-                files.push(json_object_from(&arena, file_members))
-                index <- index + 1
-            members.push(json_member(&arena, "files", json_array_from(&arena, files)))
-            output: darray[u8] = json_write(&arena, json_object_from(&arena, members))
+            output: mutable darray[u8] = []
+            in arena:
+                first: mutable bool = true
+                output.push(123)
+                object_key(&arena, &output, &first, "format")
+                append_json_string(&arena, &output, "elisa-ide-generation-manifest")
+                object_key(&arena, &output, &first, "version")
+                append_json_number(&arena, &output, manifest.version.f64())
+                object_key(&arena, &output, &first, "targetId")
+                append_json_string(&arena, &output, DesignValues::text_of(manifest.strings, manifest.target_id))
+                object_key(&arena, &output, &first, "frameworkId")
+                append_json_string(&arena, &output, DesignValues::text_of(manifest.strings, manifest.framework_id))
+                object_key(&arena, &output, &first, "documentHash")
+                append_hash(&arena, &output, manifest.document_hash)
+                object_key(&arena, &output, &first, "files")
+                output.push(91)
+                file_index: mutable i64 = 0
+                array_first: mutable bool = true
+                while file_index < manifest.files.count.i64():
+                    if not array_first:
+                        output.push(44)
+                    array_first <- false
+                    entry: FileEntry = manifest.files[file_index.usize()]
+                    file_first: mutable bool = true
+                    output.push(123)
+                    object_key(&arena, &output, &file_first, "path")
+                    append_json_string(&arena, &output, DesignValues::text_of(manifest.strings, entry.relative_path))
+                    object_key(&arena, &output, &file_first, "contentHash")
+                    append_hash(&arena, &output, entry.content_hash)
+                    output.push(125)
+                    file_index <- file_index + 1
+                output.push(93)
+                output.push(125)
+                output.push(10)
             return durable(output)
 
         # Decode accepts only this exact format/version, rejects duplicate
@@ -375,22 +411,22 @@ module GenerationManifest:
                 _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.InputTooLarge, "generation.manifest", "generation manifest exceeds the one-megabyte input limit")
                 return empty_manifest
             arena: mutable Arena = empty_arena()
-            parsed: JsonParseResult = json_parse_checked(arena, text)
-            if parsed.code != JsonErrorCode.OK or json_kind(parsed.value) != JsonKind.OBJECT:
+            parsed: JsonParseResult[arena] = json_parse_checked(&arena, text)
+            root: JsonValueHandle[arena] = json_handle_from_result(parsed)
+            if parsed.code != JsonErrorCode.OK or json_handle_kind(root) != JsonKind.OBJECT:
                 _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.MalformedJson, "generation.manifest", "generation manifest is not a valid JSON object")
                 return empty_manifest
-            root: JsonValue = parsed.value
             if duplicate_members(root):
                 _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.DuplicateKey, "generation.manifest", "generation manifest contains duplicate object keys")
                 return empty_manifest
             if not DesignText::equal(string_value(member_at(root, "format")), "elisa-ide-generation-manifest"):
                 report_manifest_error(sink, "generation manifest format marker is missing or invalid")
                 return empty_manifest
-            version_value: JsonValue = member_at(root, "version")
-            if not json_is_number(version_value):
+            version_value: JsonValueHandle[arena] = member_at(root, "version")
+            if not json_handle_is_number(version_value):
                 report_manifest_error(sink, "generation manifest version must be a number")
                 return empty_manifest
-            version_number: f64 = catch json_as_number(version_value):
+            version_number: f64 = catch json_handle_as_number(version_value):
                 value:
                     value
                 error e:
@@ -399,15 +435,15 @@ module GenerationManifest:
                 _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.UnsupportedSchemaVersion, "generation.manifest.version", "generation manifest version is not supported")
                 return empty_manifest
 
-            target: sview = string_value(member_at(root, "targetId"))
-            framework: sview = string_value(member_at(root, "frameworkId"))
+            target: sview @arena = string_value(member_at(root, "targetId"))
+            framework: sview @arena = string_value(member_at(root, "frameworkId"))
             document_hash_ok: mutable bool = false
             document_hash: u64 = parse_hash(string_value(member_at(root, "documentHash")), &document_hash_ok)
-            files_value: JsonValue = member_at(root, "files")
-            if not document_hash_ok or json_kind(files_value) != JsonKind.ARRAY:
+            files_value: JsonValueHandle[arena] = member_at(root, "files")
+            if not document_hash_ok or json_handle_kind(files_value) != JsonKind.ARRAY:
                 report_manifest_error(sink, "generation manifest needs a hexadecimal document hash and files array")
                 return empty_manifest
-            file_count: i64 = json_array_len(files_value)
+            file_count: i64 = json_handle_array_len(files_value)
             if file_count < 0 or file_count > MAX_GENERATED_FILES.i64():
                 report_manifest_error(sink, "generation manifest has too many owned files")
                 return empty_manifest
@@ -416,11 +452,11 @@ module GenerationManifest:
             manifest.version <- version_number.i64()
             index: mutable i64 = 0
             while index < file_count:
-                file_value: JsonValue = array_value(files_value, index)
-                if json_kind(file_value) != JsonKind.OBJECT or duplicate_members(file_value):
+                file_value: JsonValueHandle[arena] = array_value(files_value, index)
+                if json_handle_kind(file_value) != JsonKind.OBJECT or duplicate_members(file_value):
                     _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.DuplicateKey, "generation.manifest.files", "owned file record is not an unambiguous object")
                     return empty_manifest
-                path: sview = string_value(member_at(file_value, "path"))
+                path: sview @arena = string_value(member_at(file_value, "path"))
                 hash_ok: mutable bool = false
                 content_hash: u64 = parse_hash(string_value(member_at(file_value, "contentHash")), &hash_ok)
                 if path.len == 0 or not hash_ok or not add_hashed_file(&manifest, path, content_hash):

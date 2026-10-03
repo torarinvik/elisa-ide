@@ -16,6 +16,7 @@
 #include <float.h>
 #include <limits.h>
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <spawn.h>
 #include <stddef.h>
@@ -34,9 +35,66 @@
 #include <CoreGraphics/CoreGraphics.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <ImageIO/ImageIO.h>
+#include <mach-o/dyld.h>
 #endif
 
 extern char** environ;
+
+/* Resolve helper executables beside a development build or in an app bundle.
+ * LaunchServices does not preserve the source checkout as its working folder. */
+long designer_app_helper_path(const char* helper_name, char* output, size_t capacity) {
+    if (helper_name == NULL || output == NULL || capacity == 0) return -EINVAL;
+    size_t name_length = strnlen(helper_name, 128);
+    if (name_length == 0 || name_length >= 128) return -EINVAL;
+    for (size_t index = 0; index < name_length; index++) {
+        unsigned char byte = (unsigned char)helper_name[index];
+        if (!((byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') ||
+              (byte >= '0' && byte <= '9') || byte == '_' || byte == '-' || byte == '.'))
+            return -EINVAL;
+    }
+#ifdef __APPLE__
+    char executable[PATH_MAX];
+    uint32_t executable_capacity = (uint32_t)sizeof(executable);
+    if (_NSGetExecutablePath(executable, &executable_capacity) != 0) return -ENAMETOOLONG;
+    char resolved_executable[PATH_MAX];
+    if (realpath(executable, resolved_executable) == NULL) {
+        size_t length = strnlen(executable, sizeof(executable));
+        if (length == 0 || length >= sizeof(executable)) return -ENAMETOOLONG;
+        memcpy(resolved_executable, executable, length + 1);
+    }
+    char* executable_directory_end = strrchr(resolved_executable, '/');
+    if (executable_directory_end == NULL) return -EINVAL;
+    *executable_directory_end = '\0';
+
+    char candidate[PATH_MAX];
+    int candidate_length = snprintf(candidate, sizeof(candidate), "%s/../Resources/%s",
+                                    resolved_executable, helper_name);
+    if (candidate_length >= 0 && (size_t)candidate_length < sizeof(candidate) && access(candidate, X_OK) == 0) {
+        char resolved_candidate[PATH_MAX];
+        if (realpath(candidate, resolved_candidate) != NULL) {
+            size_t resolved_length = strlen(resolved_candidate);
+            if (resolved_length >= capacity) return -ENAMETOOLONG;
+            memcpy(output, resolved_candidate, resolved_length + 1);
+            return 0;
+        }
+    }
+
+    candidate_length = snprintf(candidate, sizeof(candidate), "%s/%s", resolved_executable, helper_name);
+    if (candidate_length >= 0 && (size_t)candidate_length < sizeof(candidate) && access(candidate, X_OK) == 0) {
+        char resolved_candidate[PATH_MAX];
+        if (realpath(candidate, resolved_candidate) != NULL) {
+            size_t resolved_length = strlen(resolved_candidate);
+            if (resolved_length >= capacity) return -ENAMETOOLONG;
+            memcpy(output, resolved_candidate, resolved_length + 1);
+            return 0;
+        }
+    }
+    return -ENOENT;
+#else
+    (void)name_length;
+    return -ENOTSUP;
+#endif
+}
 
 /* ------------------------------------------------------------------ stdio --- */
 
@@ -102,6 +160,192 @@ void designer_report_text(const char* text) {
 void designer_report_rect(const char* name, long x, long y, long width, long height) {
     printf("rect %s %ld %ld %ld %ld\n", name, x, y, width, height);
     fflush(stdout);
+}
+
+/* Exact Q10 geometry from the isolated preview worker. Each record carries
+ * the revision and snapshot signature so the shell can reject stale output. */
+void designer_report_geometry(const char* name, long revision, long signature,
+                              long x_q10, long y_q10, long width_q10,
+                              long height_q10, long visible, long selectable) {
+    printf("geometry_v1 %ld %ld %s %ld %ld %ld %ld %ld %ld\n",
+           revision, signature, name, x_q10, y_q10, width_q10, height_q10,
+           visible, selectable);
+    fflush(stdout);
+}
+
+/* Create request-private paths for one isolated preview worker. The private
+ * directory is mode 0700 and has a random mkdtemp suffix, so two IDE sessions
+ * and overlapping retries cannot replace each other's snapshot or PNG. The
+ * caller owns the returned paths and must pass them to the paired cleanup
+ * routine after the worker has exited and the image has been consumed. */
+static int designer_copy_path(char* out, size_t capacity, const char* path) {
+    if (out == NULL || capacity == 0 || path == NULL) return -EINVAL;
+    size_t length = strlen(path);
+    if (length >= capacity) return -ENAMETOOLONG;
+    memcpy(out, path, length + 1);
+    return 0;
+}
+
+long designer_preview_paths_create(char* input_path, size_t input_capacity,
+                                   char* frame_path, size_t frame_capacity) {
+    if (input_path == NULL || frame_path == NULL || input_capacity == 0 || frame_capacity == 0)
+        return -EINVAL;
+    input_path[0] = '\0';
+    frame_path[0] = '\0';
+
+    const char* temp_root = getenv("TMPDIR");
+    if (temp_root == NULL || temp_root[0] == '\0') temp_root = "/tmp";
+    size_t root_length = strlen(temp_root);
+    int has_separator = root_length > 0 && temp_root[root_length - 1] == '/';
+    static const char suffix[] = "elisa-ide-preview-XXXXXX";
+    size_t template_capacity = root_length + (has_separator ? 1 : 2) + sizeof(suffix);
+    char* directory = (char*)malloc(template_capacity);
+    if (directory == NULL) return -ENOMEM;
+    int template_length = snprintf(directory, template_capacity, "%s%selisa-ide-preview-XXXXXX",
+                                   temp_root, has_separator ? "" : "/");
+    if (template_length < 0 || (size_t)template_length >= template_capacity) {
+        free(directory);
+        return -ENAMETOOLONG;
+    }
+    if (mkdtemp(directory) == NULL) {
+        long failure = -(long)errno;
+        free(directory);
+        return failure;
+    }
+
+    char input_candidate[PATH_MAX];
+    char frame_candidate[PATH_MAX];
+    int input_length = snprintf(input_candidate, sizeof(input_candidate), "%s/input.bin", directory);
+    int frame_length = snprintf(frame_candidate, sizeof(frame_candidate), "%s/frame.png", directory);
+    int failure = 0;
+    if (input_length < 0 || (size_t)input_length >= sizeof(input_candidate) ||
+        frame_length < 0 || (size_t)frame_length >= sizeof(frame_candidate)) {
+        failure = -ENAMETOOLONG;
+    } else {
+        failure = designer_copy_path(input_path, input_capacity, input_candidate);
+        if (failure == 0) failure = designer_copy_path(frame_path, frame_capacity, frame_candidate);
+    }
+    if (failure != 0) {
+        input_path[0] = '\0';
+        frame_path[0] = '\0';
+        (void)rmdir(directory);
+        free(directory);
+        return failure;
+    }
+    free(directory);
+    return 0;
+}
+
+/* Cleanup accepts only the exact paired basenames inside one generated
+ * elisa-ide-preview-XXXXXX directory. It never recurses and will leave the
+ * directory in place if unexpected files remain. */
+long designer_preview_paths_cleanup(const char* input_path, const char* frame_path) {
+    if (input_path == NULL || frame_path == NULL) return -EINVAL;
+    size_t input_length = strnlen(input_path, PATH_MAX);
+    size_t frame_length = strnlen(frame_path, PATH_MAX);
+    static const char input_suffix[] = "/input.bin";
+    static const char frame_suffix[] = "/frame.png";
+    if (input_length >= PATH_MAX || frame_length >= PATH_MAX ||
+        input_length <= sizeof(input_suffix) - 1 || frame_length <= sizeof(frame_suffix) - 1)
+        return -EINVAL;
+    size_t directory_length = input_length - (sizeof(input_suffix) - 1);
+    if (frame_length - (sizeof(frame_suffix) - 1) != directory_length ||
+        memcmp(input_path, frame_path, directory_length) != 0 ||
+        strcmp(input_path + directory_length, input_suffix) != 0 ||
+        strcmp(frame_path + directory_length, frame_suffix) != 0)
+        return -EINVAL;
+    const char* base = input_path + directory_length;
+    while (base > input_path && base[-1] != '/') base--;
+    static const char directory_prefix[] = "elisa-ide-preview-";
+    size_t base_length = directory_length - (size_t)(base - input_path);
+    if (base_length != sizeof(directory_prefix) - 1 + 6 ||
+        memcmp(base, directory_prefix, sizeof(directory_prefix) - 1) != 0)
+        return -EINVAL;
+    for (size_t index = sizeof(directory_prefix) - 1; index < base_length; index++) {
+        char byte = base[index];
+        if (!((byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') ||
+              (byte >= '0' && byte <= '9'))) return -EINVAL;
+    }
+
+    struct stat directory_status;
+    char directory[PATH_MAX];
+    if (directory_length >= sizeof(directory)) return -ENAMETOOLONG;
+    memcpy(directory, input_path, directory_length);
+    directory[directory_length] = '\0';
+    if (lstat(directory, &directory_status) != 0) return errno == ENOENT ? 0 : -(long)errno;
+    if (!S_ISDIR(directory_status.st_mode) || S_ISLNK(directory_status.st_mode) ||
+        directory_status.st_uid != geteuid() || (directory_status.st_mode & 077) != 0)
+        return -EPERM;
+
+    if (unlink(input_path) != 0 && errno != ENOENT) return -(long)errno;
+    if (unlink(frame_path) != 0 && errno != ENOENT) return -(long)errno;
+    return rmdir(directory) == 0 || errno == ENOENT ? 0 : -(long)errno;
+}
+
+/* FNV-1a is used here as a bounded corruption/cross-frame identity check, not
+ * as an authentication primitive. The two 32-bit words keep the wire values
+ * inside the shell's checked signed-decimal parser. */
+static long designer_preview_file_identity(const char* path, size_t* length_out,
+                                           uint32_t* hash_high_out, uint32_t* hash_low_out) {
+    if (path == NULL || length_out == NULL || hash_high_out == NULL || hash_low_out == NULL)
+        return -EINVAL;
+    int descriptor = open(path, O_RDONLY);
+    if (descriptor < 0) return -(long)errno;
+    uint64_t hash = UINT64_C(14695981039346656037);
+    size_t total = 0;
+    unsigned char buffer[8192];
+    for (;;) {
+        ssize_t amount = read(descriptor, buffer, sizeof(buffer));
+        if (amount < 0) {
+            if (errno == EINTR) continue;
+            long failure = -(long)errno;
+            (void)close(descriptor);
+            return failure;
+        }
+        if (amount == 0) break;
+        if ((size_t)amount > SIZE_MAX - total) {
+            (void)close(descriptor);
+            return -EFBIG;
+        }
+        total += (size_t)amount;
+        for (ssize_t index = 0; index < amount; index++) {
+            hash ^= (uint64_t)buffer[index];
+            hash *= UINT64_C(1099511628211);
+        }
+    }
+    if (close(descriptor) != 0) return -(long)errno;
+    if (total == 0) return -ENODATA;
+    *length_out = total;
+    *hash_high_out = (uint32_t)(hash >> 32);
+    *hash_low_out = (uint32_t)hash;
+    return 0;
+}
+
+/* This small rolling signature matches PreviewWire::snapshot_signature. It
+ * stays in the native shim so the optimized UI and worker execute the exact
+ * same byte loop even when they are compiled at different optimization levels. */
+long designer_preview_snapshot_signature(const unsigned char* bytes, size_t length) {
+    if (bytes == NULL && length != 0) return -EINVAL;
+    int64_t signature = 17;
+    for (size_t index = 0; index < length; index++)
+        signature = (signature * 131 + bytes[index]) % INT64_C(2147483647);
+    return signature == 0 ? 1 : (long)signature;
+}
+
+long designer_preview_frame_identity(const char* path, size_t* length_out,
+                                     uint32_t* hash_high_out, uint32_t* hash_low_out) {
+    return designer_preview_file_identity(path, length_out, hash_high_out, hash_low_out);
+}
+
+long designer_report_frame_identity(const char* path, long revision, long signature) {
+    size_t length = 0;
+    uint32_t hash_high = 0;
+    uint32_t hash_low = 0;
+    long result = designer_preview_file_identity(path, &length, &hash_high, &hash_low);
+    if (result != 0) return result;
+    printf("frame_v1 %ld %ld %zu %u %u\n", revision, signature, length, hash_high, hash_low);
+    fflush(stdout);
+    return 0;
 }
 
 long designer_setenv(const char* name, const char* value) {
@@ -196,6 +440,19 @@ long designer_file_status_is_exists(long status) {
 long designer_file_mkdir(const char* path) {
     if (mkdir(path, 0755) == 0) return 0;
     return errno == EEXIST ? 0 : -(long)errno;
+}
+
+/* Unlike designer_file_mkdir, this reports success only when this call
+ * exclusively created the directory. EEXIST remains an error so callers can
+ * track which directories they own and may attempt to remove on rollback. */
+long designer_file_mkdir_exclusive(const char* path) {
+    return mkdir(path, 0755) == 0 ? 0 : -(long)errno;
+}
+
+/* Remove an empty directory only. rmdir fails if it is nonempty, so rollback
+ * cannot recursively erase files another process placed in the directory. */
+long designer_file_rmdir_empty(const char* path) {
+    return rmdir(path) == 0 ? 0 : -(long)errno;
 }
 
 long designer_file_unlink(const char* path) {
@@ -339,7 +596,7 @@ long designer_png_decode_rgba32(const char* path, unsigned char* output,
     CGImageRelease(image);
 
     /* The bitmap context uses premultiplied alpha internally, which Core
-     * Graphics requires. Convert in place to straight RGBA8 for SDL textures. */
+     * Graphics requires. Convert in place to straight RGBA8 for renderer upload. */
     for (size_t offset = 0; offset < byte_count; offset += 4) {
         const unsigned int alpha = output[offset + 3];
         if (alpha == 0) {
@@ -779,8 +1036,10 @@ typedef struct DesignerProcess {
     int err_fd;
     char* out;
     size_t out_len;
+    size_t out_read;
     char* err;
     size_t err_len;
+    size_t err_read;
     int truncated;
     int finished;
     int cancelled;
@@ -931,6 +1190,99 @@ void* designer_process_start(const char* const* argv, size_t argc) {
     return p;
 }
 
+typedef struct DesignerEditorReaper {
+    pid_t pid;
+} DesignerEditorReaper;
+
+static void* designer_editor_reap(void* opaque) {
+    DesignerEditorReaper* child = (DesignerEditorReaper*)opaque;
+    int status = 0;
+    pid_t result;
+    do {
+        result = waitpid(child->pid, &status, 0);
+    } while (result < 0 && errno == EINTR);
+    free(child);
+    return NULL;
+}
+
+static long designer_launch_detached(const char* executable, char* const* argv) {
+    pid_t pid = -1;
+    int spawn_rc = posix_spawnp(&pid, executable, NULL, NULL, (char* const*)argv, environ);
+    if (spawn_rc != 0) return -(long)spawn_rc;
+
+    DesignerEditorReaper* child = (DesignerEditorReaper*)malloc(sizeof(*child));
+    if (child == NULL) {
+        kill(pid, SIGKILL);
+        while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) { }
+        return -ENOMEM;
+    }
+    child->pid = pid;
+
+    pthread_attr_t attributes;
+    int thread_rc = pthread_attr_init(&attributes);
+    if (thread_rc == 0) {
+        thread_rc = pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED);
+        if (thread_rc == 0) {
+            pthread_t thread;
+            thread_rc = pthread_create(&thread, &attributes, designer_editor_reap, child);
+        }
+        pthread_attr_destroy(&attributes);
+    }
+    if (thread_rc != 0) {
+        kill(pid, SIGKILL);
+        while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) { }
+        free(child);
+        return -(long)thread_rc;
+    }
+    return 0;
+}
+
+/* Launch a user-configured editor without a shell. The path and one-based
+ * line are distinct arguments, so spaces and shell metacharacters in either
+ * value remain ordinary filename text. A detached waiter reaps editors that
+ * stay open after the IDE returns to its event loop. */
+long designer_editor_launch(const char* editor, const char* path, long line) {
+    if (editor == NULL || path == NULL || editor[0] == '\0' || path[0] == '\0' || line <= 0)
+        return -EINVAL;
+    size_t editor_length = strnlen(editor, PATH_MAX);
+    size_t path_length = strnlen(path, PATH_MAX);
+    if (editor_length == 0 || editor_length >= PATH_MAX ||
+        path_length == 0 || path_length >= PATH_MAX)
+        return -ENAMETOOLONG;
+    for (size_t index = 0; index < editor_length; index++) {
+        unsigned char byte = (unsigned char)editor[index];
+        if (byte < 32 || byte == 127) return -EINVAL;
+    }
+    for (size_t index = 0; index < path_length; index++) {
+        unsigned char byte = (unsigned char)path[index];
+        if (byte < 32 || byte == 127) return -EINVAL;
+    }
+
+    char line_argument[32];
+    int line_length = snprintf(line_argument, sizeof(line_argument), "%ld", line);
+    if (line_length <= 0 || (size_t)line_length >= sizeof(line_argument)) return -ERANGE;
+    char* argv[] = {(char*)editor, (char*)path, line_argument, NULL};
+    return designer_launch_detached(editor, argv);
+}
+
+/* Ask Finder to reveal the opened file. The source path is a single argv item;
+ * paths with spaces cannot be reinterpreted as shell syntax. */
+long designer_reveal_file(const char* path) {
+    if (path == NULL || path[0] == '\0') return -EINVAL;
+    size_t path_length = strnlen(path, PATH_MAX);
+    if (path_length == 0 || path_length >= PATH_MAX) return -ENAMETOOLONG;
+    for (size_t index = 0; index < path_length; index++) {
+        unsigned char byte = (unsigned char)path[index];
+        if (byte < 32 || byte == 127) return -EINVAL;
+    }
+#ifdef __APPLE__
+    char* argv[] = {(char*)"open", (char*)"-R", (char*)path, NULL};
+    return designer_launch_detached("open", argv);
+#else
+    return -ENOTSUP;
+#endif
+}
+
 /* Write `count` bytes to the child's stdin. Returns bytes written or negative
  * errno. The pipe is not non-blocking: a bounded message is small and the host
  * reads continuously, so a short blocking write is acceptable and simpler than
@@ -992,16 +1344,20 @@ long designer_process_poll(void* handle, long timeout_ms) {
 unsigned long designer_process_stdout(void* handle, void* out, size_t capacity) {
     DesignerProcess* p = (DesignerProcess*)handle;
     if (p == NULL) return 0;
-    size_t amount = p->out_len < capacity ? p->out_len : capacity;
-    if (amount > 0 && out != NULL) memcpy(out, p->out, amount);
+    size_t unread = p->out_len - p->out_read;
+    size_t amount = unread < capacity ? unread : capacity;
+    if (amount > 0 && out != NULL) memcpy(out, p->out + p->out_read, amount);
+    p->out_read += amount;
     return (unsigned long)amount;
 }
 
 unsigned long designer_process_stderr(void* handle, void* out, size_t capacity) {
     DesignerProcess* p = (DesignerProcess*)handle;
     if (p == NULL) return 0;
-    size_t amount = p->err_len < capacity ? p->err_len : capacity;
-    if (amount > 0 && out != NULL) memcpy(out, p->err, amount);
+    size_t unread = p->err_len - p->err_read;
+    size_t amount = unread < capacity ? unread : capacity;
+    if (amount > 0 && out != NULL) memcpy(out, p->err + p->err_read, amount);
+    p->err_read += amount;
     return (unsigned long)amount;
 }
 

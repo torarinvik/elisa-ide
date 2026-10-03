@@ -1,16 +1,22 @@
 #!/usr/bin/env bash
-# Build and run native SDL tests. These require a compiler/framework pair that
-# passes the sibling elisa-ui native example build.
+# Build and run native SDL tests. The desktop IDE is built separately with
+# scripts/build_ide.sh and its pinned AppKit + Skia profile.
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-# Compiles the emitted settings form in an actual framework application unit.
-bash scripts/build_native.sh test/codegen/generated_settings_compile.elisa generated_settings_compile >/dev/null
-SDL_VIDEODRIVER=dummy ./build/generated_settings_compile
+# Regenerates the settings app, checks user-handler preservation, compiles and
+# runs the standalone output, then clicks the generated Save button through
+# Elisa-ui's normal event route in a deterministic harness.
+bash scripts/smoke_generated_settings.sh
+bash scripts/smoke_counter_generation.sh
+bash scripts/smoke_primitives_generation.sh
+bash scripts/test_external_editor_launch.sh
 
 bash scripts/build_core.sh worker/core/document_host.elisa document_host >/dev/null
+bash scripts/build_native.sh test/ui/shell_inspector_test.elisa shell_inspector_test >/dev/null
+./build/shell_inspector_test
 bash scripts/build_native.sh test/ui/host_client_test.elisa host_client_test >/dev/null
 ./build/host_client_test
 
@@ -26,6 +32,4 @@ bash scripts/smoke_shell_frame.sh
 bash scripts/build_native.sh test/ui/designer_shell_test.elisa designer_shell_test >/dev/null
 SDL_VIDEODRIVER=dummy ./build/designer_shell_test
 
-bash scripts/build_native.sh src/app/main_native.elisa elisa_ide >/dev/null
-bash scripts/smoke_native.sh elisa_ide
 echo "all native/UI tests passed"

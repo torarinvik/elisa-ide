@@ -8,6 +8,8 @@ include "../../src/platform/posix/posix_file.elisa"
 
 @link_name("designer_report_rect")
 extern designer_report_rect(name: cstr, x: i64, y: i64, width: i64, height: i64) -> void
+@link_name("designer_report_geometry")
+extern designer_report_geometry(name: cstr, revision: i64, signature: i64, x_q10: i64, y_q10: i64, width_q10: i64, height_q10: i64, visible: i64, selectable: i64) -> void
 @link_name("designer_report_i64")
 extern designer_report_i64(label: cstr, value: i64) -> void
 
@@ -43,6 +45,7 @@ module PreviewWorkerApp:
 
         global mutable preview_loaded: bool = false
         global mutable preview_revision: u64 = 0
+        global mutable preview_signature: i64 = 0
         global mutable preview_width: f32 = 400.0
         global mutable preview_height: f32 = 300.0
         global mutable preview_node_count: usize = 0
@@ -106,7 +109,10 @@ module PreviewWorkerApp:
             return false if length > PreviewWire::MAX_TEXT_BYTES
             return false if offset + length > bytes.count
             return false if preview_text_used + length > STRING_CAPACITY
-            source: sview = "" if length == 0 else sview(&bytes[offset], 0, length.i64())
+            source: mutable sview = ""
+            if length > 0:
+                can Unsafe.PointerCast:
+                    source <- UiText::unsafe_sview_bounded_bytes(&bytes[offset], length)
             return false if UiText::valid_utf8_prefix(source, length) != length
             slot: usize = text_slot(node, field)
             preview_text_offsets[slot] <- preview_text_used.u32()
@@ -129,13 +135,22 @@ module PreviewWorkerApp:
             length: usize = preview_id_lengths[node].usize()
             return "" if length == 0
             start: usize = node * PreviewWire::MAX_ID_BYTES
-            return sview(&preview_ids[start], 0, length.i64())
+            result: mutable sview = ""
+            can Unsafe.PointerCast:
+                result <- UiText::unsafe_sview_bounded_bytes(&preview_ids[start], length)
+            return result
 
         def text_view(node: usize, field: TextField) -> sview:
             slot: usize = text_slot(node, field)
             length: usize = preview_text_lengths[slot].usize()
             return "" if length == 0
-            return sview(&preview_text_storage[preview_text_offsets[slot].usize()], 0, length.i64())
+            result: mutable sview = ""
+            can Unsafe.PointerCast:
+                result <- UiText::unsafe_sview_bounded_bytes(&preview_text_storage[preview_text_offsets[slot].usize()], length)
+            return result
+
+        def q10(value: f32) -> i64:
+            return (value.f64() * 1024.0).i64()
 
         def number(node: usize, field: NumberField) -> f32:
             return preview_numbers[number_slot(node, field)].f32() / 1024.0
@@ -190,9 +205,9 @@ module PreviewWorkerApp:
                 reserved: u8 = bytes[offset + 9]
                 offset <- offset + 10
                 return false if id_length == 0 or id_length > PreviewWire::MAX_ID_BYTES
-                return false if kind < PreviewWire::Component.Column.u8() or kind > PreviewWire::Component.TextField.u8()
+                return false if kind < PreviewWire::Component.Column.u8() or kind > PreviewWire::Component.Scroll.u8()
                 return false if (node == 0 and parent != 65535) or (node > 0 and parent.usize() >= node)
-                return false if flags & 65528 != 0 or axis > 1 or cross > 3 or main > 3 or reserved != 0
+                return false if flags & 65520 != 0 or axis > 1 or cross > 3 or main > 3 or reserved != 0
                 return false if offset + id_length > bytes.count
                 id_start: usize = node * PreviewWire::MAX_ID_BYTES
                 for index in 0..<id_length:
@@ -253,9 +268,28 @@ module PreviewWorkerApp:
                 handle <- UiHandles::button(parent, number(index, NumberField.MinimumWidth), number(index, NumberField.MinimumHeight), background, node_color(index, ColorField.Hover), node_color(index, ColorField.Press))
                 UiHandles::set_text(handle, text_view(index, TextField.Caption), number(index, NumberField.TextSize), foreground)
                 UiHandles::set_enabled(handle, preview_flags[index] & 2 != 0)
-            else:
+            elif kind == PreviewWire::Component.TextField.u8():
                 handle <- UiHandles::text_field(parent, text_view(index, TextField.Label), text_view(index, TextField.Placeholder), text_view(index, TextField.Initial), number(index, NumberField.MinimumWidth), number(index, NumberField.MinimumHeight), number(index, NumberField.TextSize), foreground, background)
                 UiHandles::set_secure(handle, preview_flags[index] & 4 != 0)
+            elif kind == PreviewWire::Component.CheckBox.u8():
+                handle <- UiHandles::check_box(parent, number(index, NumberField.MinimumWidth), number(index, NumberField.MinimumHeight), background, node_color(index, ColorField.Hover), node_color(index, ColorField.Press))
+                UiHandles::set_text(handle, text_view(index, TextField.Caption), number(index, NumberField.TextSize), foreground)
+                UiHandles::set_selected(handle, preview_flags[index] & 8 != 0)
+                UiHandles::set_enabled(handle, preview_flags[index] & 2 != 0)
+            elif kind == PreviewWire::Component.RadioButton.u8():
+                handle <- UiHandles::radio_button(parent, number(index, NumberField.MinimumWidth), number(index, NumberField.MinimumHeight), background, node_color(index, ColorField.Hover), node_color(index, ColorField.Press))
+                UiHandles::set_text(handle, text_view(index, TextField.Caption), number(index, NumberField.TextSize), foreground)
+                UiHandles::set_selected(handle, preview_flags[index] & 8 != 0)
+                UiHandles::set_enabled(handle, preview_flags[index] & 2 != 0)
+            elif kind == PreviewWire::Component.Slider.u8():
+                handle <- UiHandles::slider_labeled(parent, text_view(index, TextField.Label), number(index, NumberField.MinimumWidth), number(index, NumberField.MinimumHeight), number(index, NumberField.Padding), background, node_color(index, ColorField.Hover), node_color(index, ColorField.Press))
+                UiHandles::set_text(handle, text_view(index, TextField.Label), number(index, NumberField.TextSize), foreground)
+                UiHandles::set_enabled(handle, preview_flags[index] & 2 != 0)
+            elif kind == PreviewWire::Component.ProgressBar.u8():
+                handle <- UiHandles::progress_bar_labeled(parent, text_view(index, TextField.Label), number(index, NumberField.MinimumWidth), number(index, NumberField.MinimumHeight), number(index, NumberField.Padding), background, node_color(index, ColorField.Hover))
+                UiHandles::set_text(handle, text_view(index, TextField.Label), number(index, NumberField.TextSize), foreground)
+            else:
+                handle <- UiHandles::scroll(parent, node_axis(index), number(index, NumberField.MinimumWidth), number(index, NumberField.MinimumHeight), background)
 
             return false if not UiHandles::is_valid(handle)
             preview_handles[index] <- handle
@@ -271,15 +305,20 @@ module PreviewWorkerApp:
         def emit_geometry() -> void:
             for index in 0..<preview_node_count:
                 handle: UiHandles::Handle = preview_handles[index]
-                if UiHandles::widget(handle) is widget:
+                if UiHandles::widget(handle) is widget and widget.width > 0.0 and widget.height > 0.0:
                     id_buffer: mutable u8[PreviewWire::MAX_ID_BYTES + 1] = zeroed
                     start: usize = index * PreviewWire::MAX_ID_BYTES
                     for byte_index in 0..<preview_id_lengths[index].usize():
                         id_buffer[byte_index] <- preview_ids[start + byte_index]
                     id_buffer[preview_id_lengths[index].usize()] <- 0
-                    id_text: cstr = (&id_buffer[0]).cast[cstr] can Unsafe.PointerCast
+                    id_text: mutable cstr = ""
+                    can Unsafe.PointerCast:
+                        id_text <- (&id_buffer[0]).cast[cstr] can Unsafe.PointerCast
                     designer_report_rect(id_text, widget.x.i64(), widget.y.i64(), widget.width.i64(), widget.height.i64())
-                    
+                    designer_report_geometry(id_text, preview_revision.i64(), preview_signature,
+                        q10(widget.x), q10(widget.y), q10(widget.width), q10(widget.height),
+                        1 if UiHandles::is_visible(handle) else 0, 1)
+
         def build_preview() -> bool:
             UiHandles::reset()
             for index in 0..<preview_node_count:
@@ -304,7 +343,9 @@ module PreviewWorkerApp:
                 designer_report_rect("action", action_widget.x.i64(), action_widget.y.i64(), action_widget.width.i64(), action_widget.height.i64())
 
     public:
-        def load_preview(bytes: darray[u8]&) -> bool:
+        def load_preview(bytes: darray[u8]&, signature: i64) -> bool:
+            return false if bytes.count == 0
+            preview_signature <- signature
             return decode(bytes)
 
         def has_preview() -> bool:

@@ -17,7 +17,7 @@ extern host_stdin_read(out: mutable void&, capacity: usize) -> i64 can[Blocking.
 struct HostText:
     buf: mutable darray[u8]
 
-global mutable host_text: HostText = HostText{buf: []}
+global mutable host_text: HostText = zeroed
 
 @link_name("designer_stdout_write")
 extern host_stdout_write(bytes: void&, count: usize) -> i64 can[Blocking.IO]
@@ -113,12 +113,66 @@ def host_dispatch(opcode: i64, arg0: i64, arg1: i64, running: mutable bool&) -> 
             if DesignerSession::duplicate_selection():
                 return 1
             return 0
+        if opcode == 120:
+            if DesignerSession::copy_selection():
+                return 1
+            return 0
+        if opcode == 121:
+            if DesignerSession::cut_selection():
+                return 1
+            return 0
+        if opcode == 122:
+            if DesignerSession::paste_selection():
+                return 1
+            return 0
+        if opcode == 123:
+            if DesignerSession::wrap_selection(arg0):
+                return 1
+            return 0
+        if opcode == 124:
+            if DesignerSession::unwrap_selection():
+                return 1
+            return 0
+        if opcode == 125:
+            if DesignerSession::convert_container(arg0):
+                return 1
+            return 0
+        if opcode == 126:
+            if DesignerSession::select_ancestor():
+                return 1
+            return 0
         if opcode == 17:
             if DesignerSession::reorder_selection(arg0 != 0):
                 return 1
             return 0
+        if opcode == 84:
+            if DesignerSession::indent_selection():
+                return 1
+            return 0
+        if opcode == 85:
+            if DesignerSession::outdent_selection():
+                return 1
+            return 0
+        if opcode == 86:
+            if DesignerSession::can_insert_component_at(arg0, arg1):
+                return 1
+            return 0
+        if opcode == 87:
+            return DesignerSession::insert_component_at(arg0, arg1)
+        if opcode == 88:
+            if DesignerSession::can_reparent_selection_to(arg0):
+                return 1
+            return 0
+        if opcode == 89:
+            if DesignerSession::reparent_selection_to(arg0):
+                return 1
+            return 0
         if opcode == 18:
             if DesignerSession::save_as_form(DesignText::view_of(host_text.buf)):
+                return 1
+            return 0
+        if opcode == 19:
+            if DesignerSession::create_project(DesignText::view_of(host_text.buf)):
                 return 1
             return 0
         if opcode == 20:
@@ -133,10 +187,24 @@ def host_dispatch(opcode: i64, arg0: i64, arg1: i64, running: mutable bool&) -> 
             return DesignerSession::selection_count()
         if opcode == 25:
             return DesignerSession::problems_count_value()
+        if opcode == 90:
+            return DesignerSession::event_count()
         if opcode == 30:
             return DesignerSession::insert_component(arg0)
         if opcode == 31:
             if DesignerSession::select_hierarchy_row(arg0):
+                return 1
+            return 0
+        if opcode == 81:
+            if DesignerSession::select_node_by_id(DesignText::view_of(host_text.buf)):
+                return 1
+            return 0
+        if opcode == 82:
+            if DesignerSession::toggle_hierarchy_row(arg0):
+                return 1
+            return 0
+        if opcode == 83:
+            if DesignerSession::select_hierarchy_range(arg0):
                 return 1
             return 0
         if opcode == 32:
@@ -145,6 +213,10 @@ def host_dispatch(opcode: i64, arg0: i64, arg1: i64, running: mutable bool&) -> 
             return 0
         if opcode == 33:
             if DesignerSession::cycle_inspector(arg0):
+                return 1
+            return 0
+        if opcode == 34:
+            if DesignerSession::reset_inspector(arg0):
                 return 1
             return 0
         if opcode == 40:
@@ -185,6 +257,109 @@ def host_dispatch(opcode: i64, arg0: i64, arg1: i64, running: mutable bool&) -> 
             return set_text(DesignerSession::title())
         if opcode == 58:
             return set_text(DesignerSession::form_title())
+        if opcode == 109:
+            return set_text(DesignerSession::form_path())
+        if opcode == 112:
+            if DesignerSession::open_source(DesignText::view_of(host_text.buf)):
+                return 1
+            return 0
+        if opcode == 113:
+            if DesignerSession::source_view_is_open():
+                return 1
+            return 0
+        if opcode == 114:
+            return set_text(DesignerSession::source_view_path())
+        if opcode == 115:
+            return DesignerSession::source_view_line_count()
+        if opcode == 118:
+            return DesignerSession::source_view_line_byte_start(arg0)
+        if opcode == 116:
+            line: sview = DesignerSession::source_view_line(arg0)
+            result: i64 = set_text(line)
+            return 2 if result == 1 and DesignerSession::source_view_line_truncated()
+            return result
+        if opcode == 130:
+            if DesignerSession::source_view_dirty():
+                return 1
+            return 0
+        if opcode == 131:
+            if DesignerSession::source_view_save():
+                return 1
+            return 0
+        if opcode == 132:
+            if DesignerSession::source_view_edit_line(arg0, DesignText::view_of(host_text.buf)):
+                return 1
+            return 0
+        if opcode == 133:
+            if DesignerSession::source_view_replace_range(arg0, arg1, DesignText::view_of(host_text.buf)):
+                return 1
+            return 0
+        if opcode == 150:
+            payload: sview = DesignText::view_of(host_text.buf)
+            return -1 if arg0 < 0 or arg0 > payload.len or arg1 != 0
+            query: sview = string_view_slice(payload, 0, arg0)
+            replacement: sview = string_view_slice(payload, arg0, payload.len)
+            return DesignerSession::source_view_replace_all(query, replacement)
+        if opcode == 134:
+            if DesignerSession::source_view_undo():
+                return 1
+            return 0
+        if opcode == 135:
+            if DesignerSession::source_view_redo():
+                return 1
+            return 0
+        if opcode == 136:
+            if DesignerSession::source_view_can_undo():
+                return 1
+            return 0
+        if opcode == 137:
+            if DesignerSession::source_view_can_redo():
+                return 1
+            return 0
+        if opcode == 138:
+            if DesignerSession::source_view_check_external_change():
+                return 1
+            return 0
+        if opcode == 139:
+            if DesignerSession::source_view_external_changed():
+                return 1
+            return 0
+        if opcode == 140:
+            if DesignerSession::source_view_external_snapshot_available():
+                return 1
+            return 0
+        if opcode == 141:
+            return DesignerSession::source_view_external_line_count()
+        if opcode == 142:
+            return set_text(DesignerSession::source_view_external_line(arg0))
+        if opcode == 143:
+            return set_text(DesignerSession::source_view_compare_projection())
+        if opcode == 144:
+            if DesignerSession::source_view_reload_external():
+                return 1
+            return 0
+        if opcode == 145:
+            if DesignerSession::source_view_keep_buffer():
+                return 1
+            return 0
+        if opcode == 146:
+            if DesignerSession::source_view_save_as(DesignText::view_of(host_text.buf)):
+                return 1
+            return 0
+        if opcode == 147:
+            return DesignerSession::source_view_find(DesignText::view_of(host_text.buf), arg0, arg1 != 0)
+        if opcode == 148:
+            return DesignerSession::source_view_byte_count()
+        if opcode == 149:
+            return DesignerSession::source_view_line_for_byte(arg0)
+        if opcode == 117:
+            if DesignerSession::open_or_create_handlers():
+                return 1
+            return 0
+        if opcode == 110:
+            return DesignerSession::file_count()
+        if opcode == 111:
+            return set_text(DesignerSession::file_path(arg0))
         if opcode == 59:
             return set_text(DesignerSession::palette_display(arg0))
         if opcode == 60:
@@ -193,8 +368,68 @@ def host_dispatch(opcode: i64, arg0: i64, arg1: i64, running: mutable bool&) -> 
             return set_text(DesignerSession::undo_label())
         if opcode == 62:
             return DesignerSession::inspector_tag(arg0).i64()
+        if opcode == 63:
+            return set_text(DesignerSession::selection_path())
+        if opcode == 96:
+            return set_text(DesignerSession::problem_label(arg0))
+        if opcode == 97:
+            return set_text(DesignerSession::problem_message(arg0))
+        if opcode == 98:
+            return set_text(DesignerSession::problem_path(arg0))
+        if opcode == 99:
+            if DesignerSession::problem_is_error(arg0):
+                return 1
+            return 0
+        if opcode == 100:
+            return DesignerSession::problem_node_row(arg0)
+        if opcode == 101:
+            if DesignerSession::recovery_available():
+                return 1
+            return 0
+        if opcode == 102:
+            if DesignerSession::restore_recovery():
+                return 1
+            return 0
+        if opcode == 103:
+            if DesignerSession::discard_recovery():
+                return 1
+            return 0
+        if opcode == 104:
+            if DesignerSession::external_change():
+                return 1
+            return 0
+        if opcode == 105:
+            if DesignerSession::reload_document():
+                return 1
+            return 0
+        if opcode == 106:
+            return set_text(DesignerSession::generated_view_source())
+        if opcode == 107:
+            return set_text(DesignerSession::generated_view_source_map())
+        if opcode == 108:
+            if DesignerSession::select_generated_source_byte(arg0):
+                return 1
+            return 0
+        if opcode == 91:
+            return set_text(DesignerSession::event_label(arg0))
+        if opcode == 92:
+            return set_text(DesignerSession::event_value(arg0))
+        if opcode == 93:
+            return set_text(DesignerSession::event_signature(arg0))
+        if opcode == 64:
+            return DesignerSession::selection_ancestor_count()
+        if opcode == 65:
+            return DesignerSession::selection_ancestor_row(arg0)
         if opcode == 70:
             if DesignerSession::set_inspector_text(arg0, DesignText::view_of(host_text.buf)):
+                return 1
+            return 0
+        if opcode == 94:
+            if DesignerSession::set_event_handler(arg0, DesignText::view_of(host_text.buf)):
+                return 1
+            return 0
+        if opcode == 95:
+            if DesignerSession::clear_event_handler(arg0):
                 return 1
             return 0
         if opcode == 80:
@@ -238,7 +473,7 @@ def run_file_mode(request_path: cstr, reply_path: cstr) -> i64:
             arg1: i64 = i32_at(incoming, cursor + 8)
             cursor <- cursor + 12
             host_text.buf.resize(0)
-            if opcode == 11 or opcode == 18 or opcode == 70:
+            if opcode == 11 or opcode == 18 or opcode == 19 or opcode == 70 or opcode == 81 or opcode == 94 or opcode == 112 or opcode == 132 or opcode == 133 or opcode == 146 or opcode == 147 or opcode == 150:
                 text_start: i64 = cursor
                 text_length: i64 = i32_at(incoming, text_start)
                 cursor <- cursor + 4
@@ -246,6 +481,8 @@ def run_file_mode(request_path: cstr, reply_path: cstr) -> i64:
                 cursor <- cursor + text_length
             running: mutable bool = true
             result: i64 = host_dispatch(opcode, arg0, arg1, &running)
+            if host_opcode_changes_document(opcode):
+                _ = DesignerSession::autosave_recovery()
             append_i32(&reply_bytes, result)
             append_i32(&reply_bytes, host_text.buf.count.i64())
             append_range(&reply_bytes, host_text.buf)
@@ -281,6 +518,9 @@ def append_range(target: mutable darray[u8]&, source: darray[u8]&) -> void:
     while index < source.count.i64():
         target.push(source[index.usize()])
         index <- index + 1
+
+def host_opcode_changes_document(opcode: i64) -> bool:
+    return opcode == 12 or opcode == 13 or opcode == 14 or opcode == 16 or opcode == 17 or opcode == 30 or opcode == 32 or opcode == 33 or opcode == 34 or opcode == 70 or opcode == 82 or opcode == 83 or opcode == 84 or opcode == 85 or opcode == 87 or opcode == 89 or opcode == 94 or opcode == 95 or opcode == 121 or opcode == 122 or opcode == 123 or opcode == 124 or opcode == 125
 
 @link_name("designer_file_read")
 extern host_file_read(path: cstr, out: mutable void&, capacity: usize) -> i64 can[Blocking.IO]
@@ -327,12 +567,14 @@ def run_stream() -> i64:
             arg1: i64 = host_read_i32()
             if arg0 < 0 or arg1 < 0:
                 break
-            if opcode == 11 or opcode == 18 or opcode == 70:
+            if opcode == 11 or opcode == 18 or opcode == 19 or opcode == 70 or opcode == 81 or opcode == 112 or opcode == 132 or opcode == 133 or opcode == 146 or opcode == 147 or opcode == 150:
                 if not host_read_text(&host_text.buf):
                     break
             else:
                 host_text.buf.resize(0)
             result: i64 = host_dispatch(opcode, arg0, arg1, &running)
+            if host_opcode_changes_document(opcode):
+                _ = DesignerSession::autosave_recovery()
             host_write_i32(result)
             host_write_text(DesignText::view_of(host_text.buf))
         return 0
@@ -369,6 +611,8 @@ def run_signal_mode() -> i64:
             if valid:
                 host_text.buf <- payload
                 result <- host_dispatch(opcode, arg0, arg1, &running)
+                if host_opcode_changes_document(opcode):
+                    _ = DesignerSession::autosave_recovery()
             reply.resize(0)
             append_i32(&reply, result)
             append_i32(&reply, host_text.buf.count.i64())
@@ -398,6 +642,8 @@ def run_text_mode(request_path: cstr, reply_path: cstr) -> i64:
         if valid:
             host_text.buf <- payload
             result <- host_dispatch(opcode, arg0, arg1, &running)
+            if host_opcode_changes_document(opcode):
+                _ = DesignerSession::autosave_recovery()
         _ = DesignerSession::snapshot_to("build/host_state.json")
         reply: mutable darray[u8] = []
         append_i32(&reply, result)
@@ -465,7 +711,7 @@ def parse_text_request(line: sview, opcode: mutable i64&, arg0: mutable i64&, ar
         arg0 <- arg0_value
     else:
         return false
-    carries_text: bool = opcode == 11 or opcode == 18 or opcode == 70
+    carries_text: bool = opcode == 11 or opcode == 18 or opcode == 19 or opcode == 70 or opcode == 81 or opcode == 94 or opcode == 112 or opcode == 132 or opcode == 133 or opcode == 146 or opcode == 147 or opcode == 150
     if carries_text:
         if third_space <= second_space + 1:
             return false
@@ -498,7 +744,7 @@ def decode_hex_payload(line: sview, start: i64, stop: i64, out: mutable darray[u
     if length / 2 > DesignLimits::MAX_INPUT_BYTES.i64():
         return false
     out.resize(0)
-    DesignStore::ensure_bytes(&out, (length / 2).usize() + 1)
+    DesignStore::ensure_bytes(out, (length / 2).usize() + 1)
     index: mutable i64 = start
     while index < stop:
         high: i64 = hex_value(line[index])

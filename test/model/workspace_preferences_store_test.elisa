@@ -12,7 +12,7 @@ extern store_test_save_ratios(left: f64, right: f64, bottom: f64) -> i64 can[Blo
 
 module WorkspacePreferencesStoreTest:
     private:
-        def cstr_path(path: mutable darray[u8]&) -> cstr:
+        def cstr_path(path: mutable darray[u8]&) -> cstr can[Unsafe.PointerCast]:
             return (&path[0]).cast[cstr] can Unsafe.PointerCast
 
         def path_buffer(text: sview) -> darray[u8]:

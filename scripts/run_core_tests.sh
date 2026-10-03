@@ -19,6 +19,8 @@ TESTS=(
     test/model/workspace_preferences_test.elisa
     test/model/workspace_preferences_store_test.elisa
     test/model/shell_window_test.elisa
+    test/build/build_job_test.elisa
+    test/build/workspace_task_test.elisa
     test/codegen/design_codegen_test.elisa
     test/codegen/generation_manifest_test.elisa
     test/codegen/source_map_test.elisa
@@ -47,6 +49,21 @@ bash scripts/build_core.sh src/cli/elisa_ide_cli_main.elisa elisa_ide_cli >/dev/
 ./build/elisa_ide_cli validate test/fixtures/unknown-component-form.elisaform.json >/dev/null
 ./build/elisa_ide_cli migrate test/fixtures/legacy-form-v0.elisaform.json build/spikes/legacy-migrated.json >/dev/null
 scripts/smoke_cli_generate.sh
+scripts/smoke_project_generation.sh
+
+# The LSP bridge is a host-side service because Elisa-LSP is an external
+# stdio process. Its framing, limits, lifecycle, and version-gated diagnostics
+# stay covered independently of the document-host binary.
+python3 test/lsp/lsp_client_test.py
+python3 test/lsp/lsp_supervisor_test.py
+python3 test/lsp/workspace_service_test.py
+python3 test/lsp/server_resolution_test.py
+python3 test/source/source_document_test.py
+python3 test/problems/problem_model_test.py
+python3 test/build/build_diagnostics_test.py
+python3 test/debug/dap_client_test.py
+python3 test/profile/profile_artifact_test.py
+python3 test/toolchain/resolver_test.py
 
 # The core document process and its cross-process protocol are UI-independent.
 bash scripts/build_core.sh worker/core/document_host.elisa document_host >/dev/null

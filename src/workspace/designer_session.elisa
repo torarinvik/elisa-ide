@@ -24,9 +24,12 @@ include "../model/design_store.elisa"
 include "../registry/design_registry.elisa"
 include "../schema/design_json_decode.elisa"
 include "../schema/design_json_encode.elisa"
+include "../codegen/source_map_json.elisa"
 include "../validation/design_diagnostics.elisa"
 include "../validation/design_validate.elisa"
 include "../preview/preview_form.elisa"
+include "../lowering/design_lower.elisa"
+include "../codegen/elisa_emit.elisa"
 include "../commands/design_ops.elisa"
 include "../commands/design_command.elisa"
 include "../commands/design_history.elisa"
@@ -38,6 +41,18 @@ include "../../compiler/elisacore_std/elisacore_runtime.elisa"
 include "../../compiler/elisacore_std/collections.elisa"
 include "../../compiler/elisacore_std/elisacore_fileio.elisa"
 
+const MAX_SOURCE_HISTORY_ENTRIES: usize = 256
+const MAX_SOURCE_HISTORY_BYTES: i64 = 8388608
+
+struct SourceHistoryEntry:
+    start: mutable i64
+    before_offset: mutable i64
+    before_length: mutable i64
+    after_offset: mutable i64
+    after_length: mutable i64
+    before_lines: mutable i64
+    after_lines: mutable i64
+
 # Session state is declared at FILE scope, not inside the module.
 # stage1 declines a module-scoped global initializer that references another
 # module once a function in the same module also references it; a top-level
@@ -47,14 +62,42 @@ struct State:
     registry: mutable DesignRegistry::Registry
     form: mutable DesignForms::Form
     project_name: mutable darray[u8]
+    generation_namespace: mutable darray[u8]
     document_path: mutable darray[u8]
     form_path: mutable darray[u8]
     allocator: mutable DesignIds::Allocator
     history: mutable DesignHistory::History
     selection: mutable DesignSelection::Selection
+    clipboard: mutable DesignForms::Form
+    clipboard_roots: mutable darray[DesignIds::DesignId]
+    clipboard_ready: mutable bool
+    selection_anchor: mutable DesignIds::DesignId
+    selection_path: mutable darray[u8]
     diagnostics: mutable DesignDiagnostics::Sink
     status_message: mutable darray[u8]
+    file_projection: mutable darray[u8]
+    generated_source: mutable darray[u8]
+    generated_source_map: mutable darray[u8]
+    source_view_path: mutable darray[u8]
+    source_view_contents: mutable darray[u8]
+    source_view_line_projection: mutable darray[u8]
+    source_view_external_contents: mutable darray[u8]
+    source_view_compare_projection: mutable darray[u8]
+    source_view_external_lines: mutable i64
+    source_view_external_fingerprint: mutable u64
+    source_view_external_snapshot_valid: mutable bool
+    source_history_data: mutable darray[u8]
+    source_history_entries: mutable SourceHistoryEntry[256]
+    source_history_count: mutable i32
+    source_history_cursor: mutable i32
+    source_view_lines: mutable i64
+    source_view_fingerprint: mutable u64
+    source_view_dirty: mutable bool
+    source_view_external_changed: mutable bool
+    source_view_line_truncated: mutable bool
+    source_view_ready: mutable bool
     recovery_dir: mutable darray[u8]
+    recovery_available: mutable bool
     session_ready: mutable bool
     standalone_document: mutable bool
     saved_fingerprint: mutable u64
@@ -63,35 +106,76 @@ struct State:
     inspector_rows: mutable darray[DesignValues::StringRef]
     inspector_values: mutable darray[DesignValues::StringRef]
     inspector_tags: mutable darray[i32]
+    event_keys: mutable darray[DesignValues::StringRef]
+    event_labels: mutable darray[DesignValues::StringRef]
+    event_values: mutable darray[DesignValues::StringRef]
+    event_signatures: mutable darray[DesignValues::StringRef]
     problems_count: mutable i64
     projection_epoch: mutable i64
 
-global mutable state: State = State{
-    registry: DesignRegistry::empty_registry(),
-    form: DesignForms::empty_form(),
-    project_name: [],
-    document_path: [],
-    form_path: [],
-    allocator: DesignIds::allocator(110),
-    history: DesignHistory::empty_history(8 * 1024 * 1024),
-    selection: DesignSelection::empty(),
-    diagnostics: DesignDiagnostics::empty_sink(),
-    status_message: [],
-    recovery_dir: [],
-    session_ready: false,
-    standalone_document: false,
-    saved_fingerprint: 0,
-    hierarchy_rows: [],
-    hierarchy_depth: [],
-    inspector_rows: [],
-    inspector_values: [],
-    inspector_tags: [],
-    problems_count: 0,
-    projection_epoch: 0,
-}
+global mutable state: State = zeroed
+global mutable state_initialized: bool = false
 
 module DesignerSession:
     private:
+        const MAX_HANDLER_SCAN_BYTES: i64 = 67108864
+
+        def initialize_state() -> void:
+            return if state_initialized
+            state.registry <- DesignRegistry::empty_registry()
+            state.form <- DesignForms::empty_form()
+            state.project_name <- []
+            state.generation_namespace <- []
+            state.document_path <- []
+            state.form_path <- []
+            state.allocator <- DesignIds::allocator(110)
+            state.history <- DesignHistory::empty_history(8 * 1024 * 1024)
+            state.selection <- DesignSelection::empty()
+            state.clipboard <- DesignForms::empty_form()
+            state.clipboard_roots <- []
+            state.clipboard_ready <- false
+            state.selection_anchor <- DesignIds::empty()
+            state.selection_path <- []
+            state.diagnostics <- DesignDiagnostics::empty_sink()
+            state.status_message <- []
+            state.file_projection <- []
+            state.generated_source <- []
+            state.generated_source_map <- []
+            state.source_view_path <- []
+            state.source_view_contents <- []
+            state.source_view_line_projection <- []
+            state.source_view_external_contents <- []
+            state.source_view_compare_projection <- []
+            state.source_view_external_lines <- 0
+            state.source_view_external_fingerprint <- 0
+            state.source_view_external_snapshot_valid <- false
+            state.source_history_data <- []
+            state.source_history_count <- 0
+            state.source_history_cursor <- 0
+            state.source_view_lines <- 0
+            state.source_view_fingerprint <- 0
+            state.source_view_dirty <- false
+            state.source_view_external_changed <- false
+            state.source_view_line_truncated <- false
+            state.source_view_ready <- false
+            state.recovery_dir <- []
+            state.recovery_available <- false
+            state.session_ready <- false
+            state.standalone_document <- false
+            state.saved_fingerprint <- 0
+            state.hierarchy_rows <- []
+            state.hierarchy_depth <- []
+            state.inspector_rows <- []
+            state.inspector_values <- []
+            state.inspector_tags <- []
+            state.event_keys <- []
+            state.event_labels <- []
+            state.event_values <- []
+            state.event_signatures <- []
+            state.problems_count <- 0
+            state.projection_epoch <- 0
+            state_initialized <- true
+
         # The session's arrays and values live in the file-scope `state`
         # record above; this module owns the operations over them.
         @link_name("designer_session_set_status")
@@ -112,8 +196,46 @@ module DesignerSession:
                 target.push(text[index])
                 index <- index + 1
 
+        # Recovery paths are kept as owned bytes in State and converted to a
+        # temporary NUL-terminated cstr only at the POSIX boundary.
+        def recovery_directory() -> darray[u8]:
+            path: mutable darray[u8] = []
+            DesignText::push_view(&path, DesignText::view_of(state.recovery_dir))
+            path.push(0)
+            return path
+
+        def recovery_directory_c(directory: mutable darray[u8]&) -> cstr:
+            can Unsafe.PointerCast:
+                return (&directory[0]).cast[cstr] can Unsafe.PointerCast
+
+        def recovery_snapshot_exists() -> bool:
+            return false if state.recovery_dir.count == 0 or DesignIds::is_empty(state.form.id)
+            directory: mutable darray[u8] = recovery_directory()
+            directory_c: cstr = recovery_directory_c(&directory)
+            return DesignRecovery::has_snapshot(directory_c, state.form.id)
+
+        def update_recovery_availability() -> void:
+            state.recovery_available <- recovery_snapshot_exists()
+
+        # Resolve the exact form file currently attached to the session. A
+        # project document stores its manifest path while the form itself is
+        # addressed by the project-relative entry path; standalone forms use
+        # their document path directly. Keeping this policy in one helper
+        # makes external-change checks and saves compare the same bytes.
+        def current_document_path() -> darray[u8]:
+            path: mutable darray[u8] = []
+            return path if state.document_path.count == 0 or state.form_path.count == 0
+            if state.standalone_document:
+                return copy_path(DesignText::view_of(state.document_path))
+            DesignStore::ensure_bytes(&path, state.document_path.count + state.form_path.count + 4)
+            relative_form_path: sview = bytes_view_range(state.form_path, 0, state.form_path.count)
+            push_relative(&path, relative_form_path)
+            path.push(0)
+            return path
+
         @link_name("designer_session_registry_ready")
         def registry_ready() -> void:
+            initialize_state()
             if state.registry.components.count == 0:
                 state.registry <- DesignRegistry::build_builtin()
 
@@ -188,9 +310,9 @@ module DesignerSession:
                 return
             row: mutable i64 = 0
             descriptor_set: DesignRegistry::ComponentDescriptor = state.registry.components[component.usize()]
-            DesignStore::ensure_string_refs(&state.inspector_rows, descriptor_set.properties.count)
-            DesignStore::ensure_string_refs(&state.inspector_values, descriptor_set.properties.count)
-            DesignStore::ensure_i32(&state.inspector_tags, descriptor_set.properties.count)
+            DesignStore::ensure_string_refs(&state.inspector_rows, descriptor_set.properties.count + 2)
+            DesignStore::ensure_string_refs(&state.inspector_values, descriptor_set.properties.count + 2)
+            DesignStore::ensure_i32(&state.inspector_tags, descriptor_set.properties.count + 2)
             while row < descriptor_set.properties.count.i64():
                 descriptor: DesignRegistry::PropertyDescriptor = descriptor_set.properties[row.usize()]
                 key_view: sview = DesignValues::text_of(state.registry.strings, descriptor.key)
@@ -204,6 +326,49 @@ module DesignerSession:
                 state.inspector_rows.push(DesignValues::append(&state.form.strings.bytes, key_view))
                 state.inspector_values.push(DesignValues::append(&state.form.strings.bytes, value_view))
                 state.inspector_tags.push(descriptor.tag.i32())
+                row <- row + 1
+            state.inspector_rows.push(DesignValues::append(&state.form.strings.bytes, "__displayName"))
+            state.inspector_values.push(DesignValues::append(&state.form.strings.bytes, DesignValues::text_of(state.form.strings, node.name)))
+            state.inspector_tags.push(7)
+            state.inspector_rows.push(DesignValues::append(&state.form.strings.bytes, "__generatedSymbol"))
+            state.inspector_values.push(DesignValues::append(&state.form.strings.bytes, DesignValues::text_of(state.form.strings, node.symbol)))
+            state.inspector_tags.push(7)
+
+        # Rebuild the event projection for the primary selection. Every
+        # component descriptor event is shown, including disconnected events,
+        # so the shell can create a handler from an empty field.
+        @link_name("designer_session_rebuild_events")
+        def rebuild_events() -> void:
+            state.event_keys.resize(0)
+            state.event_labels.resize(0)
+            state.event_values.resize(0)
+            state.event_signatures.resize(0)
+            index: i64 = DesignForms::find_node(state.form, state.selection.primary)
+            if index < 0:
+                return
+            node: DesignNodes::Node = state.form.nodes[index.usize()]
+            component: i64 = DesignRegistry::find_component(state.registry, DesignValues::text_of(state.form.strings, node.type_key))
+            if component < 0:
+                return
+            descriptor_set: DesignRegistry::ComponentDescriptor = state.registry.components[component.usize()]
+            DesignStore::ensure_string_refs(&state.event_keys, descriptor_set.events.count)
+            DesignStore::ensure_string_refs(&state.event_labels, descriptor_set.events.count)
+            DesignStore::ensure_string_refs(&state.event_values, descriptor_set.events.count)
+            DesignStore::ensure_string_refs(&state.event_signatures, descriptor_set.events.count)
+            row: mutable i64 = 0
+            while row < descriptor_set.events.count.i64():
+                descriptor: DesignRegistry::EventDescriptor = descriptor_set.events[row.usize()]
+                key: sview = DesignValues::text_of(state.registry.strings, descriptor.key)
+                label: sview = DesignValues::text_of(state.registry.strings, descriptor.label)
+                signature: sview = DesignValues::text_of(state.registry.strings, descriptor.signature)
+                matching: i64 = DesignNodes::event_index(node, state.form.strings, key)
+                handler: mutable sview = ""
+                if matching >= 0:
+                    handler <- DesignValues::text_of(state.form.strings, node.events[matching.usize()].handler)
+                state.event_keys.push(DesignValues::append(&state.form.strings.bytes, key))
+                state.event_labels.push(DesignValues::append(&state.form.strings.bytes, label))
+                state.event_values.push(DesignValues::append(&state.form.strings.bytes, handler))
+                state.event_signatures.push(DesignValues::append(&state.form.strings.bytes, signature))
                 row <- row + 1
 
         @link_name("designer_session_value_to_text")
@@ -259,6 +424,7 @@ module DesignerSession:
         def refresh_projections() -> void:
             rebuild_hierarchy()
             rebuild_inspector()
+            rebuild_events()
             rebuild_problems_filtered()
             state.projection_epoch <- state.projection_epoch + 1
 
@@ -280,6 +446,26 @@ module DesignerSession:
                 index <- index + 1
             return false
 
+        # Validation paths use the stable `nodes[index]...` shape. Keep the
+        # parser deliberately strict so a project-level diagnostic never
+        # selects an unrelated hierarchy row.
+        @link_name("designer_session_diagnostic_node_index")
+        def diagnostic_node_index(path: sview) -> i64:
+            return -1 if path.len < 8
+            return -1 if path[0] != 110 or path[1] != 111 or path[2] != 100 or path[3] != 101 or path[4] != 115 or path[5] != 91
+            index: mutable i64 = 6
+            return -1 if path[index] == 93
+            value: mutable i64 = 0
+            while index < path.len and path[index] != 93:
+                byte: u8 = path[index]
+                return -1 if byte < 48 or byte > 57
+                digit: i64 = (byte - 48).i64()
+                return -1 if value > 214748364 or (value == 214748364 and digit > 7)
+                value <- value * 10 + digit
+                index <- index + 1
+            return -1 if index >= path.len or path[index] != 93
+            return value
+
         @link_name("designer_session_copy_path")
         def copy_path(text: sview) -> darray[u8]:
             path: mutable darray[u8] = []
@@ -299,13 +485,21 @@ module DesignerSession:
                     last_slash <- index
                 index <- index + 1
             if last_slash < 0:
-                DesignText::push_view(&joined, relative)
+                # `joined` belongs to DesignStore's arena. Append directly so
+                # DesignText's separate arena cannot relocate this buffer.
+                index <- 0
+                while index < relative.len:
+                    joined.push(relative[index])
+                    index <- index + 1
             else:
                 index <- 0
                 while index <= last_slash:
                     joined.push(document[index])
                     index <- index + 1
-                DesignText::push_view(&joined, relative)
+                index <- 0
+                while index < relative.len:
+                    joined.push(relative[index])
+                    index <- index + 1
             joined.push(0)
             return joined
 
@@ -333,6 +527,11 @@ module DesignerSession:
                 message_opt: cstr? = getenv("ELISA_DESIGNER_RECOVERY_DIR")
                 if message_opt is value:
                     set_bytes(&state.recovery_dir, sview(value, 0, -1))
+                else:
+                    # The native shell runs from the IDE checkout today, so
+                    # this bounded local default keeps recovery available even
+                    # when the launcher did not inject an application path.
+                    set_bytes(&state.recovery_dir, "build/recovery")
 
         # Open a project manifest or standalone form. All parsing, path
         # resolution, and validation is performed on candidates first; the
@@ -360,6 +559,7 @@ module DesignerSession:
                 candidate_sink: mutable DesignDiagnostics::Sink = DesignDiagnostics::empty_sink()
                 target_relative: mutable darray[u8] = []
                 display_name: mutable sview = ""
+                generation_namespace: mutable sview = ""
                 full_form_path: mutable darray[u8] = []
 
                 if is_project:
@@ -377,6 +577,7 @@ module DesignerSession:
                         return false
                     target_relative <- DesignText::copy_of(relative_view)
                     display_name <- DesignValues::text_of(project.strings, project.name)
+                    generation_namespace <- DesignValues::text_of(project.strings, project.generation_namespace)
                     full_form_path <- join_document_form(path, relative_view)
                     form_bytes: darray[u8] = read_all_cstr(arena, (&full_form_path[0]).cast[cstr] can Unsafe.PointerCast)
                     if form_bytes.count == 0:
@@ -408,12 +609,30 @@ module DesignerSession:
                 set_bytes(&state.document_path, path)
                 set_bytes(&state.form_path, form_path_view)
                 set_bytes(&state.project_name, display_name)
+                set_bytes(&state.generation_namespace, generation_namespace)
+                state.source_view_path.resize(0)
+                state.source_view_contents.resize(0)
+                state.source_view_line_projection.resize(0)
+                state.source_view_external_contents.resize(0)
+                state.source_view_compare_projection.resize(0)
+                state.source_view_external_lines <- 0
+                state.source_view_external_fingerprint <- 0
+                state.source_view_external_snapshot_valid <- false
+                source_history_reset()
+                state.source_view_lines <- 0
+                state.source_view_fingerprint <- 0
+                state.source_view_dirty <- false
+                state.source_view_external_changed <- false
+                state.source_view_line_truncated <- false
+                state.source_view_ready <- false
                 state.saved_fingerprint <- fingerprint
                 state.standalone_document <- is_form
                 state.history <- DesignHistory::empty_history(8 * 1024 * 1024)
                 DesignHistory::mark_saved(state.form, &state.history)
                 DesignSelection::clear_all(&state.selection)
+                state.selection_anchor <- DesignIds::empty()
                 state.diagnostics <- candidate_sink
+                update_recovery_availability()
                 state.session_ready <- true
                 refresh_projections()
                 set_status("Opened document")
@@ -456,6 +675,7 @@ module DesignerSession:
                 state.saved_fingerprint <- DesignSave::file_fingerprint(path)
                 DesignHistory::mark_saved(state.form, &state.history)
                 DesignSelection::clear_all(&state.selection)
+                state.selection_anchor <- DesignIds::empty()
                 state.diagnostics <- candidate_sink
                 refresh_projections()
                 return true
@@ -479,7 +699,9 @@ module DesignerSession:
             set_bytes(&state.project_name, project_display)
             state.document_path.resize(0)
             state.form_path.resize(0)
+            state.generation_namespace.resize(0)
             state.standalone_document <- false
+            state.recovery_available <- false
             state.saved_fingerprint <- 0
             state.history <- DesignHistory::empty_history(8 * 1024 * 1024)
             # A fresh untitled document is the undo/save baseline even though
@@ -490,9 +712,130 @@ module DesignerSession:
             DesignHistory::mark_saved(state.form, &state.history)
             DesignSelection::clear_all(&state.selection)
             DesignSelection::select_only(&state.selection, root_id)
+            DesignIds::copy_into(&state.selection_anchor, &root_id)
             refresh_projections()
             set_status("New state.form created")
             return true
+
+        # Create a complete starter project in a new directory. The path is
+        # the project folder, not a manifest filename. Persistence publishes
+        # the entry form first and the manifest last, then the normal open
+        # transaction attaches the newly-created document to this session.
+        @link_name("designer_session_create_project")
+        def create_project(folder: sview) -> bool:
+            can Memory.Allocate, Memory.Release, Unsafe.PointerCast, Blocking.IO:
+                registry_ready()
+                if folder.len == 0 or has_zero_byte(folder):
+                    set_status("Project folder path is empty or invalid")
+                    return false
+
+                folder_length: mutable i64 = folder.len
+                while folder_length > 1 and folder[folder_length - 1] == 47:
+                    folder_length <- folder_length - 1
+                leaf_start: mutable i64 = 0
+                index: mutable i64 = 0
+                while index < folder_length:
+                    if folder[index] == 47:
+                        leaf_start <- index + 1
+                    index <- index + 1
+                if leaf_start >= folder_length:
+                    set_status("Choose a new project folder")
+                    return false
+                project_name_bytes: mutable darray[u8] = []
+                DesignStore::ensure_bytes(&project_name_bytes, (folder_length - leaf_start).usize() + 1)
+                index <- leaf_start
+                while index < folder_length:
+                    project_name_bytes.push(folder[index])
+                    index <- index + 1
+                project_name_view: sview = bytes_view_range(project_name_bytes, 0, project_name_bytes.count)
+                if (project_name_view.len == 1 and project_name_view[0] == 46) or (project_name_view.len == 2 and project_name_view[0] == 46 and project_name_view[1] == 46):
+                    set_status("Choose a named project folder")
+                    return false
+
+                root_path: mutable darray[u8] = []
+                DesignStore::ensure_bytes(&root_path, folder_length.usize() + 2)
+                index <- 0
+                while index < folder_length:
+                    root_path.push(folder[index])
+                    index <- index + 1
+                root_path.push(0)
+
+                root_view: sview = bytes_view_range(root_path, 0, root_path.count - 1)
+                forms_directory: mutable darray[u8] = []
+                DesignText::push_view(&forms_directory, root_view)
+                DesignText::push_view(&forms_directory, "/forms")
+                forms_directory.push(0)
+
+                form_path: mutable darray[u8] = []
+                DesignText::push_view(&form_path, root_view)
+                DesignText::push_view(&form_path, "/forms/main.elisaform.json")
+                form_path.push(0)
+
+                manifest_path: mutable darray[u8] = []
+                DesignText::push_view(&manifest_path, root_view)
+                manifest_path.push(47)
+                DesignText::push_view(&manifest_path, bytes_view_range(project_name_bytes, 0, project_name_view.len.usize()))
+                DesignText::push_view(&manifest_path, ".elisaproject.json")
+                manifest_path.push(0)
+
+                fresh_form: mutable DesignForms::Form = DesignForms::empty_form()
+                form_id: DesignIds::DesignId = DesignIds::from_text("form-main")
+                DesignIds::copy_into(&fresh_form.id, &form_id)
+                fresh_form.name <- DesignValues::append(&fresh_form.strings.bytes, "Main")
+                fresh_form.module_symbol <- DesignValues::append(&fresh_form.strings.bytes, "main_view")
+                candidate_sink: mutable DesignDiagnostics::Sink = DesignDiagnostics::empty_sink()
+                root_id: mutable DesignIds::DesignId = DesignIds::empty()
+                inserted_root: bool = DesignOps::insert_node_into(&fresh_form, state.registry, DesignIds::empty(), -1, "elisa.ui.column", &state.allocator, &root_id, &candidate_sink)
+                if not inserted_root or DesignIds::is_empty(root_id):
+                    set_status("Cannot create the starter form")
+                    return false
+
+                project: mutable DesignProjects::Project = DesignProjects::empty_project()
+                project_id: DesignIds::DesignId = DesignIds::from_text("project-main")
+                DesignIds::copy_into(&project.id, &project_id)
+                project.name <- DesignValues::append(&project.strings.bytes, project_name_view)
+                project.application_id <- DesignValues::append(&project.strings.bytes, "org.elisa.application")
+                DesignIds::copy_into(&project.entry_form, &form_id)
+                project.generation_namespace <- DesignValues::append(&project.strings.bytes, "App")
+                project.generation_output_root <- DesignValues::append(&project.strings.bytes, "generated")
+
+                form_reference: DesignProjects::FormRef = DesignProjects::FormRef{
+                    id: form_id,
+                    path: DesignValues::append(&project.strings.bytes, "forms/main.elisaform.json"),
+                }
+                project.forms.push(form_reference)
+                DesignIds::copy_into(&project.forms[0].id, &form_id)
+                project.source_roots.push(DesignValues::append(&project.strings.bytes, "src"))
+
+                target_id: DesignIds::DesignId = DesignIds::from_text("desktop")
+                target: DesignProjects::TargetRef = DesignProjects::TargetRef{
+                    id: target_id,
+                    backend: DesignValues::append(&project.strings.bytes, "appkit-canvas"),
+                    renderer: DesignValues::append(&project.strings.bytes, "skia"),
+                }
+                project.targets.push(target)
+                DesignIds::copy_into(&project.targets[0].id, &target_id)
+
+                DesignValidate::validate_project(project, &candidate_sink)
+                DesignValidate::validate_form(fresh_form, state.registry, &candidate_sink)
+                if DesignDiagnostics::has_errors(candidate_sink):
+                    set_status("Starter project failed validation")
+                    return false
+
+                root_c: cstr = (&root_path[0]).cast[cstr] can Unsafe.PointerCast
+                forms_c: cstr = (&forms_directory[0]).cast[cstr] can Unsafe.PointerCast
+                form_c: cstr = (&form_path[0]).cast[cstr] can Unsafe.PointerCast
+                manifest_c: cstr = (&manifest_path[0]).cast[cstr] can Unsafe.PointerCast
+                if not DesignSave::save_new_project(root_c, forms_c, form_c, manifest_c, project, fresh_form):
+                    set_status("Cannot create project in this folder; choose a new path")
+                    return false
+
+                manifest_view: sview = bytes_view_range(manifest_path, 0, manifest_path.count - 1)
+                if not open_document(manifest_view):
+                    set_status("Project files were created but could not be opened")
+                    return false
+                set_status("Created project")
+                return true
 
         @link_name("designer_session_can_open")
         def can_open() -> bool:
@@ -556,19 +899,81 @@ module DesignerSession:
             if row < 0 or row >= state.hierarchy_rows.count.i64():
                 return false
             DesignSelection::select_only(&state.selection, state.hierarchy_rows[row.usize()])
+            DesignIds::copy_into(&state.selection_anchor, &state.hierarchy_rows[row.usize()])
             rebuild_inspector()
+            rebuild_events()
             state.projection_epoch <- state.projection_epoch + 1
             return true
 
-        # Palette: the first component set, with a search filter applied in the
-        # shell. The shell asks for the full list; filtering is presentation.
-        # The built-in palette is a literal so the shell can render it even
-        # when the host program's registry construction is affected by the
-        # stage1 whole-program codegen issue. The registry still owns property
-        # metadata and validation (M01 tests); this is the interactive path.
+        @link_name("designer_session_toggle_hierarchy_row")
+        def toggle_hierarchy_row(row: i64) -> bool:
+            if row < 0 or row >= state.hierarchy_rows.count.i64():
+                return false
+            DesignSelection::toggle_id(&state.selection, state.hierarchy_rows[row.usize()])
+            DesignIds::copy_into(&state.selection_anchor, &state.hierarchy_rows[row.usize()])
+            rebuild_inspector()
+            rebuild_events()
+            state.projection_epoch <- state.projection_epoch + 1
+            return true
+
+        # Shift-click replaces the current set with the contiguous hierarchy
+        # interval between the last plain/toggle click and the clicked row.
+        # The stable-ID anchor stays fixed across repeated Shift-clicks; only
+        # the primary selection follows the clicked endpoint.
+        @link_name("designer_session_select_hierarchy_range")
+        def select_hierarchy_range(row: i64) -> bool:
+            if row < 0 or row >= state.hierarchy_rows.count.i64():
+                return false
+            anchor: mutable i64 = -1
+            if DesignSelection::selected_count(state.selection) > 0 and not DesignIds::is_empty(state.selection_anchor):
+                index: mutable i64 = 0
+                while index < state.hierarchy_rows.count.i64():
+                    if DesignIds::equal(state.hierarchy_rows[index.usize()], state.selection_anchor):
+                        anchor <- index
+                        break
+                    index <- index + 1
+            if anchor < 0:
+                DesignSelection::select_only(&state.selection, state.hierarchy_rows[row.usize()])
+                DesignIds::copy_into(&state.selection_anchor, &state.hierarchy_rows[row.usize()])
+            else:
+                first: i64 = row if row < anchor else anchor
+                last: i64 = anchor if row < anchor else row
+                DesignSelection::select_only(&state.selection, state.hierarchy_rows[first.usize()])
+                index: mutable i64 = first + 1
+                while index <= last:
+                    DesignSelection::include_id(&state.selection, state.hierarchy_rows[index.usize()])
+                    index <- index + 1
+                DesignIds::copy_into(&state.selection.primary, &state.hierarchy_rows[row.usize()])
+            rebuild_inspector()
+            rebuild_events()
+            state.projection_epoch <- state.projection_epoch + 1
+            return true
+
+        # Select directly from an opaque, stable node identity supplied by
+        # another editor surface (for example, the live preview canvas).
+        # Parsing and resolving both happen before selection changes so an
+        # invalid or stale identity leaves the current projection untouched.
+        @link_name("designer_session_select_node_by_id")
+        def select_node_by_id(text: sview) -> bool:
+            id: DesignIds::DesignId = DesignIds::from_text(text)
+            if DesignIds::is_empty(id):
+                return false
+            if DesignForms::find_node(state.form, id) < 0:
+                return false
+            DesignSelection::select_only(&state.selection, id)
+            DesignIds::copy_into(&state.selection_anchor, &id)
+            rebuild_inspector()
+            rebuild_events()
+            state.projection_epoch <- state.projection_epoch + 1
+            return true
+
+        # Palette: the registry order is the stable presentation order; the
+        # shell applies search filtering without changing these indices. Keep
+        # this explicit ABI projection so the UI never receives a live registry
+        # arena or a component descriptor pointer.
         @link_name("designer_session_palette_count")
         def palette_count() -> i64:
-            return 6
+            return 11
 
         @link_name("designer_session_palette_key")
         def palette_key(index: i64) -> sview:
@@ -584,6 +989,16 @@ module DesignerSession:
                 return "elisa.ui.button"
             if index == 5:
                 return "elisa.ui.text_field"
+            if index == 6:
+                return "elisa.ui.check_box"
+            if index == 7:
+                return "elisa.ui.radio_button"
+            if index == 8:
+                return "elisa.ui.slider"
+            if index == 9:
+                return "elisa.ui.progress_bar"
+            if index == 10:
+                return "elisa.ui.scroll"
             return ""
 
         @link_name("designer_session_palette_display")
@@ -600,35 +1015,108 @@ module DesignerSession:
                 return "Button"
             if index == 5:
                 return "Text field"
+            if index == 6:
+                return "Check box"
+            if index == 7:
+                return "Radio button"
+            if index == 8:
+                return "Slider"
+            if index == 9:
+                return "Progress bar"
+            if index == 10:
+                return "Scroll"
             return ""
+
+        # Resolve a drop target to the actual insertion parent. Dropping on a
+        # container inserts into it; dropping on a leaf inserts beside it under
+        # that leaf's parent. The command layer still performs the final graph
+        # and capacity validation, so this helper is only target policy.
+        def resolve_insert_parent(palette_index: i64, hierarchy_row: i64, parent: mutable DesignIds::DesignId&) -> bool:
+            if palette_index < 0 or palette_index >= state.registry.components.count.i64():
+                return false
+            if hierarchy_row < 0 or hierarchy_row >= state.hierarchy_rows.count.i64():
+                return false
+            target: DesignIds::DesignId = state.hierarchy_rows[hierarchy_row.usize()]
+            target_index: i64 = DesignForms::find_node(state.form, target)
+            if target_index < 0:
+                return false
+            target_type: sview = DesignValues::text_of(state.form.strings, state.form.nodes[target_index.usize()].type_key)
+            target_component: i64 = DesignRegistry::find_component(state.registry, target_type)
+            if target_component < 0:
+                return false
+            if state.registry.components[target_component.usize()].can_have_children:
+                DesignIds::copy_into(parent, &target)
+                return true
+            DesignIds::copy_into(parent, &state.form.nodes[target_index.usize()].parent)
+            if DesignIds::is_empty(parent):
+                return false
+            return true
+
+        @link_name("designer_session_can_insert_component_at")
+        def can_insert_component_at(palette_index: i64, hierarchy_row: i64) -> bool:
+            return false if palette_index < 0 or palette_index >= state.registry.components.count.i64()
+            return false if hierarchy_row < 0 or hierarchy_row >= state.hierarchy_rows.count.i64()
+            target: DesignIds::DesignId = state.hierarchy_rows[hierarchy_row.usize()]
+            parent: mutable DesignIds::DesignId = DesignIds::empty()
+            DesignIds::copy_into(&parent, &target)
+            target_index: i64 = DesignForms::find_node(state.form, target)
+            return false if target_index < 0
+            target_type: sview = DesignValues::text_of(state.form.strings, state.form.nodes[target_index.usize()].type_key)
+            target_component: i64 = DesignRegistry::find_component(state.registry, target_type)
+            return false if target_component < 0
+            if not state.registry.components[target_component.usize()].can_have_children:
+                DesignIds::copy_into(&parent, &state.form.nodes[target_index.usize()].parent)
+            return false if DesignIds::is_empty(parent)
+            type_key: sview = palette_key(palette_index)
+            state.diagnostics <- DesignDiagnostics::empty_sink()
+            prepared: DesignCommand::Prepared = DesignCommand::prepare_insert(state.form, state.registry, parent, -1, type_key, &state.allocator, &state.diagnostics)
+            return prepared.valid
+
+        @link_name("designer_session_insert_component_at")
+        def insert_component_at(palette_index: i64, hierarchy_row: i64) -> i64:
+            if palette_index < 0 or palette_index >= state.registry.components.count.i64():
+                set_status("Drop palette index is invalid")
+                return -1
+            if hierarchy_row < 0 or hierarchy_row >= state.hierarchy_rows.count.i64():
+                set_status("Drop hierarchy row is invalid")
+                return -1
+            parent: mutable DesignIds::DesignId = DesignIds::empty()
+            target: DesignIds::DesignId = state.hierarchy_rows[hierarchy_row.usize()]
+            DesignIds::copy_into(&parent, &target)
+            target_index: i64 = DesignForms::find_node(state.form, target)
+            target_component: mutable i64 = -1
+            if target_index >= 0:
+                target_type: sview = DesignValues::text_of(state.form.strings, state.form.nodes[target_index.usize()].type_key)
+                target_component <- DesignRegistry::find_component(state.registry, target_type)
+                if target_component >= 0 and not state.registry.components[target_component.usize()].can_have_children:
+                    DesignIds::copy_into(&parent, &state.form.nodes[target_index.usize()].parent)
+            if DesignIds::is_empty(parent):
+                set_status("Drop target cannot contain this component")
+                return -1
+            type_key: sview = palette_key(palette_index)
+            state.diagnostics <- DesignDiagnostics::empty_sink()
+            prepared: DesignCommand::Prepared = DesignCommand::prepare_insert(state.form, state.registry, parent, -1, type_key, &state.allocator, &state.diagnostics)
+            if not prepared.valid:
+                set_status("Drop rejected; see Problems")
+                return -1
+            if not DesignHistory::apply(&state.history, &state.form, &prepared):
+                set_status("Drop could not be committed")
+                return -1
+            created: DesignIds::DesignId = prepared.created[0.usize()]
+            DesignSelection::select_only(&state.selection, created)
+            DesignIds::copy_into(&state.selection_anchor, &created)
+            refresh_projections()
+            set_status("Inserted component")
+            return hierarchy_row_for(created)
 
         # Insert a palette component under the primary selection when it can
         # nest, otherwise under the selection's parent. Returns the new row's
         # hierarchy position or -1.
         @link_name("designer_session_insert_component")
         def insert_component(palette_index: i64) -> i64:
-            if palette_index < 0 or palette_index >= state.registry.components.count.i64():
-                return -1
-            parent_id: mutable DesignIds::DesignId = state.selection.primary
-            if DesignIds::is_empty(parent_id):
-                parent_id <- state.form.root
-            parent_index: i64 = DesignForms::find_node(state.form, parent_id)
-            if parent_index >= 0 and not state.registry.components[DesignRegistry::find_component(state.registry, DesignValues::text_of(state.form.strings, state.form.nodes[parent_index.usize()].type_key)).usize()].can_have_children:
-                parent_id <- state.form.nodes[parent_index.usize()].parent
-            type_key: sview = DesignValues::text_of(state.registry.strings, state.registry.components[palette_index.usize()].type_key)
-            state.diagnostics <- DesignDiagnostics::empty_sink()
-            prepared: DesignCommand::Prepared = DesignCommand::prepare_insert(state.form, state.registry, parent_id, -1, type_key, &state.allocator, &state.diagnostics)
-            if not prepared.valid:
-                set_status("Insert failed; see Problems")
-                return -1
-            if not DesignHistory::apply(&state.history, &state.form, &prepared):
-                set_status("Insert could not be committed")
-                return -1
-            created: DesignIds::DesignId = prepared.created[0.usize()]
-            DesignSelection::select_only(&state.selection, created)
-            refresh_projections()
-            set_status("Inserted component")
-            return hierarchy_row_for(created)
+            target_row: mutable i64 = hierarchy_row_for(state.selection.primary)
+            target_row <- 0 if target_row < 0 and state.hierarchy_rows.count > 0
+            return insert_component_at(palette_index, target_row)
 
         @link_name("designer_session_hierarchy_row_for")
         def hierarchy_row_for(id: DesignIds::DesignId) -> i64:
@@ -671,8 +1159,171 @@ module DesignerSession:
                 return false
             if prepared.created.count > 0:
                 DesignSelection::select_only(&state.selection, prepared.created[0.usize()])
+                DesignIds::copy_into(&state.selection_anchor, &prepared.created[0.usize()])
             refresh_projections()
             set_status("Duplicated state.selection")
+            return true
+
+        @link_name("designer_session_copy_selection")
+        def copy_selection() -> bool:
+            roots: darray[DesignIds::DesignId] = DesignSelection::roots(state.selection, state.form)
+            if roots.count == 0:
+                set_status("Nothing to copy")
+                return false
+            DesignClone::clone_form_into(&state.clipboard, &state.form)
+            DesignClone::clone_ids_into(&state.clipboard_roots, roots)
+            state.clipboard_ready <- true
+            set_status("Copied selection")
+            return true
+
+        @link_name("designer_session_cut_selection")
+        def cut_selection() -> bool:
+            if not copy_selection():
+                return false
+            if not delete_selection():
+                return false
+            set_status("Cut selection")
+            return true
+
+        @link_name("designer_session_paste_selection")
+        def paste_selection() -> bool:
+            if not state.clipboard_ready or state.clipboard_roots.count == 0:
+                set_status("Clipboard is empty")
+                return false
+            parent: mutable DesignIds::DesignId = DesignIds::empty()
+            if not DesignIds::is_empty(state.selection.primary):
+                selected_index: i64 = DesignForms::find_node(state.form, state.selection.primary)
+                if selected_index >= 0:
+                    selected_type: sview = DesignValues::text_of(state.form.strings, state.form.nodes[selected_index.usize()].type_key)
+                    selected_component: i64 = DesignRegistry::find_component(state.registry, selected_type)
+                    if selected_component >= 0 and state.registry.components[selected_component.usize()].can_have_children:
+                        DesignIds::copy_into(&parent, &state.selection.primary)
+                    else:
+                        DesignIds::copy_into(&parent, &state.form.nodes[selected_index.usize()].parent)
+            if DesignIds::is_empty(parent):
+                DesignIds::copy_into(&parent, &state.form.root)
+            if DesignIds::is_empty(parent):
+                set_status("No paste target is available")
+                return false
+            state.diagnostics <- DesignDiagnostics::empty_sink()
+            prepared: DesignCommand::Prepared = DesignCommand::prepare_paste(state.form, state.registry, state.clipboard, state.clipboard_roots, parent, -1, &state.allocator, &state.diagnostics)
+            if not prepared.valid:
+                set_status("Paste rejected; choose a container")
+                return false
+            if not DesignHistory::apply(&state.history, &state.form, &prepared):
+                set_status("Paste could not be committed")
+                return false
+            if prepared.created.count > 0:
+                DesignSelection::select_only(&state.selection, prepared.created[0.usize()])
+                index: mutable i64 = 1
+                while index < prepared.created.count.i64():
+                    DesignSelection::include_id(&state.selection, prepared.created[index.usize()])
+                    index <- index + 1
+                DesignIds::copy_into(&state.selection_anchor, &prepared.created[0.usize()])
+            refresh_projections()
+            set_status("Pasted selection")
+            return true
+
+        @link_name("designer_session_wrap_selection")
+        def wrap_selection(kind: i64) -> bool:
+            type_key: mutable sview = ""
+            if kind == 0:
+                type_key <- "elisa.ui.row"
+            elif kind == 1:
+                type_key <- "elisa.ui.column"
+            elif kind == 2:
+                type_key <- "elisa.ui.panel"
+            elif kind == 3:
+                type_key <- "elisa.ui.scroll"
+            else:
+                set_status("Unknown wrapper type")
+                return false
+            if state.selection.ids.count == 0:
+                set_status("Select one or more sibling components to wrap")
+                return false
+            state.diagnostics <- DesignDiagnostics::empty_sink()
+            prepared: DesignCommand::Prepared = DesignCommand::prepare_wrap(state.form, state.registry, state.selection.ids, type_key, &state.allocator, &state.diagnostics)
+            if not prepared.valid:
+                set_status("Wrap rejected; select sibling components")
+                return false
+            if not DesignHistory::apply(&state.history, &state.form, &prepared):
+                set_status("Wrap could not be committed")
+                return false
+            if prepared.created.count > 0:
+                DesignSelection::select_only(&state.selection, prepared.created[0.usize()])
+                DesignIds::copy_into(&state.selection_anchor, &prepared.created[0.usize()])
+            refresh_projections()
+            set_status("Wrapped selection")
+            return true
+
+        @link_name("designer_session_unwrap_selection")
+        def unwrap_selection() -> bool:
+            if state.selection.ids.count == 0:
+                set_status("Select a container to unwrap")
+                return false
+            replacement: mutable DesignIds::DesignId = DesignIds::empty()
+            selected_before: i64 = DesignForms::find_node(state.form, state.selection.primary)
+            if selected_before >= 0 and state.form.nodes[selected_before.usize()].children.count > 0:
+                DesignIds::copy_into(&replacement, &state.form.nodes[selected_before.usize()].children[0.usize()])
+            state.diagnostics <- DesignDiagnostics::empty_sink()
+            prepared: DesignCommand::Prepared = DesignCommand::prepare_unwrap(state.form, state.selection.ids, &state.diagnostics)
+            if not prepared.valid:
+                set_status("Unwrap rejected; select one container")
+                return false
+            if not DesignHistory::apply(&state.history, &state.form, &prepared):
+                set_status("Unwrap could not be committed")
+                return false
+            if not DesignIds::is_empty(replacement):
+                DesignSelection::select_only(&state.selection, replacement)
+                DesignIds::copy_into(&state.selection_anchor, &replacement)
+            else:
+                DesignSelection::prune(&state.selection, state.form)
+            refresh_projections()
+            set_status("Unwrapped selection")
+            return true
+
+        @link_name("designer_session_convert_container")
+        def convert_container(kind: i64) -> bool:
+            type_key: mutable sview = ""
+            if kind == 0:
+                type_key <- "elisa.ui.row"
+            elif kind == 1:
+                type_key <- "elisa.ui.column"
+            else:
+                set_status("Unknown container orientation")
+                return false
+            if state.selection.ids.count == 0:
+                set_status("Select a Row or Column to convert")
+                return false
+            state.diagnostics <- DesignDiagnostics::empty_sink()
+            prepared: DesignCommand::Prepared = DesignCommand::prepare_convert_container(state.form, state.registry, state.selection.ids, type_key, &state.diagnostics)
+            if not prepared.valid:
+                set_status("Container conversion rejected")
+                return false
+            if not DesignHistory::apply(&state.history, &state.form, &prepared):
+                set_status("Container conversion could not be committed")
+                return false
+            refresh_projections()
+            set_status("Converted container orientation")
+            return true
+
+        @link_name("designer_session_select_ancestor")
+        def select_ancestor() -> bool:
+            if DesignIds::is_empty(state.selection.primary):
+                set_status("No selected component has an ancestor")
+                return false
+            node_index: i64 = DesignForms::find_node(state.form, state.selection.primary)
+            if node_index < 0:
+                set_status("Selected component no longer exists")
+                return false
+            parent: DesignIds::DesignId = state.form.nodes[node_index.usize()].parent
+            if DesignIds::is_empty(parent):
+                set_status("Selection is already at the form root")
+                return false
+            DesignSelection::select_only(&state.selection, parent)
+            DesignIds::copy_into(&state.selection_anchor, &parent)
+            refresh_projections()
+            set_status("Selected ancestor")
             return true
 
         @link_name("designer_session_reorder_selection")
@@ -704,6 +1355,119 @@ module DesignerSession:
             if not DesignHistory::apply(&state.history, &state.form, &prepared):
                 return false
             refresh_projections()
+            return true
+
+        # Reparent the primary selection into the immediately preceding
+        # sibling. This is the keyboard equivalent of dragging a node onto a
+        # preceding container: the graph command still validates leaf targets,
+        # cycles, child limits, and all selected roots atomically.
+        @link_name("designer_session_indent_selection")
+        def indent_selection() -> bool:
+            if DesignIds::is_empty(state.selection.primary):
+                set_status("Nothing to indent")
+                return false
+            node_index: i64 = DesignForms::find_node(state.form, state.selection.primary)
+            if node_index < 0:
+                return false
+            parent: DesignIds::DesignId = state.form.nodes[node_index.usize()].parent
+            parent_index: i64 = DesignForms::find_node(state.form, parent)
+            if parent_index < 0:
+                set_status("The selected node has no previous sibling container")
+                return false
+            children: darray[DesignIds::DesignId] = state.form.nodes[parent_index.usize()].children
+            position: mutable i64 = -1
+            index: mutable i64 = 0
+            while index < children.count.i64():
+                if DesignIds::equal(children[index.usize()], state.selection.primary):
+                    position <- index
+                    break
+                index <- index + 1
+            if position <= 0:
+                set_status("The selected node has no previous sibling container")
+                return false
+            target: DesignIds::DesignId = children[(position - 1).usize()]
+            state.diagnostics <- DesignDiagnostics::empty_sink()
+            prepared: DesignCommand::Prepared = DesignCommand::prepare_reparent(state.form, state.registry, state.selection.ids, target, -1, &state.diagnostics)
+            if not prepared.valid or not DesignHistory::apply(&state.history, &state.form, &prepared):
+                set_status("Indent rejected; choose a container sibling")
+                return false
+            refresh_projections()
+            set_status("Indented selection into its previous sibling")
+            return true
+
+        # Move the primary selection out of its parent and insert it directly
+        # after that parent in the grandparent's child order.
+        @link_name("designer_session_outdent_selection")
+        def outdent_selection() -> bool:
+            if DesignIds::is_empty(state.selection.primary):
+                set_status("Nothing to outdent")
+                return false
+            node_index: i64 = DesignForms::find_node(state.form, state.selection.primary)
+            if node_index < 0:
+                return false
+            parent: DesignIds::DesignId = state.form.nodes[node_index.usize()].parent
+            parent_index: i64 = DesignForms::find_node(state.form, parent)
+            if parent_index < 0:
+                set_status("The selected node is already at the form root")
+                return false
+            grandparent: DesignIds::DesignId = state.form.nodes[parent_index.usize()].parent
+            grandparent_index: i64 = DesignForms::find_node(state.form, grandparent)
+            if grandparent_index < 0:
+                set_status("The selected node cannot move outside the form root")
+                return false
+            parent_position: mutable i64 = -1
+            siblings: darray[DesignIds::DesignId] = state.form.nodes[grandparent_index.usize()].children
+            index: mutable i64 = 0
+            while index < siblings.count.i64():
+                if DesignIds::equal(siblings[index.usize()], parent):
+                    parent_position <- index
+                    break
+                index <- index + 1
+            if parent_position < 0:
+                return false
+            state.diagnostics <- DesignDiagnostics::empty_sink()
+            prepared: DesignCommand::Prepared = DesignCommand::prepare_reparent(state.form, state.registry, state.selection.ids, grandparent, parent_position + 1, &state.diagnostics)
+            if not prepared.valid or not DesignHistory::apply(&state.history, &state.form, &prepared):
+                set_status("Outdent rejected")
+                return false
+            refresh_projections()
+            set_status("Outdented selection")
+            return true
+
+        # Validate a hierarchy drag target without mutating the document. The
+        # command layer owns cycle, capacity, leaf-target, and multi-selection
+        # checks; the shell uses this query to paint drop feedback before the
+        # pointer is released.
+        @link_name("designer_session_can_reparent_selection_to")
+        def can_reparent_selection_to(hierarchy_row: i64) -> bool:
+            if hierarchy_row < 0 or hierarchy_row >= state.hierarchy_rows.count.i64():
+                return false
+            if state.selection.ids.count == 0:
+                return false
+            target: DesignIds::DesignId = state.hierarchy_rows[hierarchy_row.usize()]
+            state.diagnostics <- DesignDiagnostics::empty_sink()
+            prepared: DesignCommand::Prepared = DesignCommand::prepare_reparent(state.form, state.registry, state.selection.ids, target, -1, &state.diagnostics)
+            return prepared.valid
+
+        @link_name("designer_session_reparent_selection_to")
+        def reparent_selection_to(hierarchy_row: i64) -> bool:
+            if hierarchy_row < 0 or hierarchy_row >= state.hierarchy_rows.count.i64():
+                set_status("Drop target is outside the hierarchy")
+                return false
+            if state.selection.ids.count == 0:
+                set_status("Select a component before dragging it")
+                return false
+            target: DesignIds::DesignId = state.hierarchy_rows[hierarchy_row.usize()]
+            state.diagnostics <- DesignDiagnostics::empty_sink()
+            prepared: DesignCommand::Prepared = DesignCommand::prepare_reparent(state.form, state.registry, state.selection.ids, target, -1, &state.diagnostics)
+            if not prepared.valid:
+                set_status("Drop rejected; choose a different container")
+                return false
+            if not DesignHistory::apply(&state.history, &state.form, &prepared):
+                set_status("Drop could not be committed")
+                return false
+            refresh_projections()
+            set_status("Reparented selection")
             return true
 
         @link_name("designer_session_undo")
@@ -744,6 +1508,1201 @@ module DesignerSession:
         def is_dirty() -> bool:
             return DesignHistory::is_dirty(state.form, state.history)
 
+        # Return the current generated Elisa view without writing it. This is
+        # a read-only source projection: generated ownership remains with the
+        # form/code generator, and the shell must route edits to the form or
+        # handwritten handler source instead of mutating this buffer.
+        @link_name("designer_session_generated_view_source")
+        def generated_view_source() -> sview:
+            state.generated_source.resize(0)
+            state.generated_source_map.resize(0)
+            state.diagnostics <- DesignDiagnostics::empty_sink()
+            lowered: DesignLower::LoweredForm = DesignLower::lower_form(state.form, state.registry, &state.diagnostics)
+            if not lowered.valid:
+                return ""
+            emission: ElisaEmit::Emission = ElisaEmit::emit_view(state.form, state.registry, lowered, &state.diagnostics)
+            if not emission.valid:
+                return ""
+            set_bytes(&state.generated_source, DesignText::view_of(emission.source))
+            encoded_map: darray[u8] = CodegenSourceMapJson::encode(emission.source_map, DesignText::view_of(emission.source))
+            set_bytes(&state.generated_source_map, DesignText::view_of(encoded_map)) if encoded_map.count > 0
+            return DesignText::view_of(state.generated_source)
+
+        @link_name("designer_session_generated_view_source_map")
+        def generated_view_source_map() -> sview:
+            _ = generated_view_source()
+            return DesignText::view_of(state.generated_source_map)
+
+        # Select the owning form node for an exact UTF-8 byte offset in the
+        # current generated view. The generated bytes and map are regenerated
+        # together so a stale source-map lookup fails closed before selection
+        # changes. Property and event spans refine a node span, but selection
+        # remains a stable node identity that the hierarchy/inspector can own.
+        @link_name("designer_session_select_generated_source_byte")
+        def select_generated_source_byte(byte_offset: i64) -> bool:
+            generated: sview = generated_view_source()
+            return false if generated.len == 0
+            state.diagnostics <- DesignDiagnostics::empty_sink()
+            lowered: DesignLower::LoweredForm = DesignLower::lower_form(state.form, state.registry, &state.diagnostics)
+            return false if not lowered.valid
+            emission: ElisaEmit::Emission = ElisaEmit::emit_view(state.form, state.registry, lowered, &state.diagnostics)
+            return false if not emission.valid
+            lookup: CodegenSourceMap::Lookup = CodegenSourceMap::lookup(emission.source_map, generated, byte_offset)
+            return false if not lookup.ok or not lookup.found
+            node_text: sview = CodegenSourceMap::node_id_at(emission.source_map, lookup.span_index)
+            return false if node_text.len == 0
+            return select_node_by_id(node_text)
+
+        def source_utf8_is_valid(bytes: darray[u8]&) -> bool:
+            index: mutable i64 = 0
+            length: i64 = bytes.count.i64()
+            while index < length:
+                first: i64 = bytes[index.usize()].i32().i64()
+                second: mutable i64 = 0
+                third: mutable i64 = 0
+                fourth: mutable i64 = 0
+                if first == 0:
+                    return false
+                if first <= 127:
+                    index <- index + 1
+                elif first >= 194 and first <= 223:
+                    return false if index + 1 >= length
+                    second <- bytes[(index + 1).usize()].i32().i64()
+                    return false if second < 128 or second > 191
+                    index <- index + 2
+                elif first >= 224 and first <= 239:
+                    return false if index + 2 >= length
+                    second <- bytes[(index + 1).usize()].i32().i64()
+                    third <- bytes[(index + 2).usize()].i32().i64()
+                    return false if third < 128 or third > 191
+                    return false if first == 224 and (second < 160 or second > 191)
+                    return false if first == 237 and (second < 128 or second > 159)
+                    return false if first != 224 and first != 237 and (second < 128 or second > 191)
+                    index <- index + 3
+                elif first >= 240 and first <= 244:
+                    return false if index + 3 >= length
+                    second <- bytes[(index + 1).usize()].i32().i64()
+                    third <- bytes[(index + 2).usize()].i32().i64()
+                    fourth <- bytes[(index + 3).usize()].i32().i64()
+                    return false if third < 128 or third > 191 or fourth < 128 or fourth > 191
+                    return false if first == 240 and (second < 144 or second > 191)
+                    return false if first == 244 and (second < 128 or second > 143)
+                    return false if first != 240 and first != 244 and (second < 128 or second > 191)
+                    index <- index + 4
+                else:
+                    return false
+            return true
+
+        # Return the one supported qualification separator in an event handler
+        # symbol. Nested qualification is refused until source generation can
+        # preserve Elisa's full namespace shape.
+        def handler_separator(handler: sview) -> i64:
+            found: mutable i64 = -1
+            index: mutable i64 = 0
+            while index + 1 < handler.len:
+                if handler[index] == 58 and handler[index + 1] == 58:
+                    return -2 if found >= 0
+                    found <- index
+                    index <- index + 2
+                else:
+                    index <- index + 1
+            return found
+
+        def same_handler_module(left: sview, left_separator: i64, right: sview, right_separator: i64) -> bool:
+            return false if left_separator < 0 or right_separator < 0 or left_separator != right_separator
+            index: mutable i64 = 0
+            while index < left_separator:
+                return false if left[index] != right[index]
+                index <- index + 1
+            return true
+
+        struct HandlerCatalog:
+            strings: mutable DesignValues::StringPool
+            entries: mutable darray[DesignValues::StringRef]
+
+        def empty_handler_catalog() -> HandlerCatalog:
+            return HandlerCatalog{strings: DesignValues::empty_pool(), entries: []}
+
+        def handler_catalog_text(catalog: HandlerCatalog&, index: i64) -> sview:
+            return "" if index < 0 or index >= catalog.entries.count.i64()
+            return DesignValues::text_of(catalog.strings, catalog.entries[index.usize()])
+
+        def add_handler_to_catalog(catalog: mutable HandlerCatalog&, handler: sview) -> void:
+            return if handler.len == 0
+            index: mutable i64 = 0
+            while index < catalog.entries.count.i64():
+                if DesignText::equal(handler_catalog_text(catalog, index), handler):
+                    return
+                index <- index + 1
+            entry: DesignValues::StringRef = DesignValues::append(&catalog.strings.bytes, handler)
+            catalog.entries.push(entry)
+
+        def collect_form_handlers(catalog: mutable HandlerCatalog&, form: DesignForms::Form&) -> void:
+            node_index: mutable i64 = 0
+            while node_index < form.nodes.count.i64():
+                event_index: mutable i64 = 0
+                while event_index < form.nodes[node_index.usize()].events.count.i64():
+                    handler: sview = DesignValues::text_of(form.strings, form.nodes[node_index.usize()].events[event_index.usize()].handler)
+                    add_handler_to_catalog(catalog, handler)
+                    event_index <- event_index + 1
+                node_index <- node_index + 1
+
+        def catalog_handler_seen_before(catalog: HandlerCatalog&, index: i64, handler: sview) -> bool:
+            previous: mutable i64 = 0
+            while previous < index:
+                return true if DesignText::equal(handler_catalog_text(catalog, previous), handler)
+                previous <- previous + 1
+            return false
+
+        def catalog_module_seen_before(catalog: HandlerCatalog&, index: i64, handler: sview, separator: i64) -> bool:
+            previous: mutable i64 = 0
+            while previous < index:
+                prior: sview = handler_catalog_text(catalog, previous)
+                if same_handler_module(prior, handler_separator(prior), handler, separator):
+                    return true
+                previous <- previous + 1
+            return false
+
+        def safe_project_form_path(path: sview) -> bool:
+            return false if path.len == 0 or path[0] == 47 or has_zero_byte(path)
+            component_start: mutable i64 = 0
+            index: mutable i64 = 0
+            while index <= path.len:
+                if index == path.len or path[index] == 47:
+                    component_length: i64 = index - component_start
+                    return false if component_length == 0
+                    return false if component_length == 1 and path[component_start] == 46
+                    return false if component_length == 2 and path[component_start] == 46 and path[component_start + 1] == 46
+                    component_start <- index + 1
+                else:
+                    byte: u8 = path[index]
+                    return false if byte < 32 or byte == 127 or byte == 92
+                index <- index + 1
+            return true
+
+        # Collect project-wide handlers from disk while substituting the active
+        # form's in-memory model. This keeps unsaved event edits visible and
+        # makes missing or invalid secondary forms a fail-closed condition.
+        def collect_project_handlers(project_path: sview, catalog: mutable HandlerCatalog&) -> bool can[Memory.Allocate, Memory.Release, Unsafe.PointerCast, Blocking.IO]:
+            manifest_owned: darray[u8] = copy_path(project_path)
+            manifest_c: cstr = (&manifest_owned[0]).cast[cstr] can Unsafe.PointerCast
+            manifest_bytes: mutable darray[u8] = []
+            manifest_length: i64 = PosixFile::read_bytes_result(&manifest_bytes, manifest_c, DesignLimits::MAX_INPUT_BYTES + 1)
+            if manifest_length <= 0 or manifest_length > DesignLimits::MAX_INPUT_BYTES.i64():
+                set_status("Handler scan could not read the project manifest")
+                return false
+            scanned_bytes: mutable i64 = manifest_length
+            project_sink: mutable DesignDiagnostics::Sink = DesignDiagnostics::empty_sink()
+            project: mutable DesignProjects::Project = DesignDecode::decode_project(DesignText::view_of(manifest_bytes), &project_sink)
+            DesignValidate::validate_project(project, &project_sink)
+            if DesignDiagnostics::has_errors(project_sink) or project.forms.count == 0:
+                set_status("Handler scan found an invalid project manifest")
+                return false
+
+            active_form_found: mutable bool = false
+            form_index: mutable i64 = 0
+            while form_index < project.forms.count.i64():
+                reference: DesignProjects::FormRef = project.forms[form_index.usize()]
+                relative_path: sview = DesignValues::text_of(project.strings, reference.path)
+                if not safe_project_form_path(relative_path):
+                    set_status("Handler scan rejected a non-relative project form path")
+                    return false
+                if DesignText::equal(relative_path, DesignText::view_of(state.form_path)):
+                    collect_form_handlers(catalog, state.form)
+                    active_form_found <- true
+                else:
+                    full_path: mutable darray[u8] = join_document_form(project_path, relative_path)
+                    full_path_c: cstr = (&full_path[0]).cast[cstr] can Unsafe.PointerCast
+                    form_bytes: mutable darray[u8] = []
+                    form_length: i64 = PosixFile::read_bytes_result(&form_bytes, full_path_c, DesignLimits::MAX_INPUT_BYTES + 1)
+                    if form_length <= 0 or form_length > DesignLimits::MAX_INPUT_BYTES.i64():
+                        set_status("Handler scan could not read a referenced form")
+                        return false
+                    if scanned_bytes > MAX_HANDLER_SCAN_BYTES - form_length:
+                        set_status("Handler scan exceeded the 64 MiB project-read limit")
+                        return false
+                    scanned_bytes <- scanned_bytes + form_length
+                    form: mutable DesignForms::Form = DesignForms::empty_form()
+                    form_sink: mutable DesignDiagnostics::Sink = DesignDiagnostics::empty_sink()
+                    DesignDecode::decode_form_into(&form, DesignText::view_of(form_bytes), state.registry, &form_sink)
+                    DesignValidate::validate_form(form, state.registry, &form_sink)
+                    if DesignDiagnostics::has_errors(form_sink) or not DesignIds::equal(form.id, reference.id):
+                        set_status("Handler scan found an invalid or mismatched referenced form")
+                        return false
+                    collect_form_handlers(catalog, form)
+                form_index <- form_index + 1
+            if not active_form_found:
+                set_status("Handler scan could not match the active form to the project manifest")
+                return false
+            return active_form_found
+
+        def append_handler_function(source: mutable darray[u8]&, handler: sview, separator: i64, indentation: sview) -> void:
+            DesignText::push_view(source, indentation)
+            DesignText::push_view(source, "def ")
+            start: i64 = 0 if separator < 0 else separator + 2
+            index: mutable i64 = start
+            while index < handler.len:
+                DesignText::push_char(source, handler[index])
+                index <- index + 1
+            DesignText::push_view(source, "(widget: usize, event: i32) -> void:\n")
+            if separator >= 0:
+                DesignText::push_view(source, "            # TODO: Add this event's application behavior.\n")
+                DesignText::push_view(source, "            pass\n\n")
+            else:
+                DesignText::push_view(source, "    # TODO: Add this event's application behavior.\n")
+                DesignText::push_view(source, "    pass\n\n")
+
+        def build_handler_source(catalog: HandlerCatalog&) -> darray[u8]:
+            source: mutable darray[u8] = []
+            has_handler: mutable bool = false
+            DesignText::push_view(&source, "# User-owned event handlers for this Elisa IDE project.\n")
+            DesignText::push_view(&source, "# Elisa IDE creates missing stubs without replacing this file.\n\n")
+            index: mutable i64 = 0
+            while index < catalog.entries.count.i64():
+                handler: sview = handler_catalog_text(catalog, index)
+                separator: i64 = handler_separator(handler)
+                if separator >= 0 and not catalog_module_seen_before(catalog, index, handler, separator):
+                    DesignText::push_view(&source, "module ")
+                    copy_index: mutable i64 = 0
+                    while copy_index < separator:
+                        DesignText::push_char(&source, handler[copy_index])
+                        copy_index <- copy_index + 1
+                    DesignText::push_view(&source, ":\n    public:\n")
+                    group_index: mutable i64 = 0
+                    while group_index < catalog.entries.count.i64():
+                        grouped: sview = handler_catalog_text(catalog, group_index)
+                        grouped_separator: i64 = handler_separator(grouped)
+                        if same_handler_module(grouped, grouped_separator, handler, separator):
+                            append_handler_function(&source, grouped, grouped_separator, "        ")
+                            has_handler <- true
+                        group_index <- group_index + 1
+                elif separator == -1 and not catalog_handler_seen_before(catalog, index, handler):
+                    append_handler_function(&source, handler, -1, "    ")
+                    has_handler <- true
+                index <- index + 1
+            if not has_handler:
+                DesignText::push_view(&source, "global mutable handler_source_ready: i64 = 1\n")
+            return source
+
+        @link_name("designer_session_open_or_create_handlers")
+        def open_or_create_handlers() -> bool:
+            can Memory.Allocate, Memory.Release, Unsafe.PointerCast, Blocking.IO:
+                if state.document_path.count == 0 or state.standalone_document:
+                    set_status("Open a project before opening project handlers")
+                    return false
+                project_path: sview = DesignText::view_of(state.document_path)
+                handler_path: mutable darray[u8] = join_document_form(project_path, "src/main_handlers.elisa")
+                handler_path_view: sview = bytes_view_range(handler_path, 0, handler_path.count - 1)
+                handler_path_c: cstr = (&handler_path[0]).cast[cstr] can Unsafe.PointerCast
+                existing: mutable darray[u8] = []
+                amount: i64 = PosixFile::read_bytes_result(&existing, handler_path_c, 1048577)
+                if amount >= 0:
+                    if open_source(handler_path_view):
+                        set_status("Opened project handler source for editing")
+                        return true
+                    return false
+                if not PosixFile::read_error_is_not_found(amount):
+                    set_status("Cannot inspect project handler source")
+                    return false
+
+                catalog: mutable HandlerCatalog = empty_handler_catalog()
+                if not collect_project_handlers(project_path, &catalog):
+                    return false
+                node_index: mutable i64 = 0
+                while node_index < catalog.entries.count.i64():
+                    handler: sview = handler_catalog_text(catalog, node_index)
+                    if handler_separator(handler) == -2:
+                        set_status("Nested handler namespaces need a handwritten handler file")
+                        return false
+                    node_index <- node_index + 1
+
+                source_directory: mutable darray[u8] = join_document_form(project_path, "src")
+                directory_c: cstr = (&source_directory[0]).cast[cstr] can Unsafe.PointerCast
+                if not PosixFile::ensure_directory(directory_c):
+                    set_status("Cannot create the project src directory")
+                    return false
+                generated: darray[u8] = build_handler_source(catalog)
+                publication: i64 error[FileReplaceError] = PosixFile::atomic_write_new(handler_path_c, DesignText::view_of(generated))
+                written: i64 = catch publication:
+                    value:
+                        value
+                    FileReplaceError.DestinationExists:
+                        -2
+                    FileReplaceError.CommittedButNotDurable:
+                        generated.count.i64()
+                    error e:
+                        -1
+                if written == -2:
+                    if open_source(handler_path_view):
+                        set_status("Opened concurrently created project handler source")
+                        return true
+                    return false
+                if written < 0:
+                    set_status("Could not safely create project handler source")
+                    return false
+                if not open_source(handler_path_view):
+                    return false
+                set_status("Created project-wide handler stubs")
+                return true
+
+        @link_name("designer_session_open_source")
+        def open_source(path: sview) -> bool:
+            can Memory.Allocate, Memory.Release, Unsafe.PointerCast, Blocking.IO:
+                if path.len == 0 or has_zero_byte(path) or not has_suffix(path, ".elisa"):
+                    set_status("Open a valid .elisa source file")
+                    return false
+                owned_path: darray[u8] = copy_path(path)
+                path_c: cstr = (&owned_path[0]).cast[cstr] can Unsafe.PointerCast
+                candidate: mutable darray[u8] = []
+                amount: i64 = PosixFile::read_bytes_result(&candidate, path_c, 1048577)
+                if amount < 0:
+                    set_status("Cannot read Elisa source file")
+                    return false
+                if amount > 1048576:
+                    set_status("Elisa source exceeds the 1 MiB inspection limit")
+                    return false
+                if not source_utf8_is_valid(candidate):
+                    set_status("Elisa source is not valid UTF-8 text")
+                    return false
+                line_count: mutable i64 = 1
+                line_index: mutable i64 = 0
+                while line_index < amount:
+                    line_count <- line_count + 1 if candidate[line_index.usize()] == 10
+                    line_index <- line_index + 1
+                set_bytes(&state.source_view_path, path)
+                set_bytes(&state.source_view_contents, DesignText::view_of(candidate))
+                state.source_view_line_projection.resize(0)
+                state.source_view_external_contents.resize(0)
+                state.source_view_compare_projection.resize(0)
+                state.source_view_external_lines <- 0
+                state.source_view_external_fingerprint <- 0
+                state.source_view_external_snapshot_valid <- false
+                source_history_reset()
+                state.source_view_lines <- line_count
+                state.source_view_fingerprint <- Fingerprint::fnv1a64(DesignText::view_of(candidate))
+                state.source_view_dirty <- false
+                state.source_view_external_changed <- false
+                state.source_view_line_truncated <- false
+                state.source_view_ready <- true
+                set_status("Opened Elisa source for editing")
+                return true
+
+        @link_name("designer_session_source_view_is_open")
+        def source_view_is_open() -> bool:
+            return state.source_view_ready
+
+        @link_name("designer_session_source_view_path")
+        def source_view_path() -> sview:
+            return DesignText::view_of(state.source_view_path)
+
+        @link_name("designer_session_source_view_line_count")
+        def source_view_line_count() -> i64:
+            return 0 if not state.source_view_ready
+            return state.source_view_lines
+
+        @link_name("designer_session_source_view_line_byte_start")
+        def source_view_line_byte_start(wanted: i64) -> i64:
+            return -1 if not state.source_view_ready or wanted < 0 or wanted >= state.source_view_lines
+            return source_line_start(wanted)
+
+        @link_name("designer_session_source_view_byte_count")
+        def source_view_byte_count() -> i64:
+            return 0 if not state.source_view_ready
+            return state.source_view_contents.count.i64()
+
+        @link_name("designer_session_source_view_line_for_byte")
+        def source_view_line_for_byte(offset: i64) -> i64:
+            return -1 if not state.source_view_ready or offset < 0 or offset > state.source_view_contents.count.i64()
+            line: mutable i64 = 0
+            index: mutable i64 = 0
+            while index < offset:
+                line <- line + 1 if state.source_view_contents[index.usize()] == 10
+                index <- index + 1
+            return line
+
+        @link_name("designer_session_source_view_find")
+        def source_view_find(query: sview, from_byte: i64, forward: bool) -> i64:
+            return -1 if not state.source_view_ready
+            if query.len <= 0 or query.len > 256 or from_byte < 0:
+                set_status("Find needs nonempty text up to 256 UTF-8 bytes")
+                return -1
+            query_bytes: darray[u8] = DesignText::copy_of(query)
+            if not source_utf8_is_valid(query_bytes):
+                set_status("Find text must be valid UTF-8")
+                return -1
+            index: mutable i64 = 0
+            while index < query.len:
+                if query[index] == 0:
+                    set_status("Find text cannot contain a NUL byte")
+                    return -1
+                index <- index + 1
+            maximum_start: i64 = state.source_view_contents.count.i64() - query.len
+            return -1 if maximum_start < 0
+            candidate: mutable i64 = from_byte
+            if forward:
+                while candidate <= maximum_start:
+                    if source_utf8_boundary(candidate):
+                        matched: mutable bool = true
+                        compare_index: mutable i64 = 0
+                        while matched and compare_index < query.len:
+                            matched <- state.source_view_contents[(candidate + compare_index).usize()] == query[compare_index]
+                            compare_index <- compare_index + 1
+                        return candidate if matched
+                    candidate <- candidate + 1
+                return -1
+            candidate <- maximum_start if candidate > maximum_start
+            while candidate >= 0:
+                if source_utf8_boundary(candidate):
+                    matched: mutable bool = true
+                    compare_index: mutable i64 = 0
+                    while matched and compare_index < query.len:
+                        matched <- state.source_view_contents[(candidate + compare_index).usize()] == query[compare_index]
+                        compare_index <- compare_index + 1
+                    return candidate if matched
+                candidate <- candidate - 1
+            return -1
+
+        @link_name("designer_session_source_view_dirty")
+        def source_view_dirty() -> bool:
+            return state.source_view_ready and state.source_view_dirty
+
+        @link_name("designer_session_source_view_can_undo")
+        def source_view_can_undo() -> bool:
+            return state.source_view_ready and state.source_history_cursor > 0
+
+        @link_name("designer_session_source_view_can_redo")
+        def source_view_can_redo() -> bool:
+            return state.source_view_ready and state.source_history_cursor < state.source_history_count
+
+        @link_name("designer_session_source_view_undo")
+        def source_view_undo() -> bool:
+            if not source_view_can_undo():
+                set_status("Nothing to undo in Elisa source")
+                return false
+            if not source_history_apply(state.source_history_cursor - 1, true):
+                return false
+            state.source_history_cursor <- state.source_history_cursor - 1
+            set_status("Undid Elisa source edit")
+            return true
+
+        @link_name("designer_session_source_view_redo")
+        def source_view_redo() -> bool:
+            if not source_view_can_redo():
+                set_status("Nothing to redo in Elisa source")
+                return false
+            if not source_history_apply(state.source_history_cursor, false):
+                return false
+            state.source_history_cursor <- state.source_history_cursor + 1
+            set_status("Redid Elisa source edit")
+            return true
+
+        @link_name("designer_session_source_view_line_truncated")
+        def source_view_line_truncated() -> bool:
+            return state.source_view_line_truncated
+
+        def source_line_start(wanted: i64) -> i64:
+            start: mutable i64 = 0
+            line: mutable i64 = 0
+            index: mutable i64 = 0
+            while index < state.source_view_contents.count.i64() and line < wanted:
+                if state.source_view_contents[index.usize()] == 10:
+                    line <- line + 1
+                    start <- index + 1
+                index <- index + 1
+            return start
+
+        def source_line_end(start: i64) -> i64:
+            finish: mutable i64 = start
+            while finish < state.source_view_contents.count.i64() and state.source_view_contents[finish.usize()] != 10:
+                finish <- finish + 1
+            return finish
+
+        def source_utf8_boundary(offset: i64) -> bool:
+            length: i64 = state.source_view_contents.count.i64()
+            return false if offset < 0 or offset > length
+            return true if offset == 0 or offset == length
+            byte: i64 = state.source_view_contents[offset.usize()].i32().i64()
+            return byte < 128 or byte >= 192
+
+        def source_view_query_matches(query: darray[u8]&, candidate: i64) -> bool:
+            return false if candidate < 0 or candidate + query.count.i64() > state.source_view_contents.count.i64()
+            return false if not source_utf8_boundary(candidate)
+            matched: mutable bool = true
+            index: mutable i64 = 0
+            while matched and index < query.count.i64():
+                matched <- state.source_view_contents[(candidate + index).usize()] == query[index.usize()]
+                index <- index + 1
+            return matched
+
+        def source_line_count_in(bytes: darray[u8]&) -> i64:
+            lines: mutable i64 = 1
+            index: mutable i64 = 0
+            while index < bytes.count.i64():
+                lines <- lines + 1 if bytes[index.usize()] == 10
+                index <- index + 1
+            return lines
+
+        def source_history_reset() -> void:
+            state.source_history_data.resize(0)
+            state.source_history_count <- 0
+            state.source_history_cursor <- 0
+
+        def source_history_drop_oldest() -> void:
+            return if state.source_history_count <= 0
+            first: SourceHistoryEntry = state.source_history_entries[0.usize()]
+            removed_bytes: i64 = first.before_length + first.after_length
+            old_size: i64 = state.source_history_data.count.i64()
+            move_index: mutable i64 = removed_bytes
+            while move_index < old_size:
+                state.source_history_data[(move_index - removed_bytes).usize()] <- state.source_history_data[move_index.usize()]
+                move_index <- move_index + 1
+            state.source_history_data.resize((old_size - removed_bytes).usize())
+            read_index: mutable i32 = 1
+            write_index: mutable i32 = 0
+            while read_index < state.source_history_count:
+                moved: SourceHistoryEntry = state.source_history_entries[read_index.usize()]
+                moved.before_offset <- moved.before_offset - removed_bytes
+                moved.after_offset <- moved.after_offset - removed_bytes
+                state.source_history_entries[write_index.usize()] <- moved
+                read_index <- read_index + 1
+                write_index <- write_index + 1
+            state.source_history_count <- state.source_history_count - 1
+            state.source_history_cursor <- state.source_history_cursor - 1 if state.source_history_cursor > 0
+
+        def source_history_record(start: i64, before_length: i64, after: darray[u8]&, after_lines: i64) -> void:
+            return if start < 0 or before_length < 0 or start + before_length > state.source_view_contents.count.i64()
+            identical: mutable bool = before_length == after.count.i64()
+            compare_index: mutable i64 = 0
+            while identical and compare_index < before_length:
+                identical <- state.source_view_contents[(start + compare_index).usize()] == after[compare_index.usize()]
+                compare_index <- compare_index + 1
+            return if identical
+            if state.source_history_cursor < state.source_history_count:
+                keep_count: i32 = state.source_history_cursor
+                keep_bytes: mutable i64 = 0
+                if keep_count > 0:
+                    previous: SourceHistoryEntry = state.source_history_entries[(keep_count - 1).usize()]
+                    keep_bytes <- previous.after_offset + previous.after_length
+                state.source_history_data.resize(keep_bytes.usize())
+                state.source_history_count <- keep_count
+            entry_bytes: i64 = before_length + after.count.i64()
+            while state.source_history_count > 0 and (state.source_history_count.usize() >= MAX_SOURCE_HISTORY_ENTRIES or state.source_history_data.count.i64() + entry_bytes > MAX_SOURCE_HISTORY_BYTES):
+                source_history_drop_oldest()
+            return if entry_bytes > MAX_SOURCE_HISTORY_BYTES
+            start_offset: i64 = state.source_history_data.count.i64()
+            DesignStore::ensure_bytes(&state.source_history_data, (start_offset + entry_bytes).usize() + 1)
+            copy_index: mutable i64 = 0
+            while copy_index < before_length:
+                state.source_history_data.push(state.source_view_contents[(start + copy_index).usize()])
+                copy_index <- copy_index + 1
+            before_offset: i64 = start_offset
+            after_offset: i64 = state.source_history_data.count.i64()
+            copy_index <- 0
+            while copy_index < after.count.i64():
+                state.source_history_data.push(after[copy_index.usize()])
+                copy_index <- copy_index + 1
+            entry_index: i32 = state.source_history_count
+            state.source_history_entries[entry_index.usize()] <- SourceHistoryEntry{
+                start: start,
+                before_offset: before_offset,
+                before_length: before_length,
+                after_offset: after_offset,
+                after_length: after.count.i64(),
+                before_lines: state.source_view_lines,
+                after_lines: after_lines,
+            }
+            state.source_history_count <- state.source_history_count + 1
+            state.source_history_cursor <- state.source_history_count
+
+        def source_history_apply(entry_index: i32, undoing: bool) -> bool:
+            if entry_index < 0 or entry_index >= state.source_history_count:
+                return false
+            entry: SourceHistoryEntry = state.source_history_entries[entry_index.usize()]
+            remove_length: i64 = entry.after_length if undoing else entry.before_length
+            restore_offset: i64 = entry.before_offset if undoing else entry.after_offset
+            restore_length: i64 = entry.before_length if undoing else entry.after_length
+            next_lines: i64 = entry.before_lines if undoing else entry.after_lines
+            if entry.start < 0 or entry.start + remove_length > state.source_view_contents.count.i64():
+                set_status("Source undo history no longer matches the open buffer")
+                return false
+            next_size: i64 = state.source_view_contents.count.i64() - remove_length + restore_length
+            if next_size > 1048576:
+                set_status("Source undo would exceed the 1 MiB safety limit")
+                return false
+            updated: mutable darray[u8] = []
+            DesignStore::ensure_bytes(&updated, next_size.usize() + 1)
+            copy_index: mutable i64 = 0
+            while copy_index < entry.start:
+                updated.push(state.source_view_contents[copy_index.usize()])
+                copy_index <- copy_index + 1
+            copy_index <- 0
+            while copy_index < restore_length:
+                updated.push(state.source_history_data[(restore_offset + copy_index).usize()])
+                copy_index <- copy_index + 1
+            copy_index <- entry.start + remove_length
+            while copy_index < state.source_view_contents.count.i64():
+                updated.push(state.source_view_contents[copy_index.usize()])
+                copy_index <- copy_index + 1
+            if not source_utf8_is_valid(updated):
+                set_status("Source undo history contains invalid UTF-8")
+                return false
+            set_bytes(&state.source_view_contents, DesignText::view_of(updated))
+            state.source_view_lines <- next_lines
+            state.source_view_dirty <- Fingerprint::fnv1a64(DesignText::view_of(state.source_view_contents)) != state.source_view_fingerprint
+            return true
+
+        def source_disk_matches_baseline() -> bool:
+            owned_path: darray[u8] = copy_path(DesignText::view_of(state.source_view_path))
+            path_c: mutable cstr = ""
+            can Unsafe.PointerCast:
+                path_c <- (&owned_path[0]).cast[cstr] can Unsafe.PointerCast
+            current: mutable darray[u8] = []
+            amount: i64 = PosixFile::read_bytes_result(&current, path_c, 1048577)
+            if amount < 0 or amount > 1048576 or not source_utf8_is_valid(current):
+                state.source_view_external_changed <- true
+                state.source_view_external_contents.resize(0)
+                state.source_view_external_lines <- 0
+                state.source_view_external_fingerprint <- 0
+                state.source_view_external_snapshot_valid <- false
+                set_status("Source file is missing or unreadable; save is blocked until you reopen it")
+                return false
+            current_fingerprint: u64 = Fingerprint::fnv1a64(DesignText::view_of(current))
+            if current_fingerprint != state.source_view_fingerprint:
+                set_bytes(&state.source_view_external_contents, DesignText::view_of(current))
+                state.source_view_external_lines <- source_line_count_in(current)
+                state.source_view_external_fingerprint <- current_fingerprint
+                state.source_view_external_snapshot_valid <- true
+                state.source_view_external_changed <- true
+                set_status("Source file changed on disk; save is blocked to protect the external edit")
+                return false
+            state.source_view_external_changed <- false
+            state.source_view_external_contents.resize(0)
+            state.source_view_external_lines <- 0
+            state.source_view_external_fingerprint <- 0
+            state.source_view_external_snapshot_valid <- false
+            return true
+
+        @link_name("designer_session_source_view_check_external_change")
+        def source_view_check_external_change() -> bool:
+            return false if not state.source_view_ready
+            _ = source_disk_matches_baseline()
+            return state.source_view_external_changed
+
+        @link_name("designer_session_source_view_external_changed")
+        def source_view_external_changed() -> bool:
+            return state.source_view_ready and state.source_view_external_changed
+
+        @link_name("designer_session_source_view_external_snapshot_available")
+        def source_view_external_snapshot_available() -> bool:
+            return state.source_view_ready and state.source_view_external_changed and state.source_view_external_snapshot_valid
+
+        @link_name("designer_session_source_view_external_line_count")
+        def source_view_external_line_count() -> i64:
+            return 0 if not state.source_view_ready or not state.source_view_external_snapshot_valid
+            return state.source_view_external_lines
+
+        @link_name("designer_session_source_view_external_line")
+        def source_view_external_line(wanted: i64) -> sview:
+            state.source_view_line_projection.resize(0)
+            state.source_view_line_truncated <- false
+            return "" if not state.source_view_external_snapshot_valid or wanted < 0 or wanted >= state.source_view_external_lines
+            start: mutable i64 = 0
+            line: mutable i64 = 0
+            while start < state.source_view_external_contents.count.i64() and line < wanted:
+                if state.source_view_external_contents[start.usize()] == 10:
+                    line <- line + 1
+                start <- start + 1
+            finish: mutable i64 = start
+            while finish < state.source_view_external_contents.count.i64() and state.source_view_external_contents[finish.usize()] != 10:
+                finish <- finish + 1
+            if finish > start and state.source_view_external_contents[(finish - 1).usize()] == 13:
+                finish <- finish - 1
+            shown: mutable i64 = finish - start
+            clipped: bool = shown > 768
+            shown <- 768 if clipped
+            state.source_view_line_truncated <- clipped
+            DesignStore::ensure_bytes(&state.source_view_line_projection, 773)
+            index: mutable i64 = 0
+            while index < shown:
+                state.source_view_line_projection.push(state.source_view_external_contents[(start + index).usize()])
+                index <- index + 1
+            if clipped:
+                state.source_view_line_projection.push(32)
+                state.source_view_line_projection.push(46)
+                state.source_view_line_projection.push(46)
+                state.source_view_line_projection.push(46)
+            return DesignText::view_of(state.source_view_line_projection)
+
+        @link_name("designer_session_source_view_compare_projection")
+        def source_view_compare_projection() -> sview:
+            state.source_view_compare_projection.resize(0)
+            return "" if not state.source_view_ready or not state.source_view_external_snapshot_valid
+            # Reserve the bounded output in the document arena. This projection
+            # outlives this call, so appending through DesignText's temporary
+            # arena would leave the returned view backed by zero-filled bytes.
+            DesignStore::ensure_bytes(&state.source_view_compare_projection, 16384)
+            source_compare_append("Line-aligned source comparison (moved lines appear as edits)\n")
+            source_compare_append("- local buffer   + current disk snapshot\n")
+            local_lines: i64 = state.source_view_lines
+            disk_lines: i64 = state.source_view_external_lines
+            line_limit: i64 = local_lines if local_lines > disk_lines else disk_lines
+            local_start: mutable i64 = 0
+            disk_start: mutable i64 = 0
+            line_index: mutable i64 = 0
+            changed_lines: mutable i64 = 0
+            truncated: mutable bool = false
+            copy_index: mutable i64 = 0
+            while line_index < line_limit:
+                local_present: bool = line_index < local_lines
+                disk_present: bool = line_index < disk_lines
+                local_raw_finish: mutable i64 = local_start
+                disk_raw_finish: mutable i64 = disk_start
+                if local_present:
+                    local_raw_finish <- source_line_end(local_start)
+                if disk_present:
+                    while disk_raw_finish < state.source_view_external_contents.count.i64() and state.source_view_external_contents[disk_raw_finish.usize()] != 10:
+                        disk_raw_finish <- disk_raw_finish + 1
+                local_finish: mutable i64 = local_raw_finish
+                disk_finish: mutable i64 = disk_raw_finish
+                if local_finish > local_start and state.source_view_contents[(local_finish - 1).usize()] == 13:
+                    local_finish <- local_finish - 1
+                if disk_finish > disk_start and state.source_view_external_contents[(disk_finish - 1).usize()] == 13:
+                    disk_finish <- disk_finish - 1
+                local_length: i64 = local_finish - local_start if local_present else 0
+                disk_length: i64 = disk_finish - disk_start if disk_present else 0
+                same: mutable bool = local_present == disk_present and local_length == disk_length
+                compare_index: mutable i64 = 0
+                while same and compare_index < local_length:
+                    same <- state.source_view_contents[(local_start + compare_index).usize()] == state.source_view_external_contents[(disk_start + compare_index).usize()]
+                    compare_index <- compare_index + 1
+                if not same:
+                    if changed_lines >= 128 or state.source_view_compare_projection.count.i64() >= 14500:
+                        truncated <- true
+                        break
+                    source_compare_append("@@ line ")
+                    source_compare_append_i64(line_index + 1)
+                    source_compare_append(" @@\n")
+                    if local_present:
+                        source_compare_append("- local: ")
+                        preview: mutable i64 = local_length
+                        preview <- 320 if preview > 320
+                        while preview > 0 and local_start + preview < state.source_view_contents.count.i64() and state.source_view_contents[(local_start + preview).usize()] >= 128 and state.source_view_contents[(local_start + preview).usize()] < 192:
+                            preview <- preview - 1
+                        copy_index <- 0
+                        while copy_index < preview:
+                            state.source_view_compare_projection.push(state.source_view_contents[(local_start + copy_index).usize()])
+                            copy_index <- copy_index + 1
+                        if preview < local_length:
+                            source_compare_append(" ...")
+                        state.source_view_compare_projection.push(10)
+                    else:
+                        source_compare_append("- local: <no line>\n")
+                    if disk_present:
+                        source_compare_append("+ disk:  ")
+                        preview: mutable i64 = disk_length
+                        preview <- 320 if preview > 320
+                        while preview > 0 and disk_start + preview < state.source_view_external_contents.count.i64() and state.source_view_external_contents[(disk_start + preview).usize()] >= 128 and state.source_view_external_contents[(disk_start + preview).usize()] < 192:
+                            preview <- preview - 1
+                        copy_index <- 0
+                        while copy_index < preview:
+                            state.source_view_compare_projection.push(state.source_view_external_contents[(disk_start + copy_index).usize()])
+                            copy_index <- copy_index + 1
+                        if preview < disk_length:
+                            source_compare_append(" ...")
+                        state.source_view_compare_projection.push(10)
+                    else:
+                        source_compare_append("+ disk:  <no line>\n")
+                    changed_lines <- changed_lines + 1
+                if local_present:
+                    local_start <- local_raw_finish + 1 if local_raw_finish < state.source_view_contents.count.i64() else local_raw_finish
+                if disk_present:
+                    disk_start <- disk_raw_finish + 1 if disk_raw_finish < state.source_view_external_contents.count.i64() else disk_raw_finish
+                line_index <- line_index + 1
+            if truncated:
+                source_compare_append("... comparison output capped at 128 changed lines or 16 KiB ...\n")
+            if changed_lines == 0:
+                source_compare_append("No line-text differences; only file metadata or line-ending bytes may differ.\n")
+            return DesignText::view_of(state.source_view_compare_projection)
+
+        def source_compare_append(text: sview) -> void:
+            index: mutable i64 = 0
+            while index < text.len:
+                state.source_view_compare_projection.push(text[index])
+                index <- index + 1
+
+        def source_compare_append_i64(value: i64) -> void:
+            if value >= 10:
+                source_compare_append_i64(value / 10)
+            state.source_view_compare_projection.push(48 + (value % 10).u8())
+
+        @link_name("designer_session_source_view_edit_line")
+        def source_view_edit_line(wanted: i64, replacement: sview) -> bool:
+            can Memory.Allocate, Memory.Release, Unsafe.PointerCast, Blocking.IO:
+                if not state.source_view_ready or wanted < 0 or wanted >= state.source_view_lines:
+                    set_status("The source line is no longer available")
+                    return false
+                if replacement.len < 0 or replacement.len > 768 or (replacement.len > 0 and replacement.data == null):
+                    set_status("Source line exceeds the 768-byte editor limit")
+                    return false
+                replacement_bytes: mutable darray[u8] = []
+                DesignStore::ensure_bytes(&replacement_bytes, replacement.len.usize() + 1)
+                replacement_index: mutable i64 = 0
+                while replacement_index < replacement.len:
+                    byte: u8 = replacement[replacement_index]
+                    if byte == 0 or byte == 10 or byte == 13:
+                        set_status("A source line cannot contain a line break or NUL byte")
+                        return false
+                    replacement_bytes.push(byte)
+                    replacement_index <- replacement_index + 1
+                if not source_utf8_is_valid(replacement_bytes):
+                    set_status("Source line is not valid UTF-8 text")
+                    return false
+                start: i64 = source_line_start(wanted)
+                finish: i64 = source_line_end(start)
+                content_finish: mutable i64 = finish
+                if content_finish > start and state.source_view_contents[(content_finish - 1).usize()] == 13:
+                    content_finish <- content_finish - 1
+                old_length: i64 = content_finish - start
+                if old_length > 768:
+                    set_status("This source line is longer than 768 bytes and is locked in the bounded editor")
+                    return false
+                if old_length == replacement.len:
+                    identical: mutable bool = true
+                    compare_index: mutable i64 = 0
+                    while compare_index < old_length:
+                        identical <- false if state.source_view_contents[(start + compare_index).usize()] != replacement[compare_index]
+                        compare_index <- compare_index + 1
+                    if identical:
+                        return true
+                next_size: i64 = state.source_view_contents.count.i64() - old_length + replacement.len
+                if next_size > 1048576:
+                    set_status("Edited source would exceed the 1 MiB safety limit")
+                    return false
+                updated: mutable darray[u8] = []
+                DesignStore::ensure_bytes(&updated, next_size.usize() + 1)
+                copy_index: mutable i64 = 0
+                while copy_index < start:
+                    updated.push(state.source_view_contents[copy_index.usize()])
+                    copy_index <- copy_index + 1
+                copy_index <- 0
+                while copy_index < replacement.len:
+                    updated.push(replacement[copy_index])
+                    copy_index <- copy_index + 1
+                copy_index <- content_finish
+                while copy_index < state.source_view_contents.count.i64():
+                    updated.push(state.source_view_contents[copy_index.usize()])
+                    copy_index <- copy_index + 1
+                source_history_record(start, old_length, replacement_bytes, state.source_view_lines)
+                set_bytes(&state.source_view_contents, DesignText::view_of(updated))
+                state.source_view_dirty <- Fingerprint::fnv1a64(DesignText::view_of(state.source_view_contents)) != state.source_view_fingerprint
+                set_status("Source line edited; save to write the Elisa file")
+                return true
+
+        @link_name("designer_session_source_view_replace_range")
+        def source_view_replace_range(start: i64, finish: i64, replacement: sview) -> bool:
+            can Memory.Allocate, Memory.Release:
+                if not state.source_view_ready or start < 0 or finish < start or finish > state.source_view_contents.count.i64():
+                    set_status("Source edit range is no longer available")
+                    return false
+                if not source_utf8_boundary(start) or not source_utf8_boundary(finish):
+                    set_status("Source edit range splits a UTF-8 character")
+                    return false
+                if replacement.len < 0 or replacement.len > 4096 or (replacement.len > 0 and replacement.data == null):
+                    set_status("Inserted source text exceeds the 4 KiB edit limit")
+                    return false
+                inserted: mutable darray[u8] = []
+                DesignStore::ensure_bytes(&inserted, replacement.len.usize() + 1)
+                use_crlf: mutable bool = false
+                scan: mutable i64 = 0
+                while scan < state.source_view_contents.count.i64():
+                    if state.source_view_contents[scan.usize()] == 10:
+                        use_crlf <- scan > 0 and state.source_view_contents[(scan - 1).usize()] == 13
+                        break
+                    scan <- scan + 1
+                index: mutable i64 = 0
+                while index < replacement.len:
+                    byte: u8 = replacement[index]
+                    if byte == 0:
+                        set_status("Inserted source text contains a NUL byte")
+                        return false
+                    if byte == 13:
+                        if index + 1 >= replacement.len or replacement[index + 1] != 10:
+                            set_status("Inserted source text contains a bare carriage return")
+                            return false
+                        inserted.push(13)
+                        inserted.push(10)
+                        index <- index + 2
+                    elif byte == 10:
+                        if use_crlf and (index == 0 or replacement[index - 1] != 13):
+                            inserted.push(13)
+                        inserted.push(10)
+                        index <- index + 1
+                    else:
+                        inserted.push(byte)
+                        index <- index + 1
+                if not source_utf8_is_valid(inserted):
+                    set_status("Inserted source text is not valid UTF-8")
+                    return false
+                next_size: i64 = state.source_view_contents.count.i64() - (finish - start) + inserted.count.i64()
+                if next_size > 1048576:
+                    set_status("Edited source would exceed the 1 MiB safety limit")
+                    return false
+                updated: mutable darray[u8] = []
+                DesignStore::ensure_bytes(&updated, next_size.usize() + 1)
+                copy_index: mutable i64 = 0
+                while copy_index < start:
+                    updated.push(state.source_view_contents[copy_index.usize()])
+                    copy_index <- copy_index + 1
+                copy_index <- 0
+                while copy_index < inserted.count.i64():
+                    updated.push(inserted[copy_index.usize()])
+                    copy_index <- copy_index + 1
+                copy_index <- finish
+                while copy_index < state.source_view_contents.count.i64():
+                    updated.push(state.source_view_contents[copy_index.usize()])
+                    copy_index <- copy_index + 1
+                next_lines: i64 = source_line_count_in(updated)
+                source_history_record(start, finish - start, inserted, next_lines)
+                set_bytes(&state.source_view_contents, DesignText::view_of(updated))
+                state.source_view_lines <- next_lines
+                state.source_view_dirty <- Fingerprint::fnv1a64(DesignText::view_of(state.source_view_contents)) != state.source_view_fingerprint
+                set_status("Source text edited; save to write the Elisa file")
+                return true
+
+        @link_name("designer_session_source_view_replace_all")
+        def source_view_replace_all(query: sview, replacement: sview) -> i64:
+            can Memory.Allocate, Memory.Release:
+                if not state.source_view_ready:
+                    set_status("No Elisa source file is open")
+                    return -1
+                if query.len <= 0 or query.len > 256 or query.data == null:
+                    set_status("Replace All needs nonempty search text up to 256 UTF-8 bytes")
+                    return -1
+                if replacement.len < 0 or replacement.len > 4096 or (replacement.len > 0 and replacement.data == null):
+                    set_status("Replace All text exceeds the 4 KiB edit limit")
+                    return -1
+                query_bytes: darray[u8] = DesignText::copy_of(query)
+                replacement_bytes: darray[u8] = DesignText::copy_of(replacement)
+                return -1 if not source_utf8_is_valid(query_bytes)
+                if not source_utf8_is_valid(replacement_bytes):
+                    set_status("Replacement text is not valid UTF-8")
+                    return -1
+                inserted: mutable darray[u8] = []
+                DesignStore::ensure_bytes(&inserted, replacement_bytes.count + 1)
+                use_crlf: mutable bool = false
+                line_scan: mutable i64 = 0
+                while line_scan < state.source_view_contents.count.i64():
+                    if state.source_view_contents[line_scan.usize()] == 10:
+                        use_crlf <- line_scan > 0 and state.source_view_contents[(line_scan - 1).usize()] == 13
+                        break
+                    line_scan <- line_scan + 1
+                replacement_index: mutable i64 = 0
+                while replacement_index < replacement_bytes.count.i64():
+                    byte: u8 = replacement_bytes[replacement_index.usize()]
+                    if byte == 0:
+                        set_status("Replacement text contains a NUL byte")
+                        return -1
+                    if byte == 13:
+                        if replacement_index + 1 >= replacement_bytes.count.i64() or replacement_bytes[(replacement_index + 1).usize()] != 10:
+                            set_status("Replacement text contains a bare carriage return")
+                            return -1
+                        inserted.push(13)
+                        inserted.push(10)
+                        replacement_index <- replacement_index + 2
+                    elif byte == 10:
+                        if use_crlf and (replacement_index == 0 or replacement_bytes[(replacement_index - 1).usize()] != 13):
+                            inserted.push(13)
+                        inserted.push(10)
+                        replacement_index <- replacement_index + 1
+                    else:
+                        inserted.push(byte)
+                        replacement_index <- replacement_index + 1
+                maximum_start: i64 = state.source_view_contents.count.i64() - query_bytes.count.i64()
+                match_count: mutable i64 = 0
+                candidate: mutable i64 = 0
+                while candidate <= maximum_start:
+                    if source_view_query_matches(query_bytes, candidate):
+                        match_count <- match_count + 1
+                        candidate <- candidate + query_bytes.count.i64()
+                    else:
+                        candidate <- candidate + 1
+                if match_count == 0:
+                    set_status("No source matches to replace")
+                    return 0
+                original_size: i64 = state.source_view_contents.count.i64()
+                next_size: i64 = original_size + match_count * (inserted.count.i64() - query_bytes.count.i64())
+                if next_size < 0 or next_size > 1048576:
+                    set_status("Replace All would exceed the 1 MiB source safety limit")
+                    return -1
+                updated: mutable darray[u8] = []
+                DesignStore::ensure_bytes(&updated, next_size.usize() + 1)
+                content_cursor: mutable i64 = 0
+                candidate <- 0
+                while candidate <= maximum_start:
+                    if source_view_query_matches(query_bytes, candidate):
+                        while content_cursor < candidate:
+                            updated.push(state.source_view_contents[content_cursor.usize()])
+                            content_cursor <- content_cursor + 1
+                        replacement_index <- 0
+                        while replacement_index < inserted.count.i64():
+                            updated.push(inserted[replacement_index.usize()])
+                            replacement_index <- replacement_index + 1
+                        content_cursor <- candidate + query_bytes.count.i64()
+                        candidate <- content_cursor
+                    else:
+                        candidate <- candidate + 1
+                while content_cursor < original_size:
+                    updated.push(state.source_view_contents[content_cursor.usize()])
+                    content_cursor <- content_cursor + 1
+                next_lines: i64 = source_line_count_in(updated)
+                source_history_record(0, original_size, updated, next_lines)
+                set_bytes(&state.source_view_contents, DesignText::view_of(updated))
+                state.source_view_lines <- next_lines
+                state.source_view_dirty <- Fingerprint::fnv1a64(DesignText::view_of(state.source_view_contents)) != state.source_view_fingerprint
+                set_status("Replaced all exact source matches")
+                return match_count
+
+        @link_name("designer_session_source_view_save")
+        def source_view_save() -> bool:
+            can Memory.Allocate, Memory.Release, Unsafe.PointerCast, Blocking.IO:
+                if not state.source_view_ready:
+                    set_status("No Elisa source file is open")
+                    return false
+                if not state.source_view_dirty:
+                    set_status("Elisa source is already saved")
+                    return true
+                if not source_disk_matches_baseline():
+                    return false
+                owned_path: darray[u8] = copy_path(DesignText::view_of(state.source_view_path))
+                path_c: cstr = (&owned_path[0]).cast[cstr] can Unsafe.PointerCast
+                source: i64 error[FileReplaceError] = PosixFile::atomic_write(path_c, DesignText::view_of(state.source_view_contents))
+                written: i64 = catch source:
+                    value:
+                        value
+                    FileReplaceError.CommittedButNotDurable:
+                        state.source_view_contents.count.i64()
+                    error e:
+                        -1
+                if written < 0:
+                    set_status("Could not safely save Elisa source")
+                    return false
+                state.source_view_fingerprint <- Fingerprint::fnv1a64(DesignText::view_of(state.source_view_contents))
+                state.source_view_dirty <- false
+                state.source_view_external_changed <- false
+                set_status("Saved Elisa source")
+                return true
+
+        @link_name("designer_session_source_view_reload_external")
+        def source_view_reload_external() -> bool:
+            can Memory.Allocate, Memory.Release, Unsafe.PointerCast, Blocking.IO:
+                if not state.source_view_ready:
+                    set_status("No Elisa source file is open")
+                    return false
+                _ = source_disk_matches_baseline()
+                if not state.source_view_external_changed or not state.source_view_external_snapshot_valid:
+                    set_status("The changed source file is missing or unreadable; use Save As to preserve this buffer")
+                    return false
+                set_bytes(&state.source_view_contents, DesignText::view_of(state.source_view_external_contents))
+                state.source_view_fingerprint <- state.source_view_external_fingerprint
+                state.source_view_lines <- state.source_view_external_lines
+                state.source_view_dirty <- false
+                state.source_view_line_projection.resize(0)
+                state.source_view_compare_projection.resize(0)
+                source_history_reset()
+                state.source_view_external_changed <- false
+                state.source_view_external_contents.resize(0)
+                state.source_view_external_lines <- 0
+                state.source_view_external_fingerprint <- 0
+                state.source_view_external_snapshot_valid <- false
+                set_status("Reloaded Elisa source from disk; local source edits were discarded")
+                return true
+
+        @link_name("designer_session_source_view_keep_buffer")
+        def source_view_keep_buffer() -> bool:
+            can Memory.Allocate, Memory.Release, Unsafe.PointerCast, Blocking.IO:
+                if not state.source_view_ready:
+                    set_status("No Elisa source file is open")
+                    return false
+                _ = source_disk_matches_baseline()
+                if not state.source_view_external_changed or not state.source_view_external_snapshot_valid:
+                    set_status("The changed source file is missing or unreadable; use Save As to preserve this buffer")
+                    return false
+                state.source_view_fingerprint <- state.source_view_external_fingerprint
+                state.source_view_dirty <- Fingerprint::fnv1a64(DesignText::view_of(state.source_view_contents)) != state.source_view_fingerprint
+                state.source_view_external_changed <- false
+                state.source_view_external_contents.resize(0)
+                state.source_view_external_lines <- 0
+                state.source_view_external_fingerprint <- 0
+                state.source_view_external_snapshot_valid <- false
+                if state.source_view_dirty:
+                    set_status("Kept the local source buffer; the next Save will replace the version on disk")
+                else:
+                    set_status("The local source buffer now matches the version on disk")
+                return true
+
+        @link_name("designer_session_source_view_save_as")
+        def source_view_save_as(path: sview) -> bool:
+            can Memory.Allocate, Memory.Release, Unsafe.PointerCast, Blocking.IO:
+                if not state.source_view_ready:
+                    set_status("No Elisa source file is open")
+                    return false
+                if path.len == 0 or path.len > 4096 or has_zero_byte(path) or not has_suffix(path, ".elisa"):
+                    set_status("Save As needs a valid .elisa destination path")
+                    return false
+                destination: mutable darray[u8] = copy_path(path)
+                destination_c: cstr = (&destination[0]).cast[cstr] can Unsafe.PointerCast
+                publication: i64 error[FileReplaceError] = PosixFile::atomic_write_new(destination_c, DesignText::view_of(state.source_view_contents))
+                written: i64 = catch publication:
+                    value:
+                        value
+                    FileReplaceError.DestinationExists:
+                        -2
+                    FileReplaceError.CommittedButNotDurable:
+                        state.source_view_contents.count.i64()
+                    error e:
+                        -1
+                if written == -2:
+                    set_status("Save As refused because the destination already exists")
+                    return false
+                if written < 0:
+                    set_status("Could not safely publish Elisa source at the Save As destination")
+                    return false
+                set_bytes(&state.source_view_path, path)
+                state.source_view_fingerprint <- Fingerprint::fnv1a64(DesignText::view_of(state.source_view_contents))
+                state.source_view_dirty <- false
+                state.source_view_external_changed <- false
+                state.source_view_external_contents.resize(0)
+                state.source_view_external_lines <- 0
+                state.source_view_external_fingerprint <- 0
+                state.source_view_external_snapshot_valid <- false
+                set_status("Saved Elisa source as a new file")
+                return true
+
+        @link_name("designer_session_source_view_line")
+        def source_view_line(wanted: i64) -> sview:
+            state.source_view_line_projection.resize(0)
+            state.source_view_line_truncated <- false
+            return "" if not state.source_view_ready or wanted < 0 or wanted >= source_view_line_count()
+            start: i64 = source_line_start(wanted)
+            finish: mutable i64 = source_line_end(start)
+            if finish > start and state.source_view_contents[(finish - 1).usize()] == 13:
+                finish <- finish - 1
+            shown: mutable i64 = finish - start
+            clipped: bool = shown > 768
+            shown <- 768 if clipped
+            state.source_view_line_truncated <- clipped
+            DesignStore::ensure_bytes(&state.source_view_line_projection, 773)
+            index: mutable i64 = 0
+            while index < shown:
+                state.source_view_line_projection.push(state.source_view_contents[(start + index).usize()])
+                index <- index + 1
+            if clipped:
+                state.source_view_line_projection.push(32)
+                state.source_view_line_projection.push(46)
+                state.source_view_line_projection.push(46)
+                state.source_view_line_projection.push(46)
+            return DesignText::view_of(state.source_view_line_projection)
+
         @link_name("designer_session_can_save")
         def can_save() -> bool:
             return state.document_path.count > 0 and state.form_path.count > 0
@@ -766,7 +2725,9 @@ module DesignerSession:
                 buffer.push(path[index])
                 index <- index + 1
             buffer.push(0)
-            path_c: cstr = (&buffer[0]).cast[cstr] can Unsafe.PointerCast
+            path_c: mutable cstr = ""
+            can Unsafe.PointerCast:
+                path_c <- (&buffer[0]).cast[cstr] can Unsafe.PointerCast
             encoded: darray[u8] = DesignEncode::encode_form(state.form)
             written: i64 = PosixFile::write_plain(path_c, DesignText::view_of(encoded))
             return written >= 0
@@ -781,7 +2742,9 @@ module DesignerSession:
                 buffer.push(path[index])
                 index <- index + 1
             buffer.push(0)
-            path_c: cstr = (&buffer[0]).cast[cstr] can Unsafe.PointerCast
+            path_c: mutable cstr = ""
+            can Unsafe.PointerCast:
+                path_c <- (&buffer[0]).cast[cstr] can Unsafe.PointerCast
             bytes: mutable darray[u8] = []
             amount: usize = PosixFile::read_bytes(&bytes, path_c, 1048576)
             if amount == 0:
@@ -794,19 +2757,95 @@ module DesignerSession:
             refresh_projections()
             return true
 
+        @link_name("designer_session_recovery_available")
+        def recovery_available() -> bool:
+            return state.recovery_available
+
+        # Autosave is a working copy, never the user's project file. The host
+        # calls this after each request so an abnormal shutdown leaves the most
+        # recent dirty form recoverable without changing normal save semantics.
+        @link_name("designer_session_autosave_recovery")
+        def autosave_recovery() -> bool:
+            return false if state.recovery_dir.count == 0 or DesignIds::is_empty(state.form.id)
+            if not DesignHistory::is_dirty(state.form, state.history):
+                return true
+            directory: mutable darray[u8] = recovery_directory()
+            directory_c: cstr = recovery_directory_c(&directory)
+            written: bool = DesignRecovery::write_snapshot(directory_c, state.form)
+            state.recovery_available <- true if written
+            return written
+
+        @link_name("designer_session_restore_recovery")
+        def restore_recovery() -> bool:
+            update_recovery_availability()
+            if not state.recovery_available:
+                set_status("No recovery snapshot is available")
+                return false
+            sink: mutable DesignDiagnostics::Sink = DesignDiagnostics::empty_sink()
+            directory: mutable darray[u8] = recovery_directory()
+            directory_c: cstr = recovery_directory_c(&directory)
+            candidate: mutable DesignForms::Form = DesignRecovery::read_snapshot(directory_c, state.form.id, state.registry, &sink)
+            if DesignDiagnostics::has_errors(sink) or DesignIds::is_empty(candidate.id):
+                state.diagnostics <- sink
+                state.problems_count <- sink.items.count.i64()
+                set_status("Recovery snapshot is invalid")
+                return false
+            DesignClone::clone_form_into(&state.form, &candidate)
+            state.form.revision <- state.form.revision + 1
+            _ = DesignRecovery::remove_snapshot(directory_c, state.form.id)
+            state.recovery_available <- false
+            refresh_projections()
+            set_status("Restored recovery snapshot; save to keep it")
+            return true
+
+        @link_name("designer_session_discard_recovery")
+        def discard_recovery() -> bool:
+            update_recovery_availability()
+            return true if not state.recovery_available
+            directory: mutable darray[u8] = recovery_directory()
+            directory_c: cstr = recovery_directory_c(&directory)
+            removed: bool = DesignRecovery::remove_snapshot(directory_c, state.form.id)
+            if removed:
+                state.recovery_available <- false
+                set_status("Discarded recovery snapshot")
+            return removed
+
+        @link_name("designer_session_external_change")
+        def external_change() -> bool:
+            return false if not can_save()
+            path: mutable darray[u8] = current_document_path()
+            return false if path.count == 0
+            path_c: mutable cstr = ""
+            can Unsafe.PointerCast:
+                path_c <- (&path[0]).cast[cstr] can Unsafe.PointerCast
+            return DesignSave::file_fingerprint(path_c) != state.saved_fingerprint
+
+        # Reload is deliberately available only for a clean in-memory
+        # document. Dirty edits remain protected until the user explicitly
+        # saves them elsewhere or discards them through the recovery flow.
+        @link_name("designer_session_reload_document")
+        def reload_document() -> bool:
+            if is_dirty():
+                set_status("Reload refused; save or discard the dirty document first")
+                return false
+            if state.document_path.count == 0:
+                set_status("No document is open")
+                return false
+            path: mutable darray[u8] = DesignText::copy_of(DesignText::view_of(state.document_path))
+            loaded: bool = open_document(DesignText::view_of(path))
+            set_status("Reloaded document") if loaded
+            return loaded
+
         @link_name("designer_session_save")
         def save() -> bool:
             if state.document_path.count == 0 or state.form_path.count == 0:
                 set_status("No file to save to")
                 return false
-            joined: mutable darray[u8] = []
-            if state.standalone_document:
-                joined <- copy_path(DesignText::view_of(state.document_path))
-            else:
-                DesignStore::ensure_bytes(&joined, state.document_path.count + state.form_path.count + 4)
-                push_relative(&joined, DesignText::view_of(state.form_path))
-                joined.push(0)
-            path_c: cstr = (&joined[0]).cast[cstr] can Unsafe.PointerCast
+            joined: mutable darray[u8] = current_document_path()
+            return false if joined.count == 0
+            path_c: mutable cstr = ""
+            can Unsafe.PointerCast:
+                path_c <- (&joined[0]).cast[cstr] can Unsafe.PointerCast
             source: i64 error[DesignSaveError] = DesignSave::save_form(path_c, state.form, state.saved_fingerprint, true)
             written: i64 = catch source:
                 value:
@@ -822,6 +2861,10 @@ module DesignerSession:
                 return false
             state.saved_fingerprint <- DesignSave::file_fingerprint(path_c)
             DesignHistory::mark_saved(state.form, &state.history)
+            if state.recovery_dir.count > 0:
+                directory: mutable darray[u8] = recovery_directory()
+                _ = DesignRecovery::remove_snapshot(recovery_directory_c(&directory), state.form.id)
+            state.recovery_available <- false
             set_status("Saved")
             return true
 
@@ -854,6 +2897,10 @@ module DesignerSession:
                 state.session_ready <- true
                 state.standalone_document <- true
                 DesignHistory::mark_saved(state.form, &state.history)
+                if state.recovery_dir.count > 0:
+                    directory: mutable darray[u8] = recovery_directory()
+                    _ = DesignRecovery::remove_snapshot(recovery_directory_c(&directory), state.form.id)
+                state.recovery_available <- false
                 set_status("Saved standalone form")
                 return true
 
@@ -867,7 +2914,10 @@ module DesignerSession:
         def inspector_label(row: i64) -> sview:
             if row < 0 or row >= state.inspector_rows.count.i64():
                 return ""
-            return DesignValues::text_of(state.form.strings, state.inspector_rows[row.usize()])
+            key: sview = DesignValues::text_of(state.form.strings, state.inspector_rows[row.usize()])
+            return "Display name" if DesignText::equal(key, "__displayName")
+            return "Generated symbol" if DesignText::equal(key, "__generatedSymbol")
+            return key
 
         @link_name("designer_session_inspector_value")
         def inspector_value(row: i64) -> sview:
@@ -897,6 +2947,18 @@ module DesignerSession:
             index: i64 = DesignForms::find_node(state.form, state.selection.primary)
             if index < 0:
                 return false
+            if DesignText::equal(key, "__displayName") or DesignText::equal(key, "__generatedSymbol"):
+                state.diagnostics <- DesignDiagnostics::empty_sink()
+                prepared: DesignCommand::Prepared = DesignCommand::prepare_rename_display_name(state.form, state.selection.primary, text, &state.diagnostics) if DesignText::equal(key, "__displayName") else DesignCommand::prepare_rename_symbol(state.form, state.selection.primary, text, &state.diagnostics)
+                if not prepared.valid:
+                    set_status("Name or symbol rejected; see Problems")
+                    return false
+                if not DesignHistory::apply(&state.history, &state.form, &prepared):
+                    set_status("Name or symbol change could not be committed")
+                    return false
+                refresh_projections()
+                set_status("Display name changed" if DesignText::equal(key, "__displayName") else "Generated symbol changed")
+                return true
             component: i64 = DesignRegistry::find_component(state.registry, DesignValues::text_of(state.form.strings, state.form.nodes[index.usize()].type_key))
             descriptor_index: i64 = DesignRegistry::find_property(state.registry, component, key)
             if descriptor_index < 0:
@@ -906,7 +2968,12 @@ module DesignerSession:
             accepted: mutable bool = true
             match tag:
                 0:
-                    accepted <- false
+                    if DesignText::equal(text, "true"):
+                        value <- DesignValues::boolean(true)
+                    elif DesignText::equal(text, "false"):
+                        value <- DesignValues::boolean(false)
+                    else:
+                        accepted <- false
                 1:
                     parsed_int: i64? = parse_integer(text)
                     if parsed_int is value_int:
@@ -952,6 +3019,66 @@ module DesignerSession:
             set_status("Property changed")
             return true
 
+        # ---- events -------------------------------------------------------
+
+        @link_name("designer_session_event_count")
+        def event_count() -> i64:
+            return state.event_keys.count.i64()
+
+        @link_name("designer_session_event_key")
+        def event_key(row: i64) -> sview:
+            if row < 0 or row >= state.event_keys.count.i64():
+                return ""
+            return DesignValues::text_of(state.form.strings, state.event_keys[row.usize()])
+
+        @link_name("designer_session_event_label")
+        def event_label(row: i64) -> sview:
+            if row < 0 or row >= state.event_labels.count.i64():
+                return ""
+            return DesignValues::text_of(state.form.strings, state.event_labels[row.usize()])
+
+        @link_name("designer_session_event_value")
+        def event_value(row: i64) -> sview:
+            if row < 0 or row >= state.event_values.count.i64():
+                return ""
+            return DesignValues::text_of(state.form.strings, state.event_values[row.usize()])
+
+        @link_name("designer_session_event_signature")
+        def event_signature(row: i64) -> sview:
+            if row < 0 or row >= state.event_signatures.count.i64():
+                return ""
+            return DesignValues::text_of(state.form.strings, state.event_signatures[row.usize()])
+
+        @link_name("designer_session_set_event_handler")
+        def set_event_handler(row: i64, text: sview) -> bool:
+            if row < 0 or row >= state.event_keys.count.i64() or DesignIds::is_empty(state.selection.primary):
+                return false
+            index: i64 = DesignForms::find_node(state.form, state.selection.primary)
+            if index < 0:
+                return false
+            key: sview = event_key(row)
+            ids: mutable darray[DesignIds::DesignId] = []
+            DesignStore::ensure_ids(&ids, 1)
+            DesignIds::append_copy(&ids, &state.selection.primary)
+            state.diagnostics <- DesignDiagnostics::empty_sink()
+            prepared: DesignCommand::Prepared = DesignCommand::prepare_set_event_handler(state.form, state.registry, ids, key, text, &state.diagnostics)
+            if not prepared.valid:
+                set_status("Event handler rejected; see Problems")
+                return false
+            if not DesignHistory::apply(&state.history, &state.form, &prepared):
+                set_status("Event handler change could not be committed")
+                return false
+            rebuild_inspector()
+            rebuild_events()
+            rebuild_problems_filtered()
+            state.projection_epoch <- state.projection_epoch + 1
+            set_status("Event handler changed")
+            return true
+
+        @link_name("designer_session_clear_event_handler")
+        def clear_event_handler(row: i64) -> bool:
+            return set_event_handler(row, "")
+
         @link_name("designer_session_toggle_inspector")
         def toggle_inspector(row: i64) -> bool:
             if row < 0 or row >= state.inspector_tags.count.i64():
@@ -985,6 +3112,42 @@ module DesignerSession:
             next: sview = next_choice(choices, current)
             return set_inspector_text(row, next)
 
+        # Restore one property to the registry default through the same
+        # revisioned command path as an ordinary edit. Text and enum defaults
+        # live in the registry pool, so copy those bytes into the document
+        # pool before preparing the command; the resulting form never borrows
+        # a registry-owned string reference.
+        @link_name("designer_session_reset_inspector")
+        def reset_inspector(row: i64) -> bool:
+            if row < 0 or row >= state.inspector_rows.count.i64() or DesignIds::is_empty(state.selection.primary):
+                return false
+            node_index: i64 = DesignForms::find_node(state.form, state.selection.primary)
+            if node_index < 0:
+                return false
+            key: sview = inspector_label(row)
+            component: i64 = DesignRegistry::find_component(state.registry, DesignValues::text_of(state.form.strings, state.form.nodes[node_index.usize()].type_key))
+            descriptor_index: i64 = DesignRegistry::find_property(state.registry, component, key)
+            if descriptor_index < 0:
+                return false
+            descriptor: DesignRegistry::PropertyDescriptor = state.registry.components[component.usize()].properties[descriptor_index.usize()]
+            value: mutable DesignValues::DesignValue = descriptor.default_value
+            if value.tag == DesignValues::ValueTag.Text or value.tag == DesignValues::ValueTag.EnumKey or value.tag == DesignValues::ValueTag.NodeRef:
+                copied: DesignValues::StringRef = DesignValues::append(&state.form.strings.bytes, DesignValues::text_of(state.registry.strings, value.text_ref))
+                value.text_ref <- copied
+            ids: mutable darray[DesignIds::DesignId] = []
+            DesignStore::ensure_ids(&ids, 1)
+            DesignIds::append_copy(&ids, &state.selection.primary)
+            state.diagnostics <- DesignDiagnostics::empty_sink()
+            prepared: DesignCommand::Prepared = DesignCommand::prepare_set_property(state.form, ids, key, value, &state.diagnostics)
+            if not prepared.valid or not DesignHistory::apply(&state.history, &state.form, &prepared):
+                set_status("Property reset rejected; see Problems")
+                return false
+            rebuild_inspector()
+            rebuild_problems_filtered()
+            state.projection_epoch <- state.projection_epoch + 1
+            set_status("Property reset to its default")
+            return true
+
         @link_name("designer_session_next_choice")
         def next_choice(choices: sview, current: sview) -> sview:
             # Comma-separated alternatives; wrap around. Empty choices leave
@@ -1014,7 +3177,7 @@ module DesignerSession:
             stop: mutable i64 = start
             while stop < choices.len and choices[stop] != 44:
                 stop <- stop + 1
-            return sview(choices.data, start, stop - start)
+            return string_view_slice(choices, start, stop)
 
         # ---- problems ------------------------------------------------------
 
@@ -1048,6 +3211,22 @@ module DesignerSession:
                 return false
             return state.diagnostics.items[index.usize()].severity == DesignDiagnostics::Severity.Error
 
+        @link_name("designer_session_problem_node_row")
+        def problem_node_row(index: i64) -> i64:
+            if index < 0 or index >= state.diagnostics.items.count.i64():
+                return -1
+            path: sview = DesignText::view_of(state.diagnostics.items[index.usize()].path)
+            node_index: i64 = diagnostic_node_index(path)
+            if node_index < 0 or node_index >= state.form.nodes.count.i64():
+                return -1
+            node_id: DesignIds::DesignId = state.form.nodes[node_index.usize()].id
+            row: mutable i64 = 0
+            while row < state.hierarchy_rows.count.i64():
+                if DesignIds::equal(state.hierarchy_rows[row.usize()], node_id):
+                    return row
+                row <- row + 1
+            return -1
+
         # ---- status --------------------------------------------------------
 
         @link_name("designer_session_status")
@@ -1064,12 +3243,151 @@ module DesignerSession:
         def form_title() -> sview:
             return DesignValues::text_of(state.form.strings, state.form.name)
 
+        # Relative ownership path for the currently displayed form. The shell
+        # shows this alongside the generated read-only source projection.
+        @link_name("designer_session_form_path")
+        def form_path() -> sview:
+            return "" if state.form_path.count == 0
+            return DesignText::view_of(state.form_path)
+
+        # Bounded workspace-file projection used by the shell's read-only
+        # Files view. The manifest/form entries preserve project-relative
+        # names; generated files are virtual until a build publishes them.
+        @link_name("designer_session_file_count")
+        def file_count() -> i64:
+            return 0 if not state.session_ready or state.form_path.count == 0
+            return 4 if not state.standalone_document else 3
+
+        @link_name("designer_session_file_path")
+        def file_path(index: i64) -> sview:
+            state.file_projection.resize(0)
+            return "" if index < 0 or index >= file_count()
+            if not state.standalone_document and index == 0:
+                document: sview = DesignText::view_of(state.document_path)
+                start: i64 = basename_start(document)
+                DesignText::push_view(&state.file_projection, bytes_view_range(state.document_path, start.usize(), (document.len - start).usize()))
+            elif index == 0 and state.standalone_document:
+                DesignText::push_view(&state.file_projection, DesignText::view_of(state.form_path))
+            elif (not state.standalone_document and index == 1):
+                DesignText::push_view(&state.file_projection, DesignText::view_of(state.form_path))
+            else:
+                module_name: sview = DesignValues::text_of(state.form.strings, state.form.module_symbol)
+                DesignText::push_view(&state.file_projection, "generated/")
+                if not state.standalone_document and state.generation_namespace.count > 0:
+                    DesignText::push_view(&state.file_projection, DesignText::view_of(state.generation_namespace))
+                    if index == 2:
+                        DesignText::push_view(&state.file_projection, "_view.elisa")
+                    else:
+                        DesignText::push_view(&state.file_projection, "_view.elisa.map.json")
+                else:
+                    DesignText::push_view(&state.file_projection, module_name)
+                    if index == (2 if not state.standalone_document else 1):
+                        DesignText::push_view(&state.file_projection, ".elisa")
+                    else:
+                        DesignText::push_view(&state.file_projection, ".elisa.map.json")
+            return DesignText::view_of(state.file_projection)
+
         @link_name("designer_session_selection_name")
         def selection_name() -> sview:
             index: i64 = DesignForms::find_node(state.form, state.selection.primary)
             if index < 0:
                 return "(none)"
             return DesignValues::text_of(state.form.strings, state.form.nodes[index.usize()].name)
+
+        @link_name("designer_session_selection_path")
+        def selection_path() -> sview:
+            state.selection_path.resize(0)
+            primary_row: mutable i64 = -1
+            if not DesignIds::is_empty(state.selection.primary):
+                index: mutable i64 = 0
+                while index < state.hierarchy_rows.count.i64():
+                    if DesignIds::equal(state.hierarchy_rows[index.usize()], state.selection.primary):
+                        primary_row <- index
+                        break
+                    index <- index + 1
+            if primary_row < 0:
+                empty_path: sview = "(no selection)"
+                DesignStore::ensure_bytes(&state.selection_path, empty_path.len.usize() + 1)
+                index: mutable i64 = 0
+                while index < empty_path.len:
+                    state.selection_path.push(empty_path[index])
+                    index <- index + 1
+                return DesignText::view_of(state.selection_path)
+
+            target_depth: i32 = state.hierarchy_depth[primary_row.usize()]
+            required: mutable usize = 1
+            level: mutable i32 = 0
+            while level <= target_depth:
+                candidate: mutable i64 = primary_row
+                ancestor: mutable i64 = -1
+                while candidate >= 0:
+                    if state.hierarchy_depth[candidate.usize()] == level:
+                        ancestor <- candidate
+                        break
+                    candidate <- candidate - 1
+                if ancestor >= 0:
+                    label: sview = hierarchy_label(ancestor)
+                    required <- required + label.len.usize()
+                    required <- required + 3 if level > 0
+                level <- level + 1
+            DesignStore::ensure_bytes(&state.selection_path, required)
+
+            level <- 0
+            while level <= target_depth:
+                path_candidate: mutable i64 = primary_row
+                path_ancestor: mutable i64 = -1
+                while path_candidate >= 0:
+                    if state.hierarchy_depth[path_candidate.usize()] == level:
+                        path_ancestor <- path_candidate
+                        break
+                    path_candidate <- path_candidate - 1
+                if path_ancestor >= 0:
+                    if level > 0:
+                        state.selection_path.push(32)
+                        state.selection_path.push(47)
+                        state.selection_path.push(32)
+                    path_label: sview = hierarchy_label(path_ancestor)
+                    append_index: mutable i64 = 0
+                    while append_index < path_label.len:
+                        state.selection_path.push(path_label[append_index])
+                        append_index <- append_index + 1
+                level <- level + 1
+            return DesignText::view_of(state.selection_path)
+
+        @link_name("designer_session_selection_ancestor_count")
+        def selection_ancestor_count() -> i64:
+            return 0 if DesignIds::is_empty(state.selection.primary)
+            primary_row: mutable i64 = 0
+            found: mutable bool = false
+            while primary_row < state.hierarchy_rows.count.i64():
+                if DesignIds::equal(state.hierarchy_rows[primary_row.usize()], state.selection.primary):
+                    found <- true
+                    break
+                primary_row <- primary_row + 1
+            if not found:
+                return 0
+            return state.hierarchy_depth[primary_row.usize()].i64() + 1
+
+        @link_name("designer_session_selection_ancestor_row")
+        def selection_ancestor_row(level: i64) -> i64:
+            return -1 if level < 0
+            primary_row: mutable i64 = 0
+            found: mutable bool = false
+            while primary_row < state.hierarchy_rows.count.i64():
+                if DesignIds::equal(state.hierarchy_rows[primary_row.usize()], state.selection.primary):
+                    found <- true
+                    break
+                primary_row <- primary_row + 1
+            if not found:
+                return -1
+            target_depth: i64 = state.hierarchy_depth[primary_row.usize()].i64()
+            return -1 if level > target_depth
+            candidate: mutable i64 = primary_row
+            while candidate >= 0:
+                if state.hierarchy_depth[candidate.usize()].i64() == level:
+                    return candidate
+                candidate <- candidate - 1
+            return -1
 
         @link_name("designer_session_selection_type")
         def selection_type() -> sview:
@@ -1096,11 +3414,13 @@ module DesignerSession:
                 index <- index + 1
             if state.form.nodes.count > 0:
                 DesignSelection::select_only(&state.selection, state.form.nodes[0.usize()].id)
+                DesignIds::copy_into(&state.selection_anchor, &state.form.nodes[0.usize()].id)
                 index <- 1
                 while index < state.form.nodes.count.i64():
                     DesignSelection::include_id(&state.selection, state.form.nodes[index.usize()].id)
                     index <- index + 1
             rebuild_inspector()
+            rebuild_events()
             state.projection_epoch <- state.projection_epoch + 1
             return true
 
@@ -1123,13 +3443,21 @@ module DesignerSession:
                 last_slash <- index if state.document_path[index.usize()] == 47 else last_slash
                 index <- index + 1
             if last_slash < 0:
-                DesignText::push_view(&joined, relative)
+                # This path is also backed by DesignStore's arena; copying the
+                # view byte by byte preserves its existing allocation.
+                index <- 0
+                while index < relative.len:
+                    joined.push(relative[index])
+                    index <- index + 1
                 return
             index <- 0
             while index <= last_slash:
                 joined.push(state.document_path[index.usize()])
                 index <- index + 1
-            DesignText::push_view(&joined, relative)
+            index <- 0
+            while index < relative.len:
+                joined.push(relative[index])
+                index <- index + 1
 
         @link_name("designer_session_read_all")
         def read_all(arena: mutable Arena&, path: sview) -> darray[u8]:
@@ -1140,7 +3468,8 @@ module DesignerSession:
                 buffer.push(path[index])
                 index <- index + 1
             buffer.push(0)
-            return read_all_cstr(arena, (&buffer[0]).cast[cstr] can Unsafe.PointerCast)
+            can Unsafe.PointerCast:
+                return read_all_cstr(arena, (&buffer[0]).cast[cstr] can Unsafe.PointerCast)
 
         @link_name("designer_session_read_all_cstr")
         def read_all_cstr(arena: mutable Arena&, path: cstr) -> darray[u8]:

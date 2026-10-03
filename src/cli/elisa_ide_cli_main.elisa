@@ -7,6 +7,7 @@
 #   elisa-ide-cli validate <project-or-form.json>
 #   elisa-ide-cli migrate  <input.json> <output.json>
 #   elisa-ide-cli generate <form.json> <output.elisa>
+#   elisa-ide-cli source   <output.elisa> <output.map.json> <byte-offset>
 
 include "../registry/design_registry.elisa"
 include "../schema/design_json_decode.elisa"
@@ -14,6 +15,7 @@ include "../schema/design_json_encode.elisa"
 include "../validation/design_validate.elisa"
 include "../lowering/design_lower.elisa"
 include "../codegen/elisa_emit.elisa"
+include "../codegen/source_map_json.elisa"
 include "../platform/posix/posix_file.elisa"
 
 include "../../compiler/elisacore_std/elisacore_runtime.elisa"
@@ -25,7 +27,8 @@ module ElisaIdeCli:
         def usage() -> i64:
             print("usage: elisa-ide-cli validate <document.json>\n")
             print("       elisa-ide-cli migrate  <input.json> <output.json>\n")
-            print("       elisa-ide-cli generate <form.json> <output.elisa>\n")
+            print("       elisa-ide-cli generate <form.json> <output.elisa> [output.map.json]\n")
+            print("       elisa-ide-cli source   <output.elisa> <output.map.json> <byte-offset>\n")
             return 2
 
         def is_project_path(path: sview) -> bool:
@@ -55,6 +58,89 @@ module ElisaIdeCli:
                 error e:
                     []
             return bytes
+
+        def print_i64(value: i64) -> void:
+            text: mutable darray[u8] = []
+            DesignText::push_i64(&text, value)
+            print(DesignText::view_of(text))
+
+        def parse_offset(text: cstr, valid: mutable bool&) -> i64:
+            valid <- false
+            value: mutable i64 = 0
+            index: mutable i64 = 0
+            while index < 32:
+                byte: u8 = text[index.usize()]
+                break if byte == 0
+                return 0 if byte < 48 or byte > 57
+                value <- value * 10 + (byte - 48).i64()
+                return 0 if value < 0
+                index <- index + 1
+            return 0 if index == 0
+            valid <- true
+            return value
+
+        def print_source_origin(path: cstr, source: darray[u8]&, map: CodegenSourceMap::SourceMap, span_index: i64) -> void:
+            start: i64 = CodegenSourceMap::start_byte_at(map, span_index)
+            finish: i64 = CodegenSourceMap::end_byte_at(map, span_index)
+            line: mutable i64 = 1
+            column: mutable i64 = 1
+            cursor: mutable i64 = 0
+            while cursor < start:
+                if source[cursor.usize()] == 10:
+                    line <- line + 1
+                    column <- 1
+                else:
+                    column <- column + 1
+                cursor <- cursor + 1
+            output: mutable darray[u8] = []
+            DesignText::push_view(&output, "source: ")
+            DesignText::push_cstr(&output, path)
+            DesignText::push_view(&output, ":")
+            DesignText::push_i64(&output, line)
+            DesignText::push_view(&output, ":")
+            DesignText::push_i64(&output, column)
+            DesignText::push_view(&output, " bytes=")
+            DesignText::push_i64(&output, start)
+            DesignText::push_view(&output, "-")
+            DesignText::push_i64(&output, finish)
+            DesignText::push_view(&output, " origin=")
+            DesignText::push_view(&output, CodegenSourceMap::kind_name(CodegenSourceMap::kind_at(map, span_index)))
+            DesignText::push_view(&output, " form=")
+            DesignText::push_view(&output, CodegenSourceMap::form_id_at(map, span_index))
+            DesignText::push_view(&output, " node=")
+            DesignText::push_view(&output, CodegenSourceMap::node_id_at(map, span_index))
+            DesignText::push_view(&output, " member=")
+            DesignText::push_view(&output, CodegenSourceMap::member_at(map, span_index))
+            print(DesignText::view_of(output))
+
+        def navigate_source(source_path: cstr, map_path: cstr, offset_text: cstr) -> i64:
+            source_arena: mutable Arena = Arena{begin: null, end: null, end_index: 0, strategy: 0}
+            map_arena: mutable Arena = Arena{begin: null, end: null, end_index: 0, strategy: 0}
+            source: darray[u8] = read_document(source_path, &source_arena)
+            map_bytes: darray[u8] = read_document(map_path, &map_arena)
+            if source.count == 0 or map_bytes.count == 0:
+                print("error: cannot read generated source or source map\n")
+                return 2
+            offset_valid: mutable bool = false
+            offset: i64 = parse_offset(offset_text, &offset_valid)
+            if not offset_valid:
+                print("error: byte offset must be a non-negative integer\n")
+                return 2
+            decoded: CodegenSourceMapJson::DecodeResult = CodegenSourceMapJson::decode(DesignText::view_of(map_bytes), DesignText::view_of(source))
+            if not decoded.ok:
+                print("error: source map is stale or invalid\n")
+                return 1
+            lookup: CodegenSourceMap::Lookup = CodegenSourceMap::lookup(decoded.map, DesignText::view_of(source), offset)
+            if not lookup.ok:
+                print("error: source-map lookup rejected the byte offset\n")
+                return 1
+            if not lookup.found:
+                print("source: no design origin at byte ")
+                print_i64(offset)
+                print("\n")
+                return 0
+            print_source_origin(source_path, source, decoded.map, lookup.span_index)
+            return 0
 
         def validate_document(path: cstr) -> i64:
             arena: mutable Arena = Arena{begin: null, end: null, end_index: 0, strategy: 0}
@@ -121,7 +207,7 @@ module ElisaIdeCli:
             print("\n")
             return 0
 
-        def generate_view(input_path: cstr, output_path: cstr) -> i64:
+        def generate_view(input_path: cstr, output_path: cstr, source_map_path: cstr) -> i64:
             arena: mutable Arena = Arena{begin: null, end: null, end_index: 0, strategy: 0}
             bytes: darray[u8] = read_document(input_path, &arena)
             if bytes.count == 0:
@@ -162,6 +248,27 @@ module ElisaIdeCli:
                 print("\n")
                 return 2
 
+            map_enabled: bool = sview(source_map_path, 0, -1).len > 0
+            map_bytes: mutable darray[u8] = []
+            if map_enabled:
+                existing_map: mutable darray[u8] = []
+                map_status: i64 = PosixFile::read_bytes_result(&existing_map, source_map_path, DesignLimits::MAX_INPUT_BYTES)
+                if map_status >= 0:
+                    print("error: source-map output already exists; refusing to replace ")
+                    print(source_map_path)
+                    print("\n")
+                    return 2
+                if not PosixFile::read_error_is_not_found(map_status):
+                    print("error: source-map output path is not available ")
+                    print(source_map_path)
+                    print("\n")
+                    return 2
+                map_bytes <- CodegenSourceMapJson::encode(emission.source_map, DesignText::view_of(emission.source))
+                if map_bytes.count == 0:
+                    _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.InvalidReference, "generation.source-map", "could not encode the generated source map")
+                    print_sink(&sink)
+                    return 1
+
             # This command publishes exactly one generated view file. The
             # POSIX service stages and syncs the complete source before
             # publishing it, and its link-based publication refuses to
@@ -193,16 +300,40 @@ module ElisaIdeCli:
                 print("\n")
                 return 2
 
+            if map_enabled:
+                publish_map: i64 error[FileReplaceError] = PosixFile::atomic_write_new(source_map_path, DesignText::view_of(map_bytes))
+                map_written: mutable i64 = catch publish_map:
+                    value:
+                        value
+                    FileReplaceError.DestinationExists:
+                        -2
+                    FileReplaceError.CommittedButNotDurable:
+                        -3
+                    error e:
+                        -1
+                if map_written < 0 and map_written != -3:
+                    print("error: generated source was published but source-map publication failed at ")
+                    print(source_map_path)
+                    print("\n")
+                    return 2
+                if map_written == -3:
+                    print("warning: source-map output is visible, but directory durability could not be confirmed: ")
+                    print(source_map_path)
+                    print("\n")
+
             print_sink(&sink)
             print("generated: ")
             print(input_path)
             print(" -> ")
             print(output_path)
+            if map_enabled:
+                print(" and ")
+                print(source_map_path)
             print("\n")
             return 0
 
     public:
-        def run(argc: i64, argv: mutable void&) -> i64:
+        def run(argc: i64, argv: mutable void&) -> i64 can[Unsafe.PointerCast]:
             if argc < 3:
                 return usage()
             slots: mutable cstr&& = argv.cast[mutable cstr&&]
@@ -214,10 +345,16 @@ module ElisaIdeCli:
                     return usage()
                 return migrate_document(slots[2.usize()].cast[cstr], slots[3.usize()].cast[cstr])
             if DesignText::equal(sview(command, 0, -1), "generate"):
-                if argc != 4:
+                if argc != 4 and argc != 5:
                     return usage()
-                return generate_view(slots[2.usize()].cast[cstr], slots[3.usize()].cast[cstr])
+                if argc == 5:
+                    return generate_view(slots[2.usize()].cast[cstr], slots[3.usize()].cast[cstr], slots[4.usize()].cast[cstr])
+                return generate_view(slots[2.usize()].cast[cstr], slots[3.usize()].cast[cstr], "")
+            if DesignText::equal(sview(command, 0, -1), "source"):
+                if argc != 5:
+                    return usage()
+                return navigate_source(slots[2.usize()].cast[cstr], slots[3.usize()].cast[cstr], slots[4.usize()].cast[cstr])
             return usage()
 
 def main(argc: i64, argv: mutable void&) -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-    return DesignerCli::run(argc, argv)
+    return ElisaIdeCli::run(argc, argv)

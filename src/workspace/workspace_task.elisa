@@ -1,0 +1,124 @@
+# Shared workspace task lifecycle policy.
+#
+# Process adapters own launching and reaping. This module owns the durable
+# identity and state transitions shown by the IDE: a completion belongs to one
+# task ID and source revision, cancellation is terminal, and task output is
+# bounded before it reaches a pane or task log.
+
+include "../model/design_text.elisa"
+
+module WorkspaceTask:
+    public:
+        const MAX_OUTPUT_BYTES: usize = 262144
+
+        const enum Kind of i32:
+            Lsp = 0
+            Package = 1
+            Compiler = 2
+            Test = 3
+            Run = 4
+            Debugger = 5
+            Profiler = 6
+            Preview = 7
+            Generation = 8
+
+        const enum State of i32:
+            Queued = 0
+            Running = 1
+            Succeeded = 2
+            Failed = 3
+            Cancelled = 4
+
+        struct TaskRecord:
+            id: mutable u64
+            kind: mutable Kind
+            input_revision: mutable u64
+            state: mutable State
+            exit_code: mutable i64
+            output: mutable darray[u8]
+            output_truncated: mutable bool
+            cancel_requested: mutable bool
+
+        def empty(id: u64, kind: Kind, revision: u64) -> TaskRecord:
+            return TaskRecord{
+                id: id,
+                kind: kind,
+                input_revision: revision,
+                state: State.Queued,
+                exit_code: 0,
+                output: [],
+                output_truncated: false,
+                cancel_requested: false,
+            }
+
+        def valid_identity(task: TaskRecord&) -> bool:
+            return task.id != 0 and task.input_revision != 0
+
+        def start(task: mutable TaskRecord&) -> bool:
+            return false if not valid_identity(task) or task.state != State.Queued
+            task.state <- State.Running
+            task.exit_code <- 0
+            task.output.clear()
+            task.output_truncated <- false
+            task.cancel_requested <- false
+            return true
+
+        def is_running(task: TaskRecord&) -> bool:
+            return task.state == State.Running
+
+        def append_output(task: mutable TaskRecord&, bytes: sview) -> void:
+            return if bytes.len <= 0
+            remaining: i64 = MAX_OUTPUT_BYTES.i64() - task.output.count.i64()
+            if remaining <= 0:
+                task.output_truncated <- true
+                return
+            copy_count: i64 = bytes.len if bytes.len < remaining else remaining
+            index: mutable i64 = 0
+            while index < copy_count:
+                task.output.push(bytes[index])
+                index <- index + 1
+            task.output_truncated <- true if copy_count < bytes.len
+
+        def request_cancel(task: mutable TaskRecord&) -> bool:
+            return false if task.state != State.Running
+            task.cancel_requested <- true
+            return true
+
+        def finish(task: mutable TaskRecord&, task_id: u64, revision: u64, exit_code: i64) -> bool:
+            return false if task.state != State.Running
+            return false if task.id != task_id or task.input_revision != revision
+            task.exit_code <- exit_code
+            if task.cancel_requested:
+                task.state <- State.Cancelled
+            elif exit_code == 0:
+                task.state <- State.Succeeded
+            else:
+                task.state <- State.Failed
+            return true
+
+        def accepts_result(task: TaskRecord&, task_id: u64, revision: u64) -> bool:
+            return task.id == task_id and task.input_revision == revision and task.state != State.Queued
+
+        def output_view(task: TaskRecord&) -> sview:
+            return "" if task.output.count == 0
+            return DesignText::view_of(task.output)
+
+        def kind_label(kind: Kind) -> sview:
+            return "lsp" if kind == Kind.Lsp
+            return "package" if kind == Kind.Package
+            return "compiler" if kind == Kind.Compiler
+            return "test" if kind == Kind.Test
+            return "run" if kind == Kind.Run
+            return "debugger" if kind == Kind.Debugger
+            return "profiler" if kind == Kind.Profiler
+            return "preview" if kind == Kind.Preview
+            return "generation" if kind == Kind.Generation
+            return "unknown"
+
+        def state_label(state: State) -> sview:
+            return "queued" if state == State.Queued
+            return "running" if state == State.Running
+            return "succeeded" if state == State.Succeeded
+            return "failed" if state == State.Failed
+            return "cancelled" if state == State.Cancelled
+            return "queued"

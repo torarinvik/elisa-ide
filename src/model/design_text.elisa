@@ -48,7 +48,7 @@ module DesignText:
 
         def view_of(buffer: darray[u8]) -> sview:
             return "" if buffer.count == 0
-            return sview(&buffer[0], 0, buffer.count.i64())
+            return bytes_view_range(buffer, 0, buffer.count)
 
         def equal(left: sview, right: sview) -> bool:
             return false if left.len != right.len

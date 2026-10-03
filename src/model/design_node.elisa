@@ -152,3 +152,28 @@ module DesignNodes:
                     return index
                 index <- index + 1
             return -1
+
+        # Add, replace, or remove one event connection. An empty handler is
+        # the editor's explicit disconnected state, so it removes the durable
+        # connection instead of leaving a validation error in the document.
+        def set_event(node: mutable Node&, pool: DesignValues::StringPool&, event_key: DesignValues::StringRef, handler: DesignValues::StringRef) -> bool:
+            key_text: sview = DesignValues::text_of(pool, event_key)
+            index: i64 = event_index(node, pool, key_text)
+            if handler.length == 0:
+                return true if index < 0
+                write: mutable i64 = 0
+                read: mutable i64 = 0
+                while read < node.events.count.i64():
+                    if read != index:
+                        node.events[write.usize()] <- node.events[read.usize()]
+                        write <- write + 1
+                    read <- read + 1
+                node.events.resize(write.usize())
+                return true
+            if index >= 0:
+                node.events[index.usize()].handler <- handler
+                return true
+            return false if node.events.count >= DesignLimits::MAX_EVENTS_PER_NODE
+            ensure_events(&node.events, node.events.count + 1)
+            node.events.push(EventConnection{event_key: event_key, handler: handler})
+            return true

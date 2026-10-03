@@ -109,9 +109,13 @@ module PreviewProtocolTest:
             invalid_flags: PreviewProtocol::EncodeResult = PreviewProtocol::encode_frame(invalid_encode)
             TestSupport::check("encoder rejects reserved flags", invalid_flags.code == PreviewProtocol::Issue.ReservedBitsSet and invalid_flags.bytes.count == 0)
 
-            oversized_payload_bytes: mutable u8[1] = zeroed
+            oversized_payload_bytes: mutable darray[u8] = []
+            oversized_index: mutable i64 = 0
+            while oversized_index < PreviewProtocol::MAX_FRAME_PAYLOAD_BYTES + 1:
+                oversized_payload_bytes.push(0)
+                oversized_index <- oversized_index + 1
             oversized_payload: mutable PreviewProtocol::FrameData = frame
-            oversized_payload.payload <- StringView{data: &oversized_payload_bytes[0], len: PreviewProtocol::MAX_FRAME_PAYLOAD_BYTES + 1}
+            oversized_payload.payload <- bytes_view_range(oversized_payload_bytes, 0, oversized_payload_bytes.count)
             invalid_payload: PreviewProtocol::EncodeResult = PreviewProtocol::encode_frame(oversized_payload)
             TestSupport::check("encoder rejects payload over the transport limit before copying", invalid_payload.code == PreviewProtocol::Issue.PayloadTooLarge and invalid_payload.bytes.count == 0)
 

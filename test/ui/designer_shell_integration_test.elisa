@@ -5,15 +5,31 @@
 # its caption, saves it, then opens that file through the shell and verifies
 # the persisted value in the inspector projection.
 
-include "../../framework/src/platform/sdl3/ui_sdl3_flat.elisa"
+include "shell_test_platform.elisa"
+include "preview_image_test_adapter.elisa"
 include "../../framework/src/test/ui_harness.elisa"
 include "../../src/shell/shell_app.elisa"
 
 const SAVE_PATH: cstr = "build/shell-integration-main.elisaform.json"
-const PREVIEW_INPUT_PATH: cstr = "build/shell-integration-preview.bin"
-const PREVIEW_FRAME_PATH: cstr = "build/shell-integration-preview.png"
+const SOURCE_VIEW_PATH: cstr = "test/fixtures/source_view.elisa"
+const SOURCE_EDIT_PATH: cstr = "build/shell-source-edit.elisa"
+const PROJECT_ROOT_PATH: cstr = "build/New Elisa Project"
+const PROJECT_FORM_PATH: cstr = "build/New Elisa Project/forms/main.elisaform.json"
+const PROJECT_MANIFEST_PATH: cstr = "build/New Elisa Project/New Elisa Project.elisaproject.json"
+const PROJECT_GENERATED_ROOT_PATH: cstr = "build/New Elisa Project/generated"
+const PROJECT_GENERATED_README_PATH: cstr = "build/New Elisa Project/generated/README.md"
+const PROJECT_GENERATED_APP_PATH: cstr = "build/New Elisa Project/generated/App_app.elisa"
+const PROJECT_GENERATED_HANDLERS_PATH: cstr = "build/New Elisa Project/generated/App_handlers.elisa"
+const PROJECT_GENERATED_VIEW_PATH: cstr = "build/New Elisa Project/generated/App_view.elisa"
+const PROJECT_GENERATED_MAP_PATH: cstr = "build/New Elisa Project/generated/App_view.elisa.map.json"
+const PROJECT_GENERATED_MANIFEST_PATH: cstr = "build/New Elisa Project/generated/.elisa-ide-generation.json"
+const COMPACT_PROJECT_ROOT_PATH: cstr = "build/Compact Elisa Project"
+const COMPACT_PROJECT_FORM_PATH: cstr = "build/Compact Elisa Project/forms/main.elisaform.json"
+const COMPACT_PROJECT_MANIFEST_PATH: cstr = "build/Compact Elisa Project/Compact Elisa Project.elisaproject.json"
+const INTEGRATION_PREVIEW_PATH_CAPACITY: usize = 1024
 
 global mutable integration_failure: i64 = 0
+global mutable integration_assertion_count: i64 = 0
 
 @link_name("designer_setenv")
 extern integration_setenv(name: cstr, value: cstr) -> i64
@@ -21,7 +37,11 @@ extern integration_setenv(name: cstr, value: cstr) -> i64
 @link_name("designer_report_i64")
 extern integration_report_i64(label: cstr, value: i64) -> void
 
+@link_name("designer_report_text")
+extern integration_report_text(text: cstr) -> void
+
 def expect_integration(condition: bool, code: i64) -> void:
+    integration_assertion_count <- integration_assertion_count + 1
     if not condition and integration_failure == 0:
         integration_failure <- code
 
@@ -32,6 +52,11 @@ def same_text(left: sview, right: sview) -> bool:
         return false if left[index] != right[index]
         index <- index + 1
     return true
+
+def status_view(shell: Shell) -> sview:
+    return "" if shell.status_length <= 0 or shell.status_length > 256
+    can Unsafe.PointerCast:
+        return UiText::unsafe_sview_bounded_bytes(&shell.status_storage[0], shell.status_length.usize())
 
 def bytes_contain(bytes: darray[u8]&, needle: sview) -> bool:
     return false if needle.len == 0 or bytes.count.i64() < needle.len
@@ -49,13 +74,87 @@ def bytes_contain(bytes: darray[u8]&, needle: sview) -> bool:
         start <- start + 1
     return false
 
-def bytes_equal(left: darray[u8]&, right: darray[u8]&) -> bool:
-    return false if left.count != right.count
-    for index in 0..<left.count:
-        return false if left[index] != right[index]
-    return true
+def byte_index_of(bytes: darray[u8]&, needle: sview) -> i64:
+    return -1 if needle.len == 0 or bytes.count.i64() < needle.len
+    start: mutable i64 = 0
+    while start + needle.len <= bytes.count.i64():
+        matched: mutable bool = true
+        offset: mutable i64 = 0
+        while offset < needle.len:
+            if bytes[(start + offset).usize()] != needle[offset]:
+                matched <- false
+                break
+            offset <- offset + 1
+        return start if matched
+        start <- start + 1
+    return -1
 
-def wait_preview_worker(process: mutable PosixProcess::Process&, budget_ms: i64) -> bool:
+def report_frame_manifest(bytes: darray[u8]&) -> void:
+    needle: sview = "frame_v1 "
+    for start in 0..<bytes.count:
+        matched: mutable bool = true
+        for offset in 0..<needle.len:
+            if start + offset >= bytes.count or bytes[start + offset] != needle[offset]:
+                matched <- false
+                break
+        if matched:
+            line: mutable u8[128] = zeroed
+            length: mutable usize = 0
+            while start + length < bytes.count and bytes[start + length] != 10 and length < 127:
+                line[length] <- bytes[start + length]
+                length <- length + 1
+            text: mutable cstr = ""
+            can Unsafe.PointerCast:
+                text <- (&line[0]).cast[cstr] can Unsafe.PointerCast
+            integration_report_text(text)
+            return
+
+def geometry_bytes(text: sview) -> darray[u8]:
+    bytes: mutable darray[u8] = []
+    for index in 0..<text.len:
+        bytes.push(text[index])
+    return bytes
+
+def geometry_was_invalidated(test_shell: Shell) -> bool:
+    return test_shell.preview_region_count == 0 and test_shell.preview_geometry_revision == 0 and test_shell.preview_geometry_signature == 0 and test_shell.preview_form_width == 0.0 and test_shell.preview_form_height == 0.0
+
+def test_geometry_acceptance() -> void:
+    test_shell: mutable Shell = new_shell()
+    complete: mutable darray[u8] = geometry_bytes("preview_revision=7\ngeometry_v1 7 123 node-root 0 0 102400 76800 1 0\ngeometry_v1 7 123 node-button 1024 2048 4096 5120 1 1\n")
+    accepted: bool = ShellPreview::accept_geometry_output(test_shell, complete, 7, 123, 100.0, 75.0)
+    expect_integration(accepted and test_shell.preview_region_count == 2 and test_shell.preview_geometry_revision == 7 and test_shell.preview_geometry_signature == 123 and test_shell.preview_form_width == 100.0 and test_shell.preview_form_height == 75.0, 60)
+
+    malformed_tail: mutable darray[u8] = geometry_bytes("geometry_v1 7 123 node-root 0 0 102400 76800 1 0\ngeometry_v1 7 123 node-bad 4 nope 10 10 1 1\n")
+    malformed_accepted: bool = ShellPreview::accept_geometry_output(test_shell, malformed_tail, 7, 123, 100.0, 75.0)
+    expect_integration(not malformed_accepted and geometry_was_invalidated(test_shell), 61)
+
+    mixed_revision: mutable darray[u8] = geometry_bytes("geometry_v1 7 123 node-root 0 0 102400 76800 1 0\ngeometry_v1 8 123 node-button 1024 2048 4096 5120 1 1\n")
+    revision_accepted: bool = ShellPreview::accept_geometry_output(test_shell, mixed_revision, 7, 123, 100.0, 75.0)
+    expect_integration(not revision_accepted and geometry_was_invalidated(test_shell), 62)
+
+    mixed_signature: mutable darray[u8] = geometry_bytes("geometry_v1 7 123 node-root 0 0 102400 76800 1 0\ngeometry_v1 7 124 node-button 1024 2048 4096 5120 1 1\n")
+    signature_accepted: bool = ShellPreview::accept_geometry_output(test_shell, mixed_signature, 7, 123, 100.0, 75.0)
+    expect_integration(not signature_accepted and geometry_was_invalidated(test_shell), 63)
+
+    stale: mutable darray[u8] = geometry_bytes("geometry_v1 6 123 node-root 0 0 102400 76800 1 0\n")
+    stale_accepted: bool = ShellPreview::accept_geometry_output(test_shell, stale, 7, 123, 100.0, 75.0)
+    expect_integration(not stale_accepted and geometry_was_invalidated(test_shell), 64)
+
+    duplicate_id: mutable darray[u8] = geometry_bytes("geometry_v1 7 123 node-root 0 0 102400 76800 1 0\ngeometry_v1 7 123 node-root 1024 2048 4096 5120 1 1\n")
+    duplicate_accepted: bool = ShellPreview::accept_geometry_output(test_shell, duplicate_id, 7, 123, 100.0, 75.0)
+    expect_integration(not duplicate_accepted and geometry_was_invalidated(test_shell), 65)
+
+    trailing_field: mutable darray[u8] = geometry_bytes("geometry_v1 7 123 node-root 0 0 102400 76800 1 0 unexpected\n")
+    trailing_accepted: bool = ShellPreview::accept_geometry_output(test_shell, trailing_field, 7, 123, 100.0, 75.0)
+    expect_integration(not trailing_accepted and geometry_was_invalidated(test_shell), 66)
+
+    embedded_marker: mutable darray[u8] = geometry_bytes("worker output geometry_v1 7 123 node-root 0 0 102400 76800 1 0\n")
+    embedded_accepted: bool = ShellPreview::accept_geometry_output(test_shell, embedded_marker, 7, 123, 100.0, 75.0)
+    expect_integration(not embedded_accepted and geometry_was_invalidated(test_shell), 67)
+
+def wait_preview_worker(process: PosixProcess::Process, budget_ms: i64) -> bool:
+    # Keep the small handle by value. A native pointer produced from an Elisa
+    # reference-to-reference here does not preserve the original process handle.
     elapsed: mutable i64 = 0
     while elapsed < budget_ms:
         if PosixProcess::poll(&process, 20):
@@ -63,36 +162,204 @@ def wait_preview_worker(process: mutable PosixProcess::Process&, budget_ms: i64)
         elapsed <- elapsed + 20
     return false
 
-def fail_preview(stage: i64) -> bool:
-    integration_report_i64("preview_failure_stage=", stage)
+def wait_for_shell_preview(budget_ms: i64) -> bool:
+    elapsed: mutable i64 = 0
+    while elapsed < budget_ms:
+        if not shell.preview_pending:
+            return shell.preview_ready and shell.preview_region_count > 0 and shell.preview_geometry_revision == shell.preview_revision and shell.preview_geometry_signature == shell.preview_signature
+        process: PosixProcess::Process = preview_process
+        _ = PosixProcess::poll(&process, 20)
+        ShellPreview::poll_and_bind(shell)
+        elapsed <- elapsed + 20
     return false
 
-def run_preview(snapshot: HostClient::HostReply, stdout_out: mutable darray[u8]&, frame_out: mutable darray[u8]&) -> bool:
+def click_last_preview_region_from_canvas() -> bool:
+    return false if shell.preview_form_width <= 0.0 or shell.preview_form_height <= 0.0
+    if UiHandles::widget(shell.preview_canvas) is canvas:
+        return false if canvas.width <= 0.0 or canvas.height <= 0.0
+        scale_x: f32 = canvas.width / shell.preview_form_width
+        scale_y: f32 = canvas.height / shell.preview_form_height
+        scale: f32 = scale_x if scale_x < scale_y else scale_y
+        return false if scale <= 0.0
+        return false if shell.preview_region_count == 0
+        region: PreviewRegion = shell.preview_regions[shell.preview_region_count - 1]
+        return false if not region.visible or not region.selectable
+        form_x: f32 = (region.x_q10 + region.width_q10 / 2).f32() / 1024.0
+        form_y: f32 = (region.y_q10 + region.height_q10 / 2).f32() / 1024.0
+        drawn_width: f32 = shell.preview_form_width * scale
+        drawn_height: f32 = shell.preview_form_height * scale
+        x: f32 = canvas.x + (canvas.width - drawn_width) * 0.5 + form_x * scale
+        y: f32 = canvas.y + (canvas.height - drawn_height) * 0.5 + form_y * scale
+        UiHarness::dispatch(UiCore::PointerEvent.Down(at: UiCore::Vec2(x, y), button: UiCore::PointerButton.Primary.i32()))
+        UiHarness::dispatch(UiCore::PointerEvent.Up(at: UiCore::Vec2(x, y), button: UiCore::PointerButton.Primary.i32()))
+        return true
+    return false
+
+def fail_preview(stage: i64) -> i64:
+    integration_report_i64("preview_failure_stage=", stage)
+    return 0
+
+def preview_paths_differ(left: mutable u8[1024]&, right: mutable u8[1024]&) -> bool:
+    for index in 0..<1024:
+        return true if left[index] != right[index]
+        return false if left[index] == 0
+    return false
+
+def preview_snapshot_revision(snapshot: darray[u8]&) -> u64:
+    return 0 if snapshot.count < 16
+    revision: mutable u64 = 0
+    for shift in 0..<8:
+        revision <- revision | (snapshot[8 + shift].u64() << (shift * 8))
+    return revision
+
+def preview_snapshot_signature(snapshot: mutable darray[u8]&) -> i64:
+    return shell_preview_snapshot_signature(&snapshot[0], snapshot.count)
+
+def test_frame_identity_acceptance() -> void:
+    valid: mutable darray[u8] = geometry_bytes("worker output\nframe_v1 7 123 4096 1234 5678\n")
+    accepted: bool = ShellPreview::accept_frame_identity_output(valid, 7, 123, 4096, 1234, 5678)
+    expect_integration(accepted, 74)
+
+    wrong_revision: mutable darray[u8] = geometry_bytes("frame_v1 8 123 4096 1234 5678\n")
+    expect_integration(not ShellPreview::accept_frame_identity_output(wrong_revision, 7, 123, 4096, 1234, 5678), 75)
+
+    wrong_digest: mutable darray[u8] = geometry_bytes("frame_v1 7 123 4096 1234 5679\n")
+    expect_integration(not ShellPreview::accept_frame_identity_output(wrong_digest, 7, 123, 4096, 1234, 5678), 76)
+
+    duplicate: mutable darray[u8] = geometry_bytes("frame_v1 7 123 4096 1234 5678\nframe_v1 7 123 4096 1234 5678\n")
+    expect_integration(not ShellPreview::accept_frame_identity_output(duplicate, 7, 123, 4096, 1234, 5678), 77)
+
+    embedded: mutable darray[u8] = geometry_bytes("worker frame_v1 7 123 4096 1234 5678\n")
+    expect_integration(not ShellPreview::accept_frame_identity_output(embedded, 7, 123, 4096, 1234, 5678), 78)
+
+def test_build_diagnostic_projection() -> void:
+    bytes: mutable darray[u8] = geometry_bytes("built project application: ok\nforms/main.elisa:4:2: error: bad property\nwarning: local package graph\n")
+    text: sview = ShellBytes::view_of(&bytes)
+    expect_integration(build_diagnostic_count(text) == 2, 148)
+    first: sview = build_diagnostic_at(text, 0)
+    second: sview = build_diagnostic_at(text, 1)
+    expect_integration(same_text(first, "forms/main.elisa:4:2: error: bad property")
+        and same_text(second, "warning: local package graph"), 149)
+    expect_integration(build_diagnostic_at(text, 2).len == 0, 150)
+
+def test_preview_path_isolation() -> void:
+    first_input: mutable u8[1024] = zeroed
+    first_frame: mutable u8[1024] = zeroed
+    second_input: mutable u8[1024] = zeroed
+    second_frame: mutable u8[1024] = zeroed
+    first_created: i64 = shell_preview_paths_create(&first_input[0], INTEGRATION_PREVIEW_PATH_CAPACITY, &first_frame[0], INTEGRATION_PREVIEW_PATH_CAPACITY)
+    second_created: i64 = shell_preview_paths_create(&second_input[0], INTEGRATION_PREVIEW_PATH_CAPACITY, &second_frame[0], INTEGRATION_PREVIEW_PATH_CAPACITY)
+    distinct: bool = first_created == 0 and second_created == 0 and preview_paths_differ(first_input, second_input) and preview_paths_differ(first_frame, second_frame)
+    expect_integration(distinct, 68)
+    if distinct:
+        first_input_path: mutable cstr = ""
+        first_frame_path: mutable cstr = ""
+        second_input_path: mutable cstr = ""
+        second_frame_path: mutable cstr = ""
+        can Unsafe.PointerCast:
+            first_input_path <- (&first_input[0]).cast[cstr] can Unsafe.PointerCast
+            first_frame_path <- (&first_frame[0]).cast[cstr] can Unsafe.PointerCast
+            second_input_path <- (&second_input[0]).cast[cstr] can Unsafe.PointerCast
+            second_frame_path <- (&second_frame[0]).cast[cstr] can Unsafe.PointerCast
+        payload: mutable darray[u8] = [69, 76, 80, 70]
+        first_write: i64 = PosixFile::write_bytes_plain(first_input_path, payload)
+        second_write: i64 = PosixFile::write_bytes_plain(second_input_path, payload)
+        expect_integration(first_write == 4 and second_write == 4, 69)
+        mixed_cleanup: i64 = shell_preview_paths_cleanup(first_input_path, second_frame_path)
+        protected_first: mutable darray[u8] = []
+        protected_second: mutable darray[u8] = []
+        protected_first_length: i64 = PosixFile::read_bytes_result(&protected_first, first_input_path, 8)
+        protected_second_length: i64 = PosixFile::read_bytes_result(&protected_second, second_input_path, 8)
+        expect_integration(mixed_cleanup != 0 and protected_first_length == 4 and protected_second_length == 4, 73)
+        first_cleanup: i64 = shell_preview_paths_cleanup(first_input_path, first_frame_path)
+        remaining: mutable darray[u8] = []
+        remaining_length: i64 = PosixFile::read_bytes_result(&remaining, second_input_path, 8)
+        expect_integration(first_cleanup == 0 and remaining_length == 4 and remaining[0] == 69 and remaining[3] == 70, 70)
+        second_cleanup: i64 = shell_preview_paths_cleanup(second_input_path, second_frame_path)
+        absent: mutable darray[u8] = []
+        absent_status: i64 = PosixFile::read_bytes_result(&absent, second_input_path, 8)
+        expect_integration(second_cleanup == 0 and PosixFile::read_error_is_not_found(absent_status), 71)
+
+    tiny_input: mutable u8[2] = zeroed
+    bounded_frame: mutable u8[1024] = zeroed
+    bounded_failure: i64 = shell_preview_paths_create(&tiny_input[0], 2, &bounded_frame[0], INTEGRATION_PREVIEW_PATH_CAPACITY)
+    expect_integration(bounded_failure != 0 and tiny_input[0] == 0 and bounded_frame[0] == 0, 72)
+
+def run_preview(snapshot: HostClient::HostReply) -> i64:
     return fail_preview(1) if snapshot.result != 1 or snapshot.text.count == 0
-    _ = PosixFile::remove(PREVIEW_INPUT_PATH)
-    return fail_preview(2) if PosixFile::write_bytes_plain(PREVIEW_INPUT_PATH, snapshot.text) != snapshot.text.count.i64()
-    _ = PosixFile::remove(PREVIEW_FRAME_PATH)
-    return fail_preview(3) if integration_setenv("ELISA_UI_PREVIEW_INPUT", PREVIEW_INPUT_PATH) != 0
-    return fail_preview(4) if integration_setenv("ELISA_UI_SNAPSHOT", PREVIEW_FRAME_PATH) != 0
-    return fail_preview(5) if integration_setenv("ELISA_UI_SMOKE_FRAMES", "1") != 0
+    input_storage: mutable u8[1024] = zeroed
+    frame_storage: mutable u8[1024] = zeroed
+    return fail_preview(2) if shell_preview_paths_create(&input_storage[0], INTEGRATION_PREVIEW_PATH_CAPACITY, &frame_storage[0], INTEGRATION_PREVIEW_PATH_CAPACITY) != 0
+    input_path: mutable cstr = ""
+    frame_path: mutable cstr = ""
+    can Unsafe.PointerCast:
+        input_path <- (&input_storage[0]).cast[cstr] can Unsafe.PointerCast
+        frame_path <- (&frame_storage[0]).cast[cstr] can Unsafe.PointerCast
+    if PosixFile::write_bytes_plain(input_path, snapshot.text) != snapshot.text.count.i64():
+        _ = shell_preview_paths_cleanup(input_path, frame_path)
+        return fail_preview(3)
+    if integration_setenv("ELISA_UI_PREVIEW_INPUT", input_path) != 0:
+        _ = shell_preview_paths_cleanup(input_path, frame_path)
+        return fail_preview(4)
+    if integration_setenv("ELISA_UI_SNAPSHOT", frame_path) != 0:
+        _ = shell_preview_paths_cleanup(input_path, frame_path)
+        return fail_preview(5)
+    if integration_setenv("ELISA_UI_SMOKE_FRAMES", "1") != 0:
+        _ = shell_preview_paths_cleanup(input_path, frame_path)
+        return fail_preview(6)
 
     arguments: mutable darray[cstr] = []
     arguments.push("build/preview_worker")
     worker: mutable PosixProcess::Process = PosixProcess::start(&arguments)
-    return fail_preview(6) if not PosixProcess::valid(&worker)
-    if not wait_preview_worker(&worker, 60000):
+    if not PosixProcess::valid(&worker):
+        _ = shell_preview_paths_cleanup(input_path, frame_path)
+        return fail_preview(7)
+    if not wait_preview_worker(worker, 60000):
         _ = PosixProcess::cancel(&worker)
         PosixProcess::dispose(&worker)
-        return fail_preview(7)
+        _ = shell_preview_paths_cleanup(input_path, frame_path)
+        return fail_preview(8)
     status: PosixProcess::Status = PosixProcess::status(&worker)
-    _ = PosixProcess::read_stdout(&worker, &stdout_out, 1048576)
+    stdout: mutable darray[u8] = []
+    _ = PosixProcess::read_stdout(&worker, &stdout, 1048576)
     PosixProcess::dispose(&worker)
-    return fail_preview(8) if not status.finished or status.exit_code != 0 or status.stdout_truncated
-    frame_length: usize = PosixFile::read_bytes(&frame_out, PREVIEW_FRAME_PATH, 8388608)
-    return fail_preview(9) if frame_length < 1000 or frame_out.count < 8
-    return fail_preview(10) if frame_out[0] != 137 or frame_out[1] != 80 or frame_out[2] != 78 or frame_out[3] != 71
-    return fail_preview(11) if not bytes_contain(stdout_out, "preview_revision=") or not bytes_contain(stdout_out, "rect ")
-    return true
+    if not status.finished or status.exit_code != 0 or status.stdout_truncated:
+        _ = shell_preview_paths_cleanup(input_path, frame_path)
+        return fail_preview(9)
+    if not bytes_contain(stdout, "preview_revision=") or not bytes_contain(stdout, "rect n2 ") or not bytes_contain(stdout, "rect n3 "):
+        _ = shell_preview_paths_cleanup(input_path, frame_path)
+        return fail_preview(10)
+    frame_bytes: mutable darray[u8] = []
+    frame_length: usize = PosixFile::read_bytes(&frame_bytes, frame_path, 8388608)
+    if frame_length < 1000 or frame_bytes.count < 8:
+        _ = shell_preview_paths_cleanup(input_path, frame_path)
+        return fail_preview(11)
+    if frame_bytes[0] != 137 or frame_bytes[1] != 80 or frame_bytes[2] != 78 or frame_bytes[3] != 71:
+        _ = shell_preview_paths_cleanup(input_path, frame_path)
+        return fail_preview(12)
+    identity_length: mutable usize = 0
+    identity_hash_high: mutable u32 = 0
+    identity_hash_low: mutable u32 = 0
+    identity_status: i64 = shell_preview_frame_identity(frame_path, &identity_length, &identity_hash_high, &identity_hash_low)
+    identity_ok: bool = identity_status == 0
+    snapshot_revision: u64 = preview_snapshot_revision(snapshot.text)
+    snapshot_signature: i64 = preview_snapshot_signature(&snapshot.text)
+    manifest_ok: bool = ShellPreview::accept_frame_identity_output(stdout, snapshot_revision, snapshot_signature, identity_length, identity_hash_high, identity_hash_low)
+    if not identity_ok or not manifest_ok:
+        integration_report_i64("preview_identity_status=", identity_status)
+        integration_report_i64("preview_identity_length=", identity_length.i64())
+        integration_report_i64("preview_identity_revision=", snapshot_revision.i64())
+        integration_report_i64("preview_identity_signature=", snapshot_signature)
+        integration_report_i64("preview_manifest_present=", 1 if bytes_contain(stdout, "frame_v1 ") else 0)
+        integration_report_i64("preview_manifest_accepted=", 1 if manifest_ok else 0)
+        report_frame_manifest(stdout)
+        _ = shell_preview_paths_cleanup(input_path, frame_path)
+        return fail_preview(13)
+    checksum: mutable i64 = 0
+    for index in 0..<frame_bytes.count:
+        checksum <- checksum + frame_bytes[index].i64() * ((index % 251 + 1).i64())
+    _ = shell_preview_paths_cleanup(input_path, frame_path)
+    return checksum
 
 def click(handle: UiHandles::Handle) -> void:
     return if not UiHandles::is_valid(handle) or not UiHandles::is_visible(handle) or not UiHandles::is_enabled(handle)
@@ -116,8 +383,254 @@ def clean_host() -> void:
     PosixProcess::dispose(&host_process)
     shell.host_running <- false
 
+def clean_test_project(form_path: cstr, manifest_path: cstr, forms_path: cstr, root_path: cstr) -> void:
+    _ = PosixFile::remove(form_path)
+    _ = PosixFile::remove(manifest_path)
+    _ = PosixFile::remove_directory_if_empty(forms_path)
+    _ = PosixFile::remove_directory_if_empty(root_path)
+
+def clean_generated_project() -> void:
+    _ = PosixFile::remove(PROJECT_GENERATED_README_PATH)
+    _ = PosixFile::remove(PROJECT_GENERATED_APP_PATH)
+    _ = PosixFile::remove(PROJECT_GENERATED_HANDLERS_PATH)
+    _ = PosixFile::remove(PROJECT_GENERATED_VIEW_PATH)
+    _ = PosixFile::remove(PROJECT_GENERATED_MAP_PATH)
+    _ = PosixFile::remove(PROJECT_GENERATED_MANIFEST_PATH)
+    _ = PosixFile::remove_directory_if_empty(PROJECT_GENERATED_ROOT_PATH)
+
+def dispatch_reorder_shortcut(key: UiCore::Key) -> void:
+    UiHarness::dispatch(UiCore::KeyEvent.Down(UiCore::Key.LeftSuper))
+    UiHarness::dispatch(UiCore::KeyEvent.Down(UiCore::Key.LeftShift))
+    UiHarness::dispatch(UiCore::KeyEvent.Down(key))
+    UiHarness::dispatch(UiCore::KeyEvent.Up(key))
+    UiHarness::dispatch(UiCore::KeyEvent.Up(UiCore::Key.LeftShift))
+    UiHarness::dispatch(UiCore::KeyEvent.Up(UiCore::Key.LeftSuper))
+
+def dispatch_insert_shortcut() -> void:
+    UiHarness::dispatch(UiCore::KeyEvent.Down(UiCore::Key.LeftSuper))
+    UiHarness::dispatch(UiCore::KeyEvent.Down(UiCore::Key.I))
+    UiHarness::dispatch(UiCore::KeyEvent.Up(UiCore::Key.I))
+    UiHarness::dispatch(UiCore::KeyEvent.Up(UiCore::Key.LeftSuper))
+
+def drag_handle_to(source: UiHandles::Handle, target: UiHandles::Handle) -> void:
+    return if not UiHandles::is_valid(source) or not UiHandles::is_valid(target)
+    if UiHandles::widget(source) is source_widget:
+        if UiHandles::widget(target) is target_widget:
+            source_x: f32 = source_widget.x + source_widget.width * 0.5
+            source_y: f32 = source_widget.y + source_widget.height * 0.5
+            target_x: f32 = target_widget.x + target_widget.width * 0.5
+            target_y: f32 = target_widget.y + target_widget.height * 0.5
+            UiHarness::dispatch(UiCore::PointerEvent.Down(at: UiCore::Vec2(source_x, source_y), button: UiCore::PointerButton.Primary.i32()))
+            UiHarness::dispatch(UiCore::PointerEvent.Move(UiCore::Vec2(target_x, target_y)))
+            UiHarness::dispatch(UiCore::PointerEvent.Up(at: UiCore::Vec2(target_x, target_y), button: UiCore::PointerButton.Primary.i32()))
+
+def test_drag_editing() -> void:
+    _ = HostClient::request(host_process, 10, 0, 0)
+    refresh_all(shell, host_process)
+    drag_handle_to(shell.palette_rows[4.usize()], shell.hierarchy_rows[0.usize()])
+    expect_integration(shell.projection.node_count == 2 and shell.projection.selection_count == 1, 170)
+    expect_integration(same_text(UiHandles::text_value(shell.inspector_editors[0.usize()]), "Button"), 171)
+
+    _ = HostClient::request(host_process, 10, 0, 0)
+    _ = HostClient::request(host_process, 30, 1, 0)
+    _ = HostClient::request(host_process, 31, 0, 0)
+    _ = HostClient::request(host_process, 30, 4, 0)
+    refresh_all(shell, host_process)
+    expect_integration(shell.projection.hierarchy_count == 3, 172)
+    drag_handle_to(shell.hierarchy_rows[2.usize()], shell.hierarchy_rows[1.usize()])
+    expect_integration(shell.drag_kind == 0 and shell.projection.dirty, 173)
+    path_after_drag: HostClient::HostReply = HostClient::request(host_process, 63, 0, 0)
+    expect_integration(path_after_drag.result == 1 and same_text(ShellBytes::view_of(&path_after_drag.text), "Column / Row / Button"), 174)
+    command(shell, 13, 0)
+    path_after_undo: HostClient::HostReply = HostClient::request(host_process, 63, 0, 0)
+    expect_integration(path_after_undo.result == 1 and same_text(ShellBytes::view_of(&path_after_undo.text), "Column / Button"), 175)
+
+    # A self/leaf target gets red feedback and does not mutate the graph.
+    before_invalid: i64 = shell.projection.node_count
+    drag_handle_to(shell.hierarchy_rows[2.usize()], shell.hierarchy_rows[2.usize()])
+    expect_integration(shell.projection.node_count == before_invalid, 176)
+
+    # Escape and pointer leave cancel an in-flight drag before release.
+    root_count_before_cancel: i64 = shell.projection.node_count
+    if UiHandles::widget(shell.palette_rows[4.usize()]) is palette_widget:
+        if UiHandles::widget(shell.hierarchy_rows[0.usize()]) is root_widget:
+            UiHarness::dispatch(UiCore::PointerEvent.Down(at: UiCore::Vec2(palette_widget.x + 4.0, palette_widget.y + 4.0), button: UiCore::PointerButton.Primary.i32()))
+            UiHarness::dispatch(UiCore::PointerEvent.Move(UiCore::Vec2(root_widget.x + root_widget.width * 0.5, root_widget.y + root_widget.height * 0.5)))
+            UiHarness::dispatch(UiCore::KeyEvent.Down(UiCore::Key.Escape))
+            expect_integration(shell.projection.node_count == root_count_before_cancel and shell.drag_kind == 0, 177)
+            UiHarness::dispatch(UiCore::PointerEvent.Down(at: UiCore::Vec2(palette_widget.x + 4.0, palette_widget.y + 4.0), button: UiCore::PointerButton.Primary.i32()))
+            UiHarness::dispatch(UiCore::PointerEvent.Move(UiCore::Vec2(root_widget.x + root_widget.width * 0.5, root_widget.y + root_widget.height * 0.5)))
+            UiHarness::dispatch(UiCore::PointerEvent.Leave)
+            expect_integration(shell.projection.node_count == root_count_before_cancel and shell.drag_kind == 0, 178)
+    _ = HostClient::request(host_process, 10, 0, 0)
+    refresh_all(shell, host_process)
+
+def click_with_modifier(handle: UiHandles::Handle, modifier: UiCore::Key) -> void:
+    UiHarness::dispatch(UiCore::KeyEvent.Down(modifier))
+    click(handle)
+    UiHarness::dispatch(UiCore::KeyEvent.Up(modifier))
+
+def test_hierarchy_multi_selection() -> void:
+    # Build two siblings and exercise actual retained hierarchy callbacks with
+    # both platform selection modifiers, then delete/undo the selected roots.
+    _ = HostClient::request(host_process, 10, 0, 0)
+    _ = HostClient::request(host_process, 30, 4, 0)
+    _ = HostClient::request(host_process, 31, 0, 0)
+    _ = HostClient::request(host_process, 30, 3, 0)
+    refresh_all(shell, host_process)
+    expect_integration(shell.projection.hierarchy_count == 3, 100)
+
+    click(shell.hierarchy_rows[0.usize()])
+    click_with_modifier(shell.hierarchy_rows[1.usize()], UiCore::Key.LeftControl)
+    row_zero: HostClient::HostReply = HostClient::request(host_process, 43, 0, 0)
+    row_one: HostClient::HostReply = HostClient::request(host_process, 43, 1, 0)
+    expect_integration(shell.projection.selection_count == 2 and row_zero.result == 1 and row_one.result == 1, 101)
+    expect_integration(shell.hierarchy_breadcrumb_count == 2
+        and same_text(UiFlat::widget(shell.hierarchy_breadcrumb_segments[0.usize()].widget_id.usize()).text, "Column")
+        and same_text(UiFlat::widget(shell.hierarchy_breadcrumb_segments[1.usize()].widget_id.usize()).text, "Button"), 113)
+
+    click_with_modifier(shell.hierarchy_rows[2.usize()], UiCore::Key.LeftControl)
+    expect_integration(shell.projection.selection_count == 3, 102)
+    expect_integration(shell.hierarchy_breadcrumb_count == 2
+        and same_text(UiFlat::widget(shell.hierarchy_breadcrumb_segments[0.usize()].widget_id.usize()).text, "Column")
+        and same_text(UiFlat::widget(shell.hierarchy_breadcrumb_segments[1.usize()].widget_id.usize()).text, "Label"), 114)
+    click_with_modifier(shell.hierarchy_rows[1.usize()], UiCore::Key.LeftControl)
+    row_one_after_toggle: HostClient::HostReply = HostClient::request(host_process, 43, 1, 0)
+    expect_integration(shell.projection.selection_count == 2 and row_one_after_toggle.result == 0, 103)
+
+    click_with_modifier(shell.hierarchy_rows[1.usize()], UiCore::Key.LeftSuper)
+    expect_integration(shell.projection.selection_count == 3, 104)
+    click_with_modifier(shell.hierarchy_rows[1.usize()], UiCore::Key.LeftSuper)
+    expect_integration(shell.projection.selection_count == 2, 105)
+
+    click(shell.hierarchy_rows[2.usize()])
+    row_zero_after_plain: HostClient::HostReply = HostClient::request(host_process, 43, 0, 0)
+    row_two_after_plain: HostClient::HostReply = HostClient::request(host_process, 43, 2, 0)
+    expect_integration(shell.projection.selection_count == 1
+        and row_zero_after_plain.result == 0 and row_two_after_plain.result == 1, 106)
+
+    click(shell.hierarchy_rows[1.usize()])
+    click_with_modifier(shell.hierarchy_rows[0.usize()], UiCore::Key.LeftShift)
+    range_row_zero: HostClient::HostReply = HostClient::request(host_process, 43, 0, 0)
+    range_row_one: HostClient::HostReply = HostClient::request(host_process, 43, 1, 0)
+    range_row_two: HostClient::HostReply = HostClient::request(host_process, 43, 2, 0)
+    expect_integration(shell.projection.selection_count == 2
+        and range_row_zero.result == 1 and range_row_one.result == 1 and range_row_two.result == 0, 110)
+    click_with_modifier(shell.hierarchy_rows[2.usize()], UiCore::Key.LeftShift)
+    repeated_range_row_zero: HostClient::HostReply = HostClient::request(host_process, 43, 0, 0)
+    repeated_range_row_one: HostClient::HostReply = HostClient::request(host_process, 43, 1, 0)
+    repeated_range_row_two: HostClient::HostReply = HostClient::request(host_process, 43, 2, 0)
+    expect_integration(shell.projection.selection_count == 2
+        and repeated_range_row_zero.result == 0 and repeated_range_row_one.result == 1 and repeated_range_row_two.result == 1, 112)
+    click(shell.hierarchy_rows[2.usize()])
+    expect_integration(shell.projection.selection_count == 1, 111)
+
+    click(shell.hierarchy_rows[1.usize()])
+    click_with_modifier(shell.hierarchy_rows[2.usize()], UiCore::Key.LeftControl)
+    expect_integration(shell.projection.selection_count == 2, 107)
+    command(shell, 12, 0)
+    expect_integration(shell.projection.hierarchy_count == 1, 108)
+    command(shell, 13, 0)
+    expect_integration(shell.projection.hierarchy_count == 3, 109)
+    click(shell.hierarchy_rows[2.usize()])
+    expect_integration(shell.hierarchy_breadcrumb_count == 2
+        and same_text(UiFlat::widget(shell.hierarchy_breadcrumb_segments[1.usize()].widget_id.usize()).text, "Label"), 115)
+    click(shell.hierarchy_breadcrumb_segments[0.usize()])
+    breadcrumb_root_selected: HostClient::HostReply = HostClient::request(host_process, 43, 0, 0)
+    expect_integration(shell.projection.selection_count == 1 and breadcrumb_root_selected.result == 1
+        and shell.hierarchy_breadcrumb_count == 1
+        and same_text(UiFlat::widget(shell.hierarchy_breadcrumb_segments[0.usize()].widget_id.usize()).text, "Column"), 116)
+    _ = HostClient::request(host_process, 10, 0, 0)
+    refresh_all(shell, host_process)
+
+def test_deep_hierarchy_breadcrumb() -> void:
+    # The breadcrumb keeps a bounded number of visible segments and maps its
+    # leading ellipsis to the hidden ancestor immediately before them.
+    _ = HostClient::request(host_process, 10, 0, 0)
+    for depth in 0..<7:
+        _ = HostClient::request(host_process, 30, 0, 0)
+    refresh_all(shell, host_process)
+    expect_integration(shell.projection.hierarchy_count == 8
+        and shell.hierarchy_breadcrumb_truncated
+        and shell.hierarchy_breadcrumb_count == MAX_HIERARCHY_BREADCRUMB_SEGMENTS
+        and same_text(UiFlat::widget(shell.hierarchy_breadcrumb_segments[0.usize()].widget_id.usize()).text, "..."), 117)
+    ellipsis_ancestor_row: HostClient::HostReply = HostClient::request(host_process, 65, shell.hierarchy_breadcrumb_first - 1, 0)
+    expect_integration(ellipsis_ancestor_row.result == 2, 123)
+    ellipsis_widget: UiFlat::Widget = UiFlat::widget(shell.hierarchy_breadcrumb_segments[0.usize()].widget_id.usize())
+    ellipsis_hit: usize = UiFlat::hit(ellipsis_widget.x + ellipsis_widget.width * 0.5, ellipsis_widget.y + ellipsis_widget.height * 0.5)
+    expect_integration(ellipsis_hit == shell.hierarchy_breadcrumb_segments[0.usize()].widget_id.usize(), 127)
+    click(shell.hierarchy_breadcrumb_segments[0.usize()])
+    selected_hidden_ancestor: HostClient::HostReply = HostClient::request(host_process, 43, 2, 0)
+    selected_deep_node: HostClient::HostReply = HostClient::request(host_process, 43, 7, 0)
+    expect_integration(shell.projection.selection_count == 1, 118)
+    expect_integration(selected_hidden_ancestor.result == 1, 119)
+    expect_integration(selected_deep_node.result == 0, 120)
+    expect_integration(not shell.hierarchy_breadcrumb_truncated, 121)
+    expect_integration(shell.hierarchy_breadcrumb_count == 3, 122)
+    _ = HostClient::request(host_process, 10, 0, 0)
+    refresh_all(shell, host_process)
+
+def test_keyboard_reorder_shortcuts() -> void:
+    # Build two siblings directly through the real host, then use the public
+    # key-event path to exercise application shortcut resolution and refresh.
+    _ = HostClient::request(host_process, 10, 0, 0)
+    dispatch_insert_shortcut()
+    expect_integration(shell.projection.node_count == 2 and shell.projection.selection_count == 1, 154)
+    command(shell, 13, 0)
+    expect_integration(shell.projection.node_count == 1, 155)
+    command(shell, 14, 0)
+    expect_integration(shell.projection.node_count == 2, 156)
+    command(shell, 13, 0)
+    _ = HostClient::request(host_process, 30, 4, 0)
+    _ = HostClient::request(host_process, 31, 0, 0)
+    _ = HostClient::request(host_process, 30, 3, 0)
+    _ = HostClient::request(host_process, 31, 1, 0)
+    refresh_all(shell, host_process)
+
+    button_type: HostClient::HostReply = HostClient::request(host_process, 51, 1, 0)
+    label_type: HostClient::HostReply = HostClient::request(host_process, 51, 2, 0)
+    expect_integration(shell.projection.node_count == 3
+        and not same_text(ShellBytes::view_of(&button_type.text), ShellBytes::view_of(&label_type.text)), 90)
+
+    # Editable text gets first refusal even when the design selection is a
+    # reorderable node.
+    focused_edit_field: UiHandles::Handle = shell.compact_open_path_field if shell.compact_mode else shell.open_path_field
+    _ = UiHandles::request_focus(focused_edit_field)
+    expect_integration(UiHandles::is_focused(focused_edit_field) and shell_text_focus(shell), 97)
+    dispatch_reorder_shortcut(UiCore::Key.Down)
+    row_after_focused_key: HostClient::HostReply = HostClient::request(host_process, 51, 1, 0)
+    expect_integration(same_text(ShellBytes::view_of(&row_after_focused_key.text), ShellBytes::view_of(&button_type.text)), 91)
+    UiFlat::clear_focus()
+
+    dispatch_reorder_shortcut(UiCore::Key.Down)
+    row_one_after_down: HostClient::HostReply = HostClient::request(host_process, 51, 1, 0)
+    row_two_after_down: HostClient::HostReply = HostClient::request(host_process, 51, 2, 0)
+    selection_after_down: HostClient::HostReply = HostClient::request(host_process, 55, 0, 0)
+    expect_integration(same_text(ShellBytes::view_of(&row_one_after_down.text), ShellBytes::view_of(&label_type.text))
+        and same_text(ShellBytes::view_of(&row_two_after_down.text), ShellBytes::view_of(&button_type.text)), 92)
+    expect_integration(same_text(ShellBytes::view_of(&selection_after_down.text), ShellBytes::view_of(&button_type.text)), 93)
+
+    dispatch_reorder_shortcut(UiCore::Key.Up)
+    row_one_after_up: HostClient::HostReply = HostClient::request(host_process, 51, 1, 0)
+    row_two_after_up: HostClient::HostReply = HostClient::request(host_process, 51, 2, 0)
+    expect_integration(same_text(ShellBytes::view_of(&row_one_after_up.text), ShellBytes::view_of(&button_type.text))
+        and same_text(ShellBytes::view_of(&row_two_after_up.text), ShellBytes::view_of(&label_type.text)), 94)
+
+    dispatch_reorder_shortcut(UiCore::Key.Up)
+    boundary_row_one: HostClient::HostReply = HostClient::request(host_process, 51, 1, 0)
+    expect_integration(same_text(ShellBytes::view_of(&boundary_row_one.text), ShellBytes::view_of(&button_type.text)), 95)
+    command(shell, 13, 0)
+    command(shell, 13, 0)
+    command(shell, 13, 0)
+    command(shell, 13, 0)
+    refresh_all(shell, host_process)
+    expect_integration(shell.projection.node_count == 1 and not shell.projection.dirty, 96)
+
 def app_init() -> void:
     _ = PosixFile::remove(SAVE_PATH)
+    clean_generated_project()
+    clean_test_project(PROJECT_FORM_PATH, PROJECT_MANIFEST_PATH, "build/New Elisa Project/forms", PROJECT_ROOT_PATH)
+    clean_test_project(COMPACT_PROJECT_FORM_PATH, COMPACT_PROJECT_MANIFEST_PATH, "build/Compact Elisa Project/forms", COMPACT_PROJECT_ROOT_PATH)
     _ = PosixFile::remove("build/shell-integration-preferences.json")
     _ = integration_setenv("ELISA_IDE_CONFIG", "build/shell-integration-preferences.json")
     init(shell)
@@ -140,6 +653,10 @@ def app_frame() -> void:
 def main() -> i64:
     UiHarness::start(1180.0, 760.0)
     UiHarness::focus_gained()
+    test_geometry_acceptance()
+    test_preview_path_isolation()
+    test_frame_identity_acceptance()
+    test_build_diagnostic_projection()
 
     # Cold launch owns a clean untitled form: New/Open remain usable and Save
     # is disabled until this document has a destination.
@@ -161,6 +678,24 @@ def main() -> i64:
     click(shell.hierarchy_rows[1.usize()])
     expect_integration(shell.projection.selection_count == 1 and shell.projection.inspector_count > 0, 14)
 
+    # Node display names and generated symbols are editable as distinct
+    # inspector rows, after the component's registered properties.
+    expect_integration(shell.projection.inspector_count == 14
+        and shell.inspector_tags[12.usize()] == 7
+        and shell.inspector_tags[13.usize()] == 7, 188)
+    display_name_label: HostClient::HostReply = HostClient::request(&host_process, 52, 12, 0)
+    generated_symbol_label: HostClient::HostReply = HostClient::request(&host_process, 52, 13, 0)
+    expect_integration(same_text(ShellBytes::view_of(&display_name_label.text), "Display name")
+        and same_text(ShellBytes::view_of(&generated_symbol_label.text), "Generated symbol")
+        and same_text(UiHandles::text_value(shell.inspector_editors[12.usize()]), "Button"), 189)
+    type_editor_value(shell.inspector_editors[12.usize()], "Save action")
+    expect_integration(same_text(UiHandles::text_value(shell.inspector_editors[12.usize()]), "Save action"), 190)
+    type_editor_value(shell.inspector_editors[13.usize()], "save_action")
+    renamed_source: HostClient::HostReply = HostClient::request(&host_process, 106, 0, 0)
+    expect_integration(same_text(UiHandles::text_value(shell.inspector_editors[12.usize()]), "Save action")
+        and same_text(UiHandles::text_value(shell.inspector_editors[13.usize()]), "save_action")
+        and bytes_contain(renamed_source.text, "def widget_save_action()"), 191)
+
     # Commit a caption through the same inspector submit callback as Enter.
     type_editor_value(shell.inspector_editors[0.usize()], "Hello from the shell")
     expect_integration(same_text(UiHandles::text_value(shell.inspector_editors[0.usize()]), "Hello from the shell"), 20)
@@ -171,12 +706,23 @@ def main() -> i64:
     expect_integration(same_text(ShellBytes::view_of(&committed_caption.text), "Hello from the shell"), 28)
     preview_snapshot_before: HostClient::HostReply = HostClient::request(&host_process, 80, 0, 0)
     expect_integration(bytes_contain(preview_snapshot_before.text, "Hello from the shell"), 29)
-    preview_output_before: mutable darray[u8] = []
-    preview_frame_before: mutable darray[u8] = []
-    expect_integration(run_preview(preview_snapshot_before, &preview_output_before, &preview_frame_before)
-        and bytes_contain(preview_output_before, "preview_revision=")
-        and bytes_contain(preview_output_before, "rect n2 ")
-        and bytes_contain(preview_output_before, "rect n3 "), 35)
+    preview_frame_before: i64 = run_preview(preview_snapshot_before)
+    expect_integration(preview_frame_before > 0, 35)
+    refresh_all(shell, host_process)
+    shell_preview_ready_for_test: bool = wait_for_shell_preview(60000)
+    expect_integration(shell_preview_ready_for_test, 38)
+    expect_integration(shell.preview_region_count == 2, 39)
+    click(shell.hierarchy_rows[0.usize()])
+    expect_integration(shell.projection.selection_count == 1, 51)
+    click_result: bool = click_last_preview_region_from_canvas()
+    expect_integration(click_result, 52)
+    selected_row: HostClient::HostReply = HostClient::request(&host_process, 43, 1, 0)
+    expect_integration(shell.projection.selection_count == 1 and selected_row.result == 1, 53)
+    expect_integration(same_text(UiHandles::text_value(shell.inspector_editors[0.usize()]), "Hello from the shell"), 54)
+    click(shell.preview_retry_button)
+    expect_integration(shell.preview_pending and shell.preview_ready and shell.preview_region_count == 0, 66)
+    preview_retry_completed: bool = wait_for_shell_preview(60000)
+    expect_integration(preview_retry_completed and shell.preview_region_count == 2, 67)
     expect_integration(UiHandles::activate(shell.undo_button), 22)
     undo_caption: HostClient::HostReply = HostClient::request(&host_process, 53, 0, 0)
     expect_integration(same_text(ShellBytes::view_of(&undo_caption.text), "Button"), 26)
@@ -184,11 +730,8 @@ def main() -> i64:
     preview_snapshot_after: HostClient::HostReply = HostClient::request(&host_process, 80, 0, 0)
     expect_integration(bytes_contain(preview_snapshot_after.text, "Button")
         and not bytes_contain(preview_snapshot_after.text, "Hello from the shell"), 36)
-    preview_output_after: mutable darray[u8] = []
-    preview_frame_after: mutable darray[u8] = []
-    preview_rerendered: bool = run_preview(preview_snapshot_after, &preview_output_after, &preview_frame_after)
-    expect_integration(preview_rerendered and bytes_contain(preview_output_after, "preview_revision=")
-        and not bytes_equal(preview_frame_before, preview_frame_after), 37)
+    preview_frame_after: i64 = run_preview(preview_snapshot_after)
+    expect_integration(preview_frame_after > 0 and preview_frame_before != preview_frame_after, 37)
 
     # Save As is available for the untitled document. Reopen it through the
     # visible shell controls after the successful commit.
@@ -206,15 +749,198 @@ def main() -> i64:
     click(shell.hierarchy_rows[1.usize()])
     expect_integration(same_text(UiHandles::text_value(shell.inspector_editors[0.usize()]), "Button"), 34)
 
+    # The generated source projection is available beside the RAD canvas and
+    # remains read-only; toggling the same command returns to the canvas.
+    expect_integration(UiHandles::activate(shell.source_button), 127)
+    source_view: sview = UiFlat::widget(shell.source_text.widget_id.usize()).text
+    source_bytes: mutable darray[u8] = geometry_bytes(source_view)
+    expect_integration(shell.source_mode, 131)
+    expect_integration(UiHandles::is_visible(shell.source_pane), 132)
+    expect_integration(not UiHandles::is_visible(shell.source_open_editor_button), 142)
+    expect_integration(not UiHandles::is_visible(shell.source_reveal_button), 163)
+    source_ownership_text: sview = UiFlat::widget(shell.source_ownership.widget_id.usize()).text
+    expect_integration(UiHandles::is_visible(shell.source_ownership)
+        and bytes_contain(geometry_bytes(source_ownership_text), "Form:")
+        and bytes_contain(geometry_bytes(source_ownership_text), "generated view is read-only"), 137)
+    expect_integration(shell.source_line_count > 0
+        and UiHandles::is_visible(shell.source_line_rows[0.usize()]), 136)
+    expect_integration(bytes_contain(source_bytes, "module main_view:"), 133)
+    expect_integration(bytes_contain(source_bytes, "def build() -> bool"), 134)
+    source_owner_line: mutable i32 = -1
+    button_byte_offset: i64 = byte_index_of(source_bytes, "UiHandles::button")
+    source_scan: mutable i32 = 0
+    while source_scan < shell.source_line_count:
+        next_offset: mutable i64 = source_bytes.count.i64()
+        if source_scan + 1 < shell.source_line_count:
+            next_offset <- shell.source_line_offsets[(source_scan + 1).usize()]
+        if button_byte_offset >= shell.source_line_offsets[source_scan.usize()] and button_byte_offset < next_offset:
+            source_owner_line <- source_scan
+            break
+        source_scan <- source_scan + 1
+    source_owner_activation: mutable bool = false
+    source_owner_result: mutable bool = false
+    source_owner_name: mutable bool = false
+    if source_owner_line >= 0:
+        if UiHandles::widget(shell.source_line_rows[source_owner_line.usize()]) is source_widget:
+            center_x: f32 = source_widget.x + source_widget.width * 0.5
+            center_y: f32 = source_widget.y + source_widget.height * 0.5
+            source_click_row: i32 = source_row_at(shell, UiCore::Vec2(center_x, center_y))
+            expect_integration(source_click_row == source_owner_line, 190)
+            source_owner_activation <- true
+            UiHarness::dispatch(UiCore::PointerEvent.Down(at: UiCore::Vec2(center_x, center_y), button: UiCore::PointerButton.Primary.i32()))
+            UiHarness::dispatch(UiCore::PointerEvent.Up(at: UiCore::Vec2(center_x, center_y), button: UiCore::PointerButton.Primary.i32()))
+        selected_name: HostClient::HostReply = HostClient::request(host_process, 54, 0, 0)
+        source_owner_result <- selected_name.result == 1
+        source_owner_name <- same_text(ShellBytes::view_of(&selected_name.text), "Button")
+    expect_integration(source_owner_line >= 0, 138)
+    expect_integration(source_owner_activation, 139)
+    expect_integration(source_owner_result, 140)
+    expect_integration(source_owner_name, 141)
+    expect_integration(UiHandles::activate(shell.source_button), 130)
+    expect_integration(not shell.source_mode and UiHandles::is_visible(shell.surface_pane), 129)
+
+    # A regular Elisa source file opens in the bounded line editor. A copied
+    # fixture lets the shell test verify Save without changing tracked input.
+    source_fixture: mutable darray[u8] = []
+    source_fixture_length: usize = PosixFile::read_bytes(&source_fixture, SOURCE_VIEW_PATH, 1048576)
+    _ = PosixFile::remove(SOURCE_EDIT_PATH)
+    source_copy_length: i64 = PosixFile::write_plain(SOURCE_EDIT_PATH, ShellBytes::view_of(&source_fixture))
+    expect_integration(source_fixture_length > 0 and source_copy_length == source_fixture_length.i64(), 153)
+    UiHandles::replace_text(shell.open_path_field, sview(SOURCE_EDIT_PATH, 0, -1))
+    click(shell.open_button)
+    source_first_line: sview = UiHandles::text_value(shell.source_line_rows[0.usize()])
+    source_title_text: sview = UiFlat::widget(shell.source_title.widget_id.usize()).text
+    expect_integration(shell.source_mode and UiHandles::is_visible(shell.source_pane)
+        and same_text(source_title_text, "Elisa source"), 154)
+    expect_integration(UiHandles::is_visible(shell.source_open_editor_button)
+        and UiHandles::is_enabled(shell.source_open_editor_button), 162)
+    expect_integration(UiHandles::is_visible(shell.source_reveal_button)
+        and UiHandles::is_enabled(shell.source_reveal_button), 164)
+    expect_integration(shell.source_line_count == 32
+        and bytes_contain(geometry_bytes(source_first_line), "1: module source_view:"), 155)
+    source_editor: UiHandles::Handle = shell.source_line_rows[0.usize()]
+    source_editor_original: sview = UiHandles::text_value(source_editor)
+    source_editor_focused: bool = UiHandles::request_focus(source_editor)
+    UiHandles::set_selection_utf16(source_editor, 0, source_editor_original.len.usize())
+    app_text_input("1: module source_view_edited:")
+    app_widget_event(source_editor.widget_id.usize(), UiConst::WidgetEvent.Change.i32())
+    edited_source_line: HostClient::HostReply = HostClient::request(host_process, 116, 0, 0)
+    expect_integration(source_editor_focused and edited_source_line.result == 1
+        and same_text(ShellBytes::view_of(&edited_source_line.text), "module source_view_edited:")
+        and HostClient::request(host_process, 130, 0, 0).result == 1
+        and same_text(UiFlat::widget(shell.source_title.widget_id.usize()).text, "Elisa source (modified)"), 165)
+    click(shell.save_button)
+    saved_source_bytes: mutable darray[u8] = []
+    saved_source_length: usize = PosixFile::read_bytes(&saved_source_bytes, SOURCE_EDIT_PATH, 1048576)
+    expect_integration(HostClient::request(host_process, 130, 0, 0).result == 0
+        and saved_source_length > 0 and bytes_contain(saved_source_bytes, "module source_view_edited:")
+        and same_text(UiFlat::widget(shell.source_title.widget_id.usize()).text, "Elisa source"), 166)
+    expect_integration(UiHandles::is_enabled(shell.source_next_button), 156)
+    expect_integration(UiHandles::activate(shell.source_next_button), 157)
+    source_second_page: sview = UiHandles::text_value(shell.source_line_rows[0.usize()])
+    expect_integration(shell.source_page_start == 32
+        and bytes_contain(geometry_bytes(source_second_page), "33:     def source_view_marker() -> i64:"), 158)
+    click(shell.source_line_rows[0.usize()])
+    expect_integration(shell.source_selected_line == 33
+        and bytes_contain(geometry_bytes(status_view(shell)), "Selected source line 33"), 160)
+    expect_integration(UiHandles::activate(shell.source_previous_button) and shell.source_page_start == 0, 161)
+
+    # Create a project under a folder path containing spaces, edit its form,
+    # save through the project-relative destination, and reopen the manifest.
+    UiHandles::replace_text(shell.open_path_field, sview(PROJECT_ROOT_PATH, 0, -1))
+    click(shell.new_project_button)
+    expect_integration(not shell.projection.dirty and shell.projection.node_count == 1, 40)
+    manifest_bytes: mutable darray[u8] = []
+    manifest_length: usize = PosixFile::read_bytes(&manifest_bytes, PROJECT_MANIFEST_PATH, 1048576)
+    form_bytes: mutable darray[u8] = []
+    form_length: usize = PosixFile::read_bytes(&form_bytes, PROJECT_FORM_PATH, 1048576)
+    expect_integration(manifest_length > 0 and bytes_contain(manifest_bytes, "New Elisa Project")
+        and bytes_contain(manifest_bytes, "forms/main.elisaform.json"), 41)
+    expect_integration(form_length > 0 and bytes_contain(form_bytes, "form-main") and bytes_contain(form_bytes, "node"), 42)
+
+    click(shell.palette_rows[4.usize()])
+    expect_integration(shell.projection.dirty and not UiHandles::is_enabled(shell.new_project_button), 43)
+    # Exercise the replacement guard directly as well as the disabled button:
+    # a dirty project must remain open and no folder should be created.
+    create_project(shell)
+    update_status(shell)
+    expect_integration(shell.projection.dirty and shell.projection.node_count == 2
+        and same_text(status_view(shell), "Save this document before creating a project"), 44)
+    click(shell.hierarchy_rows[1.usize()])
+    type_editor_value(shell.inspector_editors[0.usize()], "Project saved")
+    expect_integration(UiHandles::is_enabled(shell.save_button), 50)
+    click(shell.save_button)
+    expect_integration(not shell.projection.dirty, 45)
+    UiHandles::replace_text(shell.open_path_field, sview(PROJECT_MANIFEST_PATH, 0, -1))
+    click(shell.open_button)
+    expect_integration(not shell.projection.dirty and shell.projection.node_count == 2, 46)
+    expect_integration(shell.file_count == 4
+        and UiHandles::is_visible(shell.file_rows[0.usize()])
+        and same_text(UiFlat::widget(shell.file_rows[0.usize()].widget_id.usize()).text, "New Elisa Project.elisaproject.json")
+        and same_text(UiFlat::widget(shell.file_rows[1.usize()].widget_id.usize()).text, "forms/main.elisaform.json")
+        and same_text(UiFlat::widget(shell.file_rows[2.usize()].widget_id.usize()).text, "generated/App_view.elisa"), 145)
+    expect_integration(UiHandles::activate(shell.file_rows[2.usize()])
+        and shell.source_mode and UiHandles::is_visible(shell.source_pane), 146)
+    expect_integration(UiHandles::activate(shell.source_button) and not shell.source_mode, 147)
+    click(shell.hierarchy_rows[1.usize()])
+    expect_integration(same_text(UiHandles::text_value(shell.inspector_editors[0.usize()]), "Project saved"), 47)
+
+    # Build the saved project through the shell's supervised job path. The
+    # generated project remains independent of the designer process and must
+    # publish only after the current build revision exits successfully.
+    click(shell.build_button)
+    build_wait: mutable i64 = 0
+    while BuildJob::is_running(&build_job) and build_wait < 120000:
+        app_frame()
+        build_wait <- build_wait + 1
+    built_project: mutable darray[u8] = []
+    built_project_length: usize = PosixFile::read_bytes(&built_project, "build/elisa_project_app", 8)
+    expect_integration(build_wait < 120000 and build_job.state == BuildJob::State.Succeeded
+        and built_project_length > 0, 135)
+    build_output_text: sview = UiFlat::widget(shell.build_output.widget_id.usize()).text
+    build_output_view: sview = BuildJob::output_view(&build_job)
+    expect_integration(UiHandles::is_visible(shell.build_output), 142)
+    expect_integration(bytes_contain(geometry_bytes(build_output_view), "built project application"), 143)
+    expect_integration(bytes_contain(geometry_bytes(build_output_text), "built project application"), 144)
+    UiHandles::set_text(shell.build_output, "generated/main_view.elisa:3:5: error: invalid handler\n", 11.0, shell_color(172, 184, 204))
+    shell.build_problem_count <- build_diagnostic_count(UiFlat::widget(shell.build_output.widget_id.usize()).text)
+    refresh_problems(shell, host_process)
+    build_problem_text: sview = UiFlat::widget(shell.problem_rows[0.usize()].widget_id.usize()).text
+    expect_integration(shell.build_problem_count == 1 and UiHandles::is_visible(shell.problem_rows[0.usize()])
+        and bytes_contain(geometry_bytes(build_problem_text), "invalid handler"), 151)
+    _ = widget_event_rows(shell, shell.problem_rows[0.usize()].widget_id.usize())
+    expect_integration(UiHandles::is_visible(shell.problem_rows[0.usize()]), 152)
+    expect_integration(bytes_contain(geometry_bytes(status_view(shell)), "source mapping is unavailable"), 153)
+    expect_integration(shell.problem_copy_length > 0 and UiHandles::is_enabled(shell.problem_copy_button), 165)
+    expect_integration(widget_event_rows(shell, shell.problem_copy_button.widget_id.usize())
+        and same_text(status_view(shell), "The system clipboard is unavailable"), 166)
+
+    test_hierarchy_multi_selection()
+    test_deep_hierarchy_breadcrumb()
+    test_drag_editing()
+
+    # The compact path row exposes the same project action at narrow widths.
+    clean_test_project(COMPACT_PROJECT_FORM_PATH, COMPACT_PROJECT_MANIFEST_PATH, "build/Compact Elisa Project/forms", COMPACT_PROJECT_ROOT_PATH)
+    UiCore::set_viewport(600.0, 760.0)
+    apply_shell_layout(shell)
+    UiHandles::layout(UiCore::viewport_width(), UiCore::viewport_height())
+    expect_integration(shell.compact_mode and UiHandles::is_visible(shell.compact_new_project_button), 48)
+    UiHandles::replace_text(shell.compact_open_path_field, sview(COMPACT_PROJECT_ROOT_PATH, 0, -1))
+    click(shell.compact_new_project_button)
+    compact_manifest: mutable darray[u8] = []
+    compact_manifest_length: usize = PosixFile::read_bytes(&compact_manifest, COMPACT_PROJECT_MANIFEST_PATH, 1048576)
+    expect_integration(compact_manifest_length > 0 and not shell.projection.dirty and shell.projection.node_count == 1, 49)
+
+    test_keyboard_reorder_shortcuts()
     UiHarness::frame()
     return finish()
 
 def finish() -> i64:
-    ShellPreview::stop()
+    ShellPreview::stop(shell)
     clean_host()
     UiHarness::stop()
     if integration_failure != 0:
         integration_report_i64("designer shell integration assertion=", integration_failure)
         return 1
-    integration_report_i64("designer shell integration assertions passed=", 29)
+    integration_report_i64("designer shell integration assertions passed=", integration_assertion_count)
     return 0

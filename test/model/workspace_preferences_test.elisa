@@ -76,7 +76,7 @@ module WorkspacePreferencesTest:
             TestSupport::check("encode/decode preserves local preference values", round_trip.theme == preferences.theme and round_trip.recent_files.count == preferences.recent_files.count and round_trip.left_pane_ratio == preferences.left_pane_ratio and round_trip.right_pane_ratio == preferences.right_pane_ratio and round_trip.bottom_pane_ratio == preferences.bottom_pane_ratio and DesignText::equal(WorkspacePreferences::recent_path(round_trip, 0), WorkspacePreferences::recent_path(preferences, 0)))
 
             quoted: mutable WorkspacePreferences::Preferences = WorkspacePreferences::empty()
-            quoted.recent_files.push(DesignValues::append(quoted.strings.bytes, "/Users/me/A \"quoted\" form.elisaform.json"))
+            quoted.recent_files.push(DesignValues::append(&quoted.strings.bytes, "/Users/me/A \"quoted\" form.elisaform.json"))
             quoted_sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
             quoted_json: darray[u8] = WorkspacePreferences::encode(quoted, &quoted_sink)
             quoted_round_trip: WorkspacePreferences::Preferences = WorkspacePreferences::decode(TestSupport::view_of(quoted_json), &quoted_sink)

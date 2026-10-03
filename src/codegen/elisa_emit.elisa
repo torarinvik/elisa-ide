@@ -123,8 +123,12 @@ module ElisaEmit:
 
         def push_number(out: mutable darray[u8]&, value: f64) -> bool:
             return false if not is_finite(value)
+            arena: mutable Arena = Arena{begin: null, end: null, end_index: 0, strategy: 0}
             number: mutable darray[u8] = []
-            json_emit_number(&number, value)
+            in arena:
+                handle: JsonValueHandle[arena] = json_handle_number(&arena, value)
+                can Memory.Allocate, Abort.Panic, Console.Format, Unsafe.PointerCast:
+                    number <- json_handle_write(&arena, handle)
             return false if number.count == 0 or DesignText::equal(DesignText::view_of(number), "null")
             source: sview = DesignText::view_of(number)
             push_text(out, source)
@@ -260,6 +264,66 @@ module ElisaEmit:
                 push_text(out, ", ")
                 mapped_color(out, pending, operation.source_node, "fill", effective_color(form, registry, node, operation.component_index, "fill"))
                 push_text(out, ")\n")
+            elif DesignText::equal(type_key, "elisa.ui.check_box") or DesignText::equal(type_key, "elisa.ui.radio_button"):
+                push_text(out, "check_box(" if DesignText::equal(type_key, "elisa.ui.check_box") else "radio_button(")
+                push_parent(out, operation.parent_operation)
+                push_text(out, ", ")
+                return false if not mapped_numeric_argument(out, pending, form, registry, node, operation.component_index, operation.source_node, "minimumWidth")
+                push_text(out, ", ")
+                return false if not mapped_numeric_argument(out, pending, form, registry, node, operation.component_index, operation.source_node, "minimumHeight")
+                push_text(out, ", ")
+                mapped_color(out, pending, operation.source_node, "color", effective_color(form, registry, node, operation.component_index, "color"))
+                push_text(out, ", ")
+                mapped_color(out, pending, operation.source_node, "hoverColor", effective_color(form, registry, node, operation.component_index, "hoverColor"))
+                push_text(out, ", ")
+                mapped_color(out, pending, operation.source_node, "pressColor", effective_color(form, registry, node, operation.component_index, "pressColor"))
+                push_text(out, ")\n")
+            elif DesignText::equal(type_key, "elisa.ui.slider"):
+                push_text(out, "slider_labeled(")
+                push_parent(out, operation.parent_operation)
+                push_text(out, ", ")
+                mapped_text(out, pending, operation.source_node, "label", effective_text(form, registry, node, operation.component_index, "label"))
+                push_text(out, ", ")
+                return false if not mapped_numeric_argument(out, pending, form, registry, node, operation.component_index, operation.source_node, "minimumWidth")
+                push_text(out, ", ")
+                return false if not mapped_numeric_argument(out, pending, form, registry, node, operation.component_index, operation.source_node, "minimumHeight")
+                push_text(out, ", ")
+                return false if not mapped_numeric_argument(out, pending, form, registry, node, operation.component_index, operation.source_node, "value")
+                push_text(out, ", ")
+                mapped_color(out, pending, operation.source_node, "trackColor", effective_color(form, registry, node, operation.component_index, "trackColor"))
+                push_text(out, ", ")
+                mapped_color(out, pending, operation.source_node, "fillColor", effective_color(form, registry, node, operation.component_index, "fillColor"))
+                push_text(out, ", ")
+                mapped_color(out, pending, operation.source_node, "thumbColor", effective_color(form, registry, node, operation.component_index, "thumbColor"))
+                push_text(out, ")\n")
+            elif DesignText::equal(type_key, "elisa.ui.progress_bar"):
+                push_text(out, "progress_bar_labeled(")
+                push_parent(out, operation.parent_operation)
+                push_text(out, ", ")
+                mapped_text(out, pending, operation.source_node, "label", effective_text(form, registry, node, operation.component_index, "label"))
+                push_text(out, ", ")
+                return false if not mapped_numeric_argument(out, pending, form, registry, node, operation.component_index, operation.source_node, "minimumWidth")
+                push_text(out, ", ")
+                return false if not mapped_numeric_argument(out, pending, form, registry, node, operation.component_index, operation.source_node, "minimumHeight")
+                push_text(out, ", ")
+                return false if not mapped_numeric_argument(out, pending, form, registry, node, operation.component_index, operation.source_node, "value")
+                push_text(out, ", ")
+                mapped_color(out, pending, operation.source_node, "trackColor", effective_color(form, registry, node, operation.component_index, "trackColor"))
+                push_text(out, ", ")
+                mapped_color(out, pending, operation.source_node, "fillColor", effective_color(form, registry, node, operation.component_index, "fillColor"))
+                push_text(out, ")\n")
+            elif DesignText::equal(type_key, "elisa.ui.scroll"):
+                push_text(out, "scroll(")
+                push_parent(out, operation.parent_operation)
+                push_text(out, ", ")
+                mapped_token(out, pending, operation.source_node, "axis", "UiConst::Axis.Row" if DesignText::equal(effective_text(form, registry, node, operation.component_index, "axis"), "row") else "UiConst::Axis.Column")
+                push_text(out, ", ")
+                return false if not mapped_numeric_argument(out, pending, form, registry, node, operation.component_index, operation.source_node, "minimumWidth")
+                push_text(out, ", ")
+                return false if not mapped_numeric_argument(out, pending, form, registry, node, operation.component_index, operation.source_node, "minimumHeight")
+                push_text(out, ", ")
+                mapped_color(out, pending, operation.source_node, "background", effective_color(form, registry, node, operation.component_index, "background"))
+                push_text(out, ")\n")
             else:
                 _ = DesignDiagnostics::report_error(sink, DesignDiagnostics::Code.UnsupportedTarget, "component", "the selected component has no source constructor mapping")
                 return false
@@ -334,10 +398,52 @@ module ElisaEmit:
                 push_text(out, ")\n")
 
             if DesignText::equal(type_key, "elisa.ui.text_field"):
+                push_text(out, "            UiHandles::set_help(")
+                push_text(out, handle)
+                push_text(out, ", ")
+                mapped_text(out, pending, operation.source_node, "help", effective_text(form, registry, node, operation.component_index, "help"))
+                push_text(out, ")\n")
                 push_text(out, "            UiHandles::set_secure(")
                 push_text(out, handle)
                 push_text(out, ", ")
                 mapped_token(out, pending, operation.source_node, "secure", "true" if effective_bool(form, registry, node, operation.component_index, "secure") else "false")
+                push_text(out, ")\n")
+
+            if DesignText::equal(type_key, "elisa.ui.check_box") or DesignText::equal(type_key, "elisa.ui.radio_button"):
+                push_text(out, "            UiHandles::set_text(")
+                push_text(out, handle)
+                push_text(out, ", ")
+                mapped_text(out, pending, operation.source_node, "text", effective_text(form, registry, node, operation.component_index, "text"))
+                push_text(out, ", ")
+                return false if not mapped_numeric_argument(out, pending, form, registry, node, operation.component_index, operation.source_node, "size")
+                push_text(out, ", ")
+                mapped_color(out, pending, operation.source_node, "textColor", effective_color(form, registry, node, operation.component_index, "textColor"))
+                push_text(out, ")\n")
+                push_text(out, "            UiHandles::set_selected(")
+                push_text(out, handle)
+                push_text(out, ", ")
+                mapped_token(out, pending, operation.source_node, "selected", "true" if effective_bool(form, registry, node, operation.component_index, "selected") else "false")
+                push_text(out, ")\n")
+                push_text(out, "            UiHandles::set_enabled(")
+                push_text(out, handle)
+                push_text(out, ", ")
+                mapped_token(out, pending, operation.source_node, "enabled", "true" if effective_bool(form, registry, node, operation.component_index, "enabled") else "false")
+                push_text(out, ")\n")
+
+            if DesignText::equal(type_key, "elisa.ui.slider") or DesignText::equal(type_key, "elisa.ui.progress_bar"):
+                push_text(out, "            UiHandles::set_text(")
+                push_text(out, handle)
+                push_text(out, ", ")
+                mapped_text(out, pending, operation.source_node, "label", effective_text(form, registry, node, operation.component_index, "label"))
+                push_text(out, ", ")
+                return false if not mapped_numeric_argument(out, pending, form, registry, node, operation.component_index, operation.source_node, "size")
+                push_text(out, ", ")
+                mapped_color(out, pending, operation.source_node, "textColor", effective_color(form, registry, node, operation.component_index, "textColor"))
+                push_text(out, ")\n") if DesignRegistry::find_property(registry, operation.component_index, "textColor") >= 0
+                push_text(out, "            UiHandles::set_value(")
+                push_text(out, handle)
+                push_text(out, ", ")
+                return false if not mapped_numeric_argument(out, pending, form, registry, node, operation.component_index, operation.source_node, "value")
                 push_text(out, ")\n")
 
             if DesignRegistry::find_property(registry, operation.component_index, "visible") >= 0:
@@ -360,6 +466,7 @@ module ElisaEmit:
 
         def emit_dispatch(out: mutable darray[u8]&, pending: mutable darray[PendingSpan]&, form: DesignForms::Form&, lowered: DesignLower::LoweredForm) -> void:
             push_text(out, "        def dispatch_widget_event(widget: usize, event: i32) -> void:\n")
+            emitted: mutable bool = false
             operation_index: mutable i64 = 0
             while operation_index < lowered.operations.count.i64():
                 operation: DesignLower::Operation = lowered.operations[operation_index.usize()]
@@ -376,8 +483,10 @@ module ElisaEmit:
                     push_text(out, DesignValues::text_of(form.strings, connection.handler))
                     push_text(out, "(widget, event)\n                return\n")
                     record_span(pending, event_start, out.count.i64(), CodegenSourceMap::OriginKind.Event, operation.source_node, DesignValues::text_of(form.strings, connection.event_key))
+                    emitted <- true
                     event_index <- event_index + 1
                 operation_index <- operation_index + 1
+            push_text(out, "            pass\n") if not emitted
 
         def build_source_map(source: darray[u8], form: DesignForms::Form&, pending: darray[PendingSpan]) -> CodegenSourceMap::SourceMap:
             source_text: sview = DesignText::view_of(source)
@@ -433,6 +542,24 @@ module ElisaEmit:
                 operation_index <- operation_index + 1
 
             push_text(&out, "            return true\n\n")
+            # User handlers need a supported way to address runtime controls.
+            # Export one generation-scoped accessor per stable node symbol;
+            # callers must reacquire handles after `build()` resets the tree.
+            operation_index <- 0
+            while operation_index < lowered.operations.count.i64():
+                operation: DesignLower::Operation = lowered.operations[operation_index.usize()]
+                node: DesignNodes::Node = form.nodes[operation.source_node.usize()]
+                accessor_start: i64 = out.count.i64()
+                push_text(&out, "        def widget_")
+                push_text(&out, DesignValues::text_of(form.strings, node.symbol))
+                push_text(&out, "() -> UiHandles::Handle:\n            return UiHandles::invalid() if not UiHandles::is_valid(widgets[")
+                push_index(&out, operation_index)
+                push_text(&out, "])\n            return widgets[")
+                push_index(&out, operation_index)
+                push_text(&out, "]\n\n")
+                record_span(&pending, accessor_start, out.count.i64(), CodegenSourceMap::OriginKind.Node, operation.source_node, "")
+                operation_index <- operation_index + 1
+
             emit_dispatch(&out, &pending, form, lowered)
             record_span(&pending, 0, out.count.i64(), CodegenSourceMap::OriginKind.Template, -1, "elisa.ui.generated-view")
             source_map: mutable CodegenSourceMap::SourceMap = build_source_map(out, form, pending)

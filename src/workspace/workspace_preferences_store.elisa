@@ -32,7 +32,7 @@ module WorkspacePreferencesStore:
                 target.push(47)
             append_view(target, suffix)
 
-        def as_cstr(path: mutable darray[u8]&) -> cstr:
+        def as_cstr(path: mutable darray[u8]&) -> cstr can[Unsafe.PointerCast]:
             return (&path[0]).cast[cstr] can Unsafe.PointerCast
 
         def path_length(path: mutable darray[u8]&) -> i64:
@@ -144,7 +144,7 @@ module WorkspacePreferencesStore:
             return "" if path.count == 0
             length: mutable usize = path.count
             length <- length - 1 if path[length - 1] == 0
-            return sview(&path[0], 0, length.i64())
+            return bytes_view_range(path, 0, length)
 
         def current_config_path() -> darray[u8]:
             explicit_opt: cstr? = getenv("ELISA_IDE_CONFIG")

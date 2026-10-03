@@ -88,6 +88,8 @@ module DesignCodegenTest:
             TestSupport::check("button constructor and styling emitted", TestSupport::text_contains(TestSupport::view_of(first.source), "UiHandles::set_text(widgets["))
             TestSupport::check("event handler dispatch emitted", TestSupport::text_contains(TestSupport::view_of(first.source), "SettingsHandlers::save_clicked(widget, event)"))
             TestSupport::check("valid handle checked", TestSupport::text_contains(TestSupport::view_of(first.source), "UiHandles::is_valid(widgets["))
+            TestSupport::check("generated view exports stable-symbol runtime handle accessors", TestSupport::text_contains(TestSupport::view_of(first.source), "def widget_save_button() -> UiHandles::Handle:") and TestSupport::text_contains(TestSupport::view_of(first.source), "def widget_status_label() -> UiHandles::Handle:") and TestSupport::text_contains(TestSupport::view_of(first.source), "def widget_name_input() -> UiHandles::Handle:") and TestSupport::text_contains(TestSupport::view_of(first.source), "def widget_volume_slider() -> UiHandles::Handle:"))
+            TestSupport::check("generated text-field help is emitted as widget help", TestSupport::text_contains(TestSupport::view_of(first.source), "UiHandles::set_help(widgets["))
 
             app_config: ElisaAppEmit::AppConfig = ElisaAppEmit::AppConfig{
                 framework_include: "../framework/src/platform/sdl3/ui_sdl3_flat.elisa",

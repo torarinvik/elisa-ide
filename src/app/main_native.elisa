@@ -1,21 +1,23 @@
-# Native entry: SDL3 backend + the model-backed designer shell.
-# ELISA_UI_SMOKE_FRAMES (with SDL_VIDEODRIVER=dummy) bounds the loop for headless checks.
+# Native IDE entry: AppKit owns the window and Skia paints its custom canvas.
+# UI test targets keep using the separate SDL3 backend and harness.
 
-include "../../framework/src/platform/sdl3/ui_sdl3_flat.elisa"
+include "../../framework/src/platform/appkit/ui_appkit_canvas_flat.elisa"
+include "../../framework/src/platform/appkit/ui_appkit_canvas_skia.elisa"
+include "../platform/ide_preview_image_skia.elisa"
 include "../shell/shell_app.elisa"
 
-def smoke_frames() -> i64:
-    value_opt: cstr? = getenv("ELISA_UI_SMOKE_FRAMES")
-    if value_opt is value:
-        return 30
-    return 0
+@link_name("designer_ide_prepare_working_directory")
+extern ide_prepare_working_directory() -> i64 can[Blocking.IO]
 
-def main() -> i64:
-    result: i64 = UiSdl3::run("Elisa IDE", 1180, 760, smoke_frames())
+def main() -> i64 can[Blocking.IO, Memory.Release, Ui.Draw, Ui.Text, Ui.Input, Ui.Window, Unsafe.PointerCast]:
+    return 1 if ide_prepare_working_directory() != 0
+    result: i64 = UiAppKitCanvas::run_with_min_size("Elisa IDE", 1180.0, 760.0, 900.0, 600.0)
     # If the application exits during an active drag, persist its latest
     # clamped ratios as part of a clean native shutdown.
     if result == 0:
         _ = save_pane_preferences(shell)
+    stop_build_run(shell)
+    ShellPreview::stop(shell)
     if shell.host_running:
         HostClient::stop(&host_process)
         stopped: bool = PosixProcess::poll(&host_process, 1000)
@@ -26,6 +28,7 @@ def main() -> i64:
     return result
 
 def app_init() -> void:
+    shell <- new_shell()
     init(shell)
 
 def app_widget_event(widget: usize, event: i32) -> void:
@@ -40,5 +43,5 @@ def app_text_input(text: sview) -> void:
 def app_text_editing(text: sview, selected_start: i32, selected_length: i32) -> void:
     UiHandles::update_marked_text_utf8_characters(text, selected_start, selected_length)
 
-def app_frame() -> void:
+def app_frame() -> void can[Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast, Ui.Draw, Ui.Text]:
     frame(shell)

@@ -41,7 +41,7 @@ capabilities must be checked for every installation.
 
 | Tool | Current integration seam | Current boundary to show honestly |
 | --- | --- | --- |
-| Elisa-LSP | Long-lived LSP 3.17 JSON-RPC process over stdio with `Content-Length` framing. The current server implements document lifecycle, compiler diagnostics, semantic tokens, symbols, folding/selection ranges, hover/signature help, and limited same-file navigation/reference features. | Completion, rename, formatting, and workspace-wide/cross-file analysis are not currently complete. Read advertised capabilities from `initialize` and `docs/feature-manifest.json`; do not enable a feature from a design note alone. |
+| Elisa-LSP | Long-lived LSP 3.17 JSON-RPC process over stdio with `Content-Length` framing. `src/lsp/lsp_client.py` provides bounded transport and versioned notifications; `src/lsp/workspace_service.py` connects unsaved source buffers, restart replay, and source-mapped Problems rows; `scripts/smoke_lsp.py` exercises that path against the real local server. | Embedded source-editor and Problems-panel presentation, semantic-token rendering, completion, rename, formatting, and workspace-wide/cross-file analysis are not currently complete. Read advertised capabilities from `initialize` and `docs/feature-manifest.json`; do not enable a feature from a design note alone. |
 | Elisa compiler | Invoke the selected compiler wrapper with explicit compiler root, runtime, target, output, and arguments. Preserve stdout, stderr, status, and provenance for build tasks. | Freshness checks are part of the contract. Different local tool builds and isolated worktrees may use different compiler/runtime revisions. |
 | elisa-pkg | Use the `elisapkg` CLI for manifest validation, local dependency resolution, build/run/test, cache, and package tasks. | Current build/run/test accepts validated local v2 dependency graphs. Registry lockfiles can be inspected or cached, but registry dependencies are rejected before compiler launch and network acquisition/TUF are not production-ready. There is no documented library ABI. |
 | elisa-debugger | Launch `elisa-debugger-dap-server` and use DAP `Content-Length` framing for the supported source breakpoint, thread/stack/locals, memory, pause/continue, and forward/reverse-step flow. | The adapter consumes a verified EDIR artifact and does not build the program; launch arguments, working directory, and environment are ignored today. EDIR emission is limited to a small effect-free `main` subset. Compiler columns are one-based UTF-8 bytes while the adapter expects zero-based UTF-16, so source positions must be normalized before normal project debugging is claimed. Unsupported DAP requests remain unavailable. |
@@ -99,7 +99,20 @@ preview, select the matching stable ID, save/reopen, generate code, and build
 or run the output. That slice proves the shared document, process, UI, and
 source ownership boundaries.
 
-The full Elisa IDE then adds integrated source editing and LSP first, followed
+The current generated-project slice is exercised by
+`scripts/smoke_project_generation.sh`. It stages every project form (with the
+entry form as the application root) and the application composition root,
+records the generated-file hashes and source-map ownership in
+`.elisa-ide-generation.json`, preserves a handwritten handler file, rejects a
+manually edited generated file, and runs the emitted SDL3 application under a
+headless driver. This is a project-generation/build smoke, not yet the
+in-IDE Build/Run job UI. The desktop shell now exposes Build/Run/Stop controls
+backed by the revision-aware `BuildJob` policy kernel, while
+`scripts/build_project.sh` and `scripts/run_project.sh` remain the structured
+headless build/run entrypoints; the desktop host continues to use AppKit + Skia.
+
+The full Elisa IDE then adds integrated source editing on top of the new bounded
+LSP transport and diagnostics bridge, followed
 by a unified compiler/package/test task manager, profiler job and result views,
 and DAP debugging. The debugger track includes compiler-side EDIR expansion
 and coordinate normalization as explicit prerequisites. Tool capability
