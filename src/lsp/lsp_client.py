@@ -9,6 +9,7 @@ rules.  It intentionally has no third-party dependencies.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import select
@@ -634,6 +635,41 @@ class LspClient:
         if not readable:
             raise LspError("timed out waiting for LSP output")
         chunk = os.read(fd, 8192)
+        return self._consume_stdout_chunk(chunk)
+
+    def poll_notifications(self, *, timeout: float = 0.0) -> int:
+        """Read any currently available server messages without blocking long.
+
+        Language servers publish diagnostics asynchronously. A UI event loop
+        needs to drain those messages even when it has no request outstanding;
+        this method provides that path while preserving the same framing and
+        message validation used by request/response reads.
+        """
+        if timeout < 0 or not math.isfinite(timeout):
+            raise ValueError("poll timeout must be finite and nonnegative")
+        process = self._ensure_running()
+        assert process.stdout is not None
+        fd = process.stdout.fileno()
+        frames_read = 0
+        wait = timeout
+        while True:
+            try:
+                readable, _, _ = select.select([fd], [], [], wait)
+            except InterruptedError:
+                return frames_read
+            if not readable:
+                return frames_read
+            try:
+                chunk = os.read(fd, 8192)
+                frames_read += len(self._consume_stdout_chunk(chunk))
+            except LspError:
+                self.abort()
+                raise
+            if not chunk:
+                return frames_read
+            wait = 0.0
+
+    def _consume_stdout_chunk(self, chunk: bytes) -> list[LspFrame]:
         if not chunk:
             self._stdout_eof = True
             self.decoder.finish()

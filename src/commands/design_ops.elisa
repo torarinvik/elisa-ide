@@ -321,6 +321,16 @@ module DesignOps:
                         property_index <- property_index + 1
                 index <- index + 1
 
+            # Mark doomed rows before touching any form-owned arrays. The
+            # compaction pass reads only this bounded, stack-backed bitmap, so
+            # it never carries a view into the temporary ID list across a form
+            # mutation.
+            doomed_rows: mutable bool[DesignLimits::MAX_NODES] = zeroed
+            index <- 0
+            while index < form.nodes.count.i64():
+                doomed_rows[index.usize()] <- index_of_id(doomed, form.nodes[index.usize()].id) >= 0
+                index <- index + 1
+
             # Detach roots from their parents.
             index <- 0
             while index < roots.count.i64():
@@ -333,7 +343,7 @@ module DesignOps:
             write: mutable i64 = 0
             read: mutable i64 = 0
             while read < form.nodes.count.i64():
-                if index_of_id(doomed, form.nodes[read.usize()].id) < 0:
+                if not doomed_rows[read.usize()]:
                     # clone_node_into clears nested destination arrays before
                     # copying. When the compaction positions match, source and
                     # destination alias, so leave that node in place.
@@ -633,22 +643,22 @@ module DesignOps:
         # Duplicate topmost selected roots atomically after their originals.
         # One mapping spans the whole selection so NodeRefs between separately
         # selected subtrees also point at the corresponding copies.
-        def duplicate(form: mutable DesignForms::Form&, ids: darray[DesignIds::DesignId], allocator: mutable DesignIds::Allocator&, sink: mutable DesignDiagnostics::Sink&) -> darray[DesignIds::DesignId]:
-            created: mutable darray[DesignIds::DesignId] = []
+        def duplicate_into[@r](form: mutable DesignForms::Form&, ids: darray[DesignIds::DesignId], allocator: mutable DesignIds::Allocator&, created: mutable darray[DesignIds::DesignId]& @r, sink: mutable DesignDiagnostics::Sink&) -> bool:
+            created.resize(0)
             if ids.count == 0:
                 report(sink, DesignDiagnostics::Code.MissingParent, "selection", "duplicate requires at least one selected node")
-                return created
+                return false
             selected_index: mutable i64 = 0
             while selected_index < ids.count.i64():
                 if DesignForms::find_node(form, ids[selected_index.usize()]) < 0:
                     report(sink, DesignDiagnostics::Code.MissingParent, "selection", "a selected node does not resolve to a node")
-                    return created
+                    return false
                 selected_index <- selected_index + 1
             roots: darray[DesignIds::DesignId] = topmost_roots(form, ids)
             if roots.count == 0:
                 report(sink, DesignDiagnostics::Code.MissingParent, "selection", "duplicate requires at least one selected node")
-                return created
-            DesignStore::ensure_ids(&created, roots.count)
+                return false
+            DesignStore::ensure_ids(created, roots.count)
             old_ids: mutable darray[DesignIds::DesignId] = []
             new_ids: mutable darray[DesignIds::DesignId] = []
 
@@ -659,15 +669,15 @@ module DesignOps:
                 original_index: i64 = DesignForms::find_node(form, roots[root_index.usize()])
                 if DesignIds::equal(roots[root_index.usize()], form.root):
                     report(sink, DesignDiagnostics::Code.MultipleRoots, "root", "the form root cannot be duplicated")
-                    return created
+                    return false
                 if original_index < 0:
                     report(sink, DesignDiagnostics::Code.MissingParent, "selection", "a selected node does not resolve to a node")
-                    return created
+                    return false
                 original_parent: DesignIds::DesignId = form.nodes[original_index.usize()].parent
                 parent_index: i64 = DesignForms::find_node(form, original_parent)
                 if DesignIds::is_empty(original_parent) or parent_index < 0 or index_of_id(form.nodes[parent_index.usize()].children, roots[root_index.usize()]) < 0:
                     report(sink, DesignDiagnostics::Code.MissingParent, "parent", "a selected node is not linked from its current parent")
-                    return created
+                    return false
                 additions: mutable i64 = 0
                 sibling_index: mutable i64 = 0
                 while sibling_index < roots.count.i64():
@@ -677,27 +687,27 @@ module DesignOps:
                     sibling_index <- sibling_index + 1
                 if form.nodes[parent_index.usize()].children.count.i64() + additions > DesignLimits::MAX_CHILDREN_PER_NODE.i64():
                     report(sink, DesignDiagnostics::Code.TooManyNodes, "children", "duplicate would exceed the parent child limit")
-                    return created
+                    return false
                 subtree: darray[DesignIds::DesignId] = collect_subtree(form, roots[root_index.usize()])
                 copy_index: mutable i64 = 0
                 while copy_index < subtree.count.i64():
                     subtree_id: DesignIds::DesignId = subtree[copy_index.usize()]
                     if DesignForms::find_node(form, subtree_id) < 0 or id_in_list(old_ids, subtree_id):
                         report(sink, DesignDiagnostics::Code.MissingParent, "children", "duplicate subtree contains a missing or repeated node")
-                        return created
+                        return false
                     DesignIds::append_copy(&old_ids, &subtree_id)
                     copy_index <- copy_index + 1
                 root_index <- root_index + 1
             if form.nodes.count.i64() + old_ids.count.i64() > DesignLimits::MAX_NODES.i64():
                 report(sink, DesignDiagnostics::Code.TooManyNodes, "nodes", "duplicate would exceed the node limit")
-                return created
+                return false
 
             DesignStore::ensure_ids(&new_ids, old_ids.count)
             index: mutable i64 = 0
             while index < old_ids.count.i64():
                 if not append_fresh_id(form, new_ids, allocator):
                     report(sink, DesignDiagnostics::Code.DuplicateId, "id", "could not allocate a unique node id for duplicate")
-                    return created
+                    return false
                 index <- index + 1
 
             backup: mutable DesignForms::Form = DesignForms::empty_form()
@@ -740,7 +750,8 @@ module DesignOps:
                 if not symbol_made:
                     DesignClone::clone_form_into(form, backup)
                     report(sink, DesignDiagnostics::Code.InvalidSymbol, "symbol", "could not generate a unique symbol for duplicate")
-                    return []
+                    created.resize(0)
+                    return false
                 copy.symbol <- symbol_ref
                 # Remap parent and child links through the complete mapping.
                 parent_position: i64 = index_of_id(old_ids, copy.parent)
@@ -767,7 +778,8 @@ module DesignOps:
                 if not DesignForms::add_node(form, copy):
                     DesignClone::clone_form_into(form, backup)
                     report(sink, DesignDiagnostics::Code.TooManyNodes, "nodes", "duplicate exceeded the node limit")
-                    return []
+                    created.resize(0)
+                    return false
                 index <- index + 1
 
             # Add copied roots after their originals, in selection order.
@@ -778,60 +790,63 @@ module DesignOps:
                 if original_index < 0 or copied_root_position < 0:
                     DesignClone::clone_form_into(form, backup)
                     report(sink, DesignDiagnostics::Code.MissingParent, "selection", "duplicate root mapping could not be resolved")
-                    return []
+                    created.resize(0)
+                    return false
                 parent_index: i64 = DesignForms::find_node(form, form.nodes[original_index.usize()].parent)
                 if parent_index < 0:
                     DesignClone::clone_form_into(form, backup)
                     report(sink, DesignDiagnostics::Code.MissingParent, "parent", "duplicate parent does not resolve to a node")
-                    return []
+                    created.resize(0)
+                    return false
                 position: i64 = index_of_id(form.nodes[parent_index.usize()].children, roots[root_index.usize()]) + 1
                 insert_id_in_place(form.nodes[parent_index.usize()].children, &new_ids[copied_root_position.usize()], position)
-                DesignIds::append_copy(&created, &new_ids[copied_root_position.usize()])
+                DesignIds::append_copy(created, &new_ids[copied_root_position.usize()])
                 root_index <- root_index + 1
-            return created
+            return true
 
         # Paste a detached clipboard snapshot into `parent`. The clipboard is
         # a form clone, so all source string references are copied into the
         # destination pool and every pasted node receives a fresh stable ID.
         # A complete old-to-new map remaps child links and NodeRef properties
         # that point within the pasted selection.
-        def paste(form: mutable DesignForms::Form&, registry: DesignRegistry::Registry, source: DesignForms::Form&, roots: darray[DesignIds::DesignId], parent: DesignIds::DesignId, index: i64, allocator: mutable DesignIds::Allocator&, sink: mutable DesignDiagnostics::Sink&) -> darray[DesignIds::DesignId]:
-            created: mutable darray[DesignIds::DesignId] = []
+        def paste_into[@r](form: mutable DesignForms::Form&, registry: DesignRegistry::Registry, source: DesignForms::Form&, roots: darray[DesignIds::DesignId], parent: DesignIds::DesignId, index: i64, allocator: mutable DesignIds::Allocator&, created: mutable darray[DesignIds::DesignId]& @r, sink: mutable DesignDiagnostics::Sink&) -> bool:
+            created.resize(0)
             if roots.count == 0:
                 report(sink, DesignDiagnostics::Code.MissingParent, "selection", "paste requires a nonempty clipboard")
-                return created
+                return false
             parent_index: i64 = DesignForms::find_node(form, parent)
             if parent_index < 0 or not can_have_children(registry, DesignValues::text_of(form.strings, form.nodes[parent_index.usize()].type_key)):
                 report(sink, DesignDiagnostics::Code.LeafParent, "parent", "paste target cannot contain children")
-                return created
+                return false
             old_ids: mutable darray[DesignIds::DesignId] = []
             root_index: mutable i64 = 0
             while root_index < roots.count.i64():
                 source_root_index: i64 = DesignForms::find_node(source, roots[root_index.usize()])
                 if source_root_index < 0:
                     report(sink, DesignDiagnostics::Code.MissingParent, "selection", "clipboard root no longer resolves")
-                    return []
+                    return false
                 subtree: darray[DesignIds::DesignId] = collect_subtree(source, roots[root_index.usize()])
                 subtree_index: mutable i64 = 0
                 while subtree_index < subtree.count.i64():
                     if id_in_list(old_ids, subtree[subtree_index.usize()]):
                         report(sink, DesignDiagnostics::Code.MissingParent, "children", "clipboard contains a repeated subtree")
-                        return []
+                        return false
                     DesignIds::append_copy(&old_ids, &subtree[subtree_index.usize()])
                     subtree_index <- subtree_index + 1
                 root_index <- root_index + 1
             if parent_index < 0 or form.nodes[parent_index.usize()].children.count.i64() + roots.count.i64() > DesignLimits::MAX_CHILDREN_PER_NODE.i64():
                 report(sink, DesignDiagnostics::Code.TooManyNodes, "children", "paste would exceed the target child limit")
-                return []
+                return false
             if form.nodes.count.i64() + old_ids.count.i64() > DesignLimits::MAX_NODES.i64():
                 report(sink, DesignDiagnostics::Code.TooManyNodes, "nodes", "paste would exceed the node limit")
-                return []
+                return false
+            DesignStore::ensure_ids(created, roots.count)
             new_ids: mutable darray[DesignIds::DesignId] = []
             cursor: mutable i64 = 0
             while cursor < old_ids.count.i64():
                 if not append_fresh_id(form, &new_ids, allocator):
                     report(sink, DesignDiagnostics::Code.DuplicateId, "id", "could not allocate a unique pasted ID")
-                    return []
+                    return false
                 cursor <- cursor + 1
             backup: mutable DesignForms::Form = DesignForms::empty_form()
             DesignClone::clone_form_into(&backup, form)
@@ -841,7 +856,7 @@ module DesignOps:
                 if source_index < 0:
                     DesignClone::clone_form_into(form, backup)
                     report(sink, DesignDiagnostics::Code.MissingParent, "selection", "clipboard node no longer resolves")
-                    return []
+                    return false
                 source_node: DesignNodes::Node = source.nodes[source_index.usize()]
                 copy: mutable DesignNodes::Node = DesignNodes::empty_node()
                 DesignClone::clone_node_into(&copy, source_node)
@@ -880,7 +895,7 @@ module DesignOps:
                 if not symbol_made:
                     DesignClone::clone_form_into(form, backup)
                     report(sink, DesignDiagnostics::Code.InvalidSymbol, "symbol", "could not generate a unique pasted symbol")
-                    return []
+                    return false
                 copy.symbol <- symbol_ref
                 parent_position: i64 = index_of_id(old_ids, source_node.parent)
                 if parent_position >= 0:
@@ -890,7 +905,7 @@ module DesignOps:
                     if root_position < 0:
                         DesignClone::clone_form_into(form, backup)
                         report(sink, DesignDiagnostics::Code.MissingParent, "parent", "clipboard node has an external parent")
-                        return []
+                        return false
                     DesignIds::copy_into(&copy.parent, &parent)
                 child_index: mutable i64 = 0
                 while child_index < copy.children.count.i64():
@@ -898,7 +913,7 @@ module DesignOps:
                     if child_position < 0:
                         DesignClone::clone_form_into(form, backup)
                         report(sink, DesignDiagnostics::Code.MissingParent, "children", "clipboard child is missing")
-                        return []
+                        return false
                     DesignIds::copy_into(&copy.children[child_index.usize()], &new_ids[child_position.usize()])
                     child_index <- child_index + 1
                 property_index: mutable i64 = 0
@@ -926,7 +941,7 @@ module DesignOps:
                 if not DesignForms::add_node(form, copy):
                     DesignClone::clone_form_into(form, backup)
                     report(sink, DesignDiagnostics::Code.TooManyNodes, "nodes", "paste exceeded the node limit")
-                    return []
+                    return false
                 cursor <- cursor + 1
             position: mutable i64 = index
             if position < 0 or position > form.nodes[parent_index.usize()].children.count.i64():
@@ -937,12 +952,12 @@ module DesignOps:
                 if copied_root_position < 0:
                     DesignClone::clone_form_into(form, backup)
                     report(sink, DesignDiagnostics::Code.MissingParent, "selection", "clipboard root mapping failed")
-                    return []
+                    return false
                 insert_id_in_place(form.nodes[parent_index.usize()].children, &new_ids[copied_root_position.usize()], position)
-                DesignIds::append_copy(&created, &new_ids[copied_root_position.usize()])
+                DesignIds::append_copy(created, &new_ids[copied_root_position.usize()])
                 position <- position + 1
                 root_index <- root_index + 1
-            return created
+            return true
 
         def rename_symbol(form: mutable DesignForms::Form&, id: DesignIds::DesignId, symbol: sview, sink: mutable DesignDiagnostics::Sink&) -> bool:
             if not DesignIds::valid_symbol(symbol):

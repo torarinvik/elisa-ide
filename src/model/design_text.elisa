@@ -50,6 +50,13 @@ module DesignText:
             return "" if buffer.count == 0
             return bytes_view_range(buffer, 0, buffer.count)
 
+        # Borrowed counterpart for callers that must preserve the byte buffer's
+        # region. Passing darray by value only copies its header, so a returned
+        # view from that copy cannot safely be retained by a region-aware API.
+        def view_of_ref[@r](buffer: darray[u8]& @r) -> sview @r:
+            return "" if buffer.count == 0
+            return bytes_view_range_ref(buffer, 0, buffer.count)
+
         def equal(left: sview, right: sview) -> bool:
             return false if left.len != right.len
             index: mutable i64 = 0

@@ -107,34 +107,37 @@ module DesignEncode:
                             append_json_string(arena, buffer, raw)
                 return
 
-        def append_raw_members[@r](arena: mutable Arena& @r, buffer: mutable darray[u8]&, first: mutable bool&, raw: darray[u8]) -> void:
-            in arena:
-                # Decoding only stores validated JSON here. Keep the defensive
-                # parse check so a damaged extension blob cannot corrupt the file.
-                return if raw.count == 0
-                parsed: JsonParseResult[r] = json_parse_checked(arena, DesignText::view_of(raw))
+        def append_raw_members[@source](buffer: mutable darray[u8]&, first: mutable bool&, raw: darray[u8]& @source) -> void:
+            # Decoding only stores validated JSON here. Keep the defensive parse
+            # check so a damaged extension blob cannot corrupt the file. The
+            # scratch arena is local to this helper so parsed strings can borrow
+            # the caller-owned raw bytes only while they are being re-encoded.
+            return if raw.count == 0
+            scratch_arena: mutable Arena = empty_arena()
+            in scratch_arena:
+                parsed: JsonParseResult[scratch_arena] = json_parse_checked(scratch_arena, DesignText::view_of_ref(raw))
                 return if parsed.code != JsonErrorCode.OK
-                root: JsonValueHandle[r] = json_handle_from_result(parsed)
+                root: JsonValueHandle[scratch_arena] = json_handle_from_result(parsed)
                 return if not json_handle_is_object(root)
                 count: i64 = json_handle_object_len(root)
                 index: mutable i64 = 0
                 while index < count:
-                    key: sview @r = catch json_handle_key_at(root, index):
+                    key: sview @scratch_arena = catch json_handle_key_at(root, index):
                         value:
                             value
                         error e:
                             ""
-                    item: JsonValueHandle[r] = catch json_handle_value_at(root, index):
+                    item: JsonValueHandle[scratch_arena] = catch json_handle_value_at(root, index):
                         value:
                             value
                         error e:
                             json_handle_null(root)
-                    object_key(arena, buffer, first, key)
-                    append_handle_json(arena, buffer, item)
+                    object_key(scratch_arena, buffer, first, key)
+                    append_handle_json(scratch_arena, buffer, item)
                     index <- index + 1
                 return
 
-        def emit_node[@r](arena: mutable Arena& @r, buffer: mutable darray[u8]&, form: DesignForms::Form&, node: DesignNodes::Node&) -> void:
+        def emit_node[@a, @form](arena: mutable Arena& @a, buffer: mutable darray[u8]&, form: DesignForms::Form& @form, node: DesignNodes::Node& @form) -> void:
             in arena:
                 first: mutable bool = true
                 id_text_storage: mutable u8[24] = zeroed
@@ -194,10 +197,10 @@ module DesignEncode:
                     object_key(arena, buffer, &first, "editorHidden")
                     append_json_bool(arena, buffer, true)
 
-                append_raw_members(arena, buffer, &first, node.extension_json)
+                append_raw_members(buffer, &first, &node.extension_json)
                 buffer.push(125)
 
-        def emit_form[@r](arena: mutable Arena& @r, buffer: mutable darray[u8]&, form: DesignForms::Form&) -> void:
+        def emit_form[@a, @form](arena: mutable Arena& @a, buffer: mutable darray[u8]&, form: DesignForms::Form& @form) -> void:
             in arena:
                 first: mutable bool = true
                 id_text_storage: mutable u8[24] = zeroed
@@ -230,14 +233,14 @@ module DesignEncode:
                 index: mutable i64 = 0
                 while index < form.nodes.count.i64():
                     array_item_prefix(buffer, &nodes_first)
-                    emit_node(arena, buffer, form, form.nodes[index.usize()])
+                    emit_node(arena, buffer, form, &form.nodes[index.usize()])
                     index <- index + 1
                 buffer.push(93)
 
-                append_raw_members(arena, buffer, &first, form.extensions)
+                append_raw_members(buffer, &first, &form.extensions)
                 buffer.push(125)
 
-        def emit_project[@r](arena: mutable Arena& @r, buffer: mutable darray[u8]&, project: DesignProjects::Project&) -> void:
+        def emit_project[@a, @project](arena: mutable Arena& @a, buffer: mutable darray[u8]&, project: DesignProjects::Project& @project) -> void:
             in arena:
                 first: mutable bool = true
                 id_text_storage: mutable u8[24] = zeroed
@@ -319,7 +322,7 @@ module DesignEncode:
                     index <- index + 1
                 buffer.push(93)
 
-                append_raw_members(arena, buffer, &first, project.extensions)
+                append_raw_members(buffer, &first, &project.extensions)
                 buffer.push(125)
 
         private:
@@ -335,14 +338,14 @@ module DesignEncode:
             return result
 
     public:
-        def encode_form(form: DesignForms::Form&) -> darray[u8]:
+        def encode_form[@form](form: DesignForms::Form& @form) -> darray[u8]:
             arena: mutable Arena = empty_arena()
             output: mutable darray[u8] = []
             emit_form(&arena, &output, form)
             output.push(10)
             return durable(output)
 
-        def encode_project(project: DesignProjects::Project&) -> darray[u8]:
+        def encode_project[@project](project: DesignProjects::Project& @project) -> darray[u8]:
             arena: mutable Arena = empty_arena()
             output: mutable darray[u8] = []
             emit_project(&arena, &output, project)

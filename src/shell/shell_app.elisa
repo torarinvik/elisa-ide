@@ -6,6 +6,7 @@
 
 include "host_client.elisa"
 include "shell_state.elisa"
+include "shell_lsp.elisa"
 include "shell_layout.elisa"
 include "shell_preview.elisa"
 include "shell_panels.elisa"
@@ -20,8 +21,10 @@ extern designer_workspace_preferences_save_ratios(left: f64, right: f64, bottom:
 
 const PROJECT_BUILD_SCRIPT: cstr = "scripts/build_project.sh"
 const PROJECT_RUN_BINARY: cstr = "build/elisa_project_app"
+const SOURCE_RUN_BINARY: cstr = "build/elisa_ide_source_app"
 const COMMAND_KEY_CAPACITY: usize = 512
 const BUILD_PATH_CAPACITY: usize = 1024
+const SOURCE_PATH_CAPACITY: usize = 4096
 const PROCESS_OUTPUT_CAPACITY: usize = 4096
 
 const enum ShellCommand of u32:
@@ -73,7 +76,6 @@ def start_host(shell: mutable Shell&) -> void:
     if host_path_storage[0] == 0 and shell_preview_helper_path("document_host", &host_path_storage[0], BUILD_PATH_CAPACITY) != 0:
         set_status_view(shell, "Document host is missing from this app bundle")
         return
-    _ = PosixFile::remove("build/host_reply.bin")
     host_executable: mutable cstr = ""
     can Unsafe.PointerCast:
         host_executable <- (&host_path_storage[0]).cast[cstr] can Unsafe.PointerCast
@@ -81,6 +83,8 @@ def start_host(shell: mutable Shell&) -> void:
     shell.host_running <- PosixProcess::valid(host_process)
     if shell.host_running:
         _ = HostClient::request(host_process, 10, 0, 0)
+    else:
+        set_status_view(shell, "Document host failed to start; check the helper and temporary-directory permissions")
 
 def source_path_for_external_action(process: mutable PosixProcess::Process&) -> darray[u8]:
     path_reply: HostClient::HostReply = HostClient::request(process, 114, 0, 0)
@@ -599,9 +603,9 @@ def build_shell(shell: mutable Shell&) -> void:
     shell.new_button <- toolbar_button(shell, shell.toolbar, "New", 64.0)
     shell.new_project_button <- toolbar_button(shell, shell.toolbar, "New Project", 92.0)
     shell.build_button <- toolbar_button(shell, shell.toolbar, "Build", 64.0)
-    UiHandles::set_help(shell.build_button, "Generate and compile the project in the path field")
+    UiHandles::set_help(shell.build_button, "Build the saved standalone Elisa source file or generate and compile the visual project")
     shell.run_button <- toolbar_button(shell, shell.toolbar, "Run", 58.0)
-    UiHandles::set_help(shell.run_button, "Run the artifact from the latest successful build")
+    UiHandles::set_help(shell.run_button, "Run the last successful standalone-source or visual-project build")
     shell.stop_button <- toolbar_button(shell, shell.toolbar, "Stop", 58.0)
     UiHandles::set_help(shell.stop_button, "Cancel the active build or stop the running application")
     shell.save_button <- toolbar_button(shell, shell.toolbar, "Save", 64.0)
@@ -694,6 +698,29 @@ def build_shell(shell: mutable Shell&) -> void:
     UiHandles::set_cross_alignment(shell.source_ownership, UiConst::CrossAlignment.End)
     UiHandles::set_grow(shell.source_ownership, 1.0)
     UiHandles::set_help(shell.source_ownership, "Generated source is owned by the form file shown here; edit the form or handwritten handler source instead")
+    source_lsp_row: UiHandles::Handle = UiHandles::row(shell.source_pane, 5.0, 0.0, shell_color(22, 25, 31))
+    UiHandles::set_grow(source_lsp_row, 0.0)
+    shell.source_lsp_status <- toolbar_button(shell, source_lsp_row, "Elisa-LSP idle", 116.0)
+    UiHandles::set_grow(shell.source_lsp_status, 1.0)
+    UiHandles::set_help(shell.source_lsp_status, "Elisa-LSP state and diagnostic count. Click to go to the definition at the source caret, or press F12 from a source row.")
+    shell.source_lsp_definition_button <- shell.source_lsp_status
+    shell.source_lsp_restart_button <- toolbar_button(shell, source_lsp_row, "Restart LSP", 78.0)
+    UiHandles::set_help(shell.source_lsp_restart_button, "Restart Elisa-LSP and replay the current unsaved source buffer")
+    UiHandles::set_visible(shell.source_lsp_restart_button, false)
+    UiHandles::set_enabled(shell.source_lsp_restart_button, false)
+    source_symbol_row: UiHandles::Handle = UiHandles::row(shell.source_pane, 5.0, 2.0, shell_color(22, 25, 31))
+    UiHandles::set_grow(source_symbol_row, 0.0)
+    shell.source_symbol_query <- UiHandles::text_field(source_symbol_row, "Workspace symbol", "Search Elisa-LSP workspace symbols", "", 180.0, 22.0, 11.0, shell_color(232, 236, 246), shell_color(27, 32, 43))
+    UiHandles::set_grow(shell.source_symbol_query, 1.0)
+    UiHandles::set_help(shell.source_symbol_query, "Search symbols from the current Elisa-LSP workspace; results open local .elisa files")
+    shell.source_symbol_search_button <- toolbar_button(shell, source_symbol_row, "Search", 64.0)
+    UiHandles::set_help(shell.source_symbol_search_button, "Search the current LSP workspace for the entered symbol")
+    UiHandles::set_enabled(shell.source_symbol_search_button, false)
+    shell.source_symbol_next_button <- toolbar_button(shell, source_symbol_row, "Next", 54.0)
+    UiHandles::set_help(shell.source_symbol_next_button, "Open the next result from the latest workspace symbol search")
+    UiHandles::set_enabled(shell.source_symbol_next_button, false)
+    shell.source_symbol_status <- UiHandles::label(source_symbol_row, "Workspace symbols unavailable", 10.0, shell_color(148, 158, 180))
+    UiHandles::set_grow(shell.source_symbol_status, 1.0)
     source_find_row: UiHandles::Handle = UiHandles::row(shell.source_pane, 5.0, 2.0, shell_color(22, 25, 31))
     UiHandles::set_grow(source_find_row, 0.0)
     shell.source_find_field <- UiHandles::text_field(source_find_row, "Find in source", "Search source text", "", 120.0, 22.0, 11.0, shell_color(232, 236, 246), shell_color(27, 32, 43))
@@ -811,10 +838,143 @@ def path_has_suffix(path: sview, suffix: sview) -> bool:
         index <- index + 1
     return true
 
+def uri_hex_value(byte: u8) -> i32:
+    value: i32 = byte.i32()
+    return value - 48 if value >= 48 and value <= 57
+    return value - 65 + 10 if value >= 65 and value <= 70
+    return value - 97 + 10 if value >= 97 and value <= 102
+    return -1
+
+def uri_prefix_matches(uri: sview, prefix: sview) -> bool:
+    return false if uri.len < prefix.len
+    index: mutable i64 = 0
+    while index < prefix.len:
+        return false if uri[index] != prefix[index]
+        index <- index + 1
+    return true
+
+def decode_local_file_uri(uri: sview) -> darray[u8]:
+    path_start: mutable i64 = -1
+    if uri_prefix_matches(uri, "file:///"):
+        # Keep the third slash: it is the first byte of an absolute POSIX path.
+        path_start <- 7
+    elif uri_prefix_matches(uri, "file://localhost/"):
+        path_start <- 16
+    if path_start < 0:
+        return []
+    decoded: mutable darray[u8] = []
+    cursor: mutable i64 = path_start
+    while cursor < uri.len:
+        byte: mutable u8 = uri[cursor].u8()
+        if byte == 37:
+            return [] if cursor + 2 >= uri.len
+            high: i32 = uri_hex_value(uri[cursor + 1].u8())
+            low: i32 = uri_hex_value(uri[cursor + 2].u8())
+            return [] if high < 0 or low < 0
+            byte <- (high * 16 + low).u8()
+            cursor <- cursor + 2
+        elif byte == 63 or byte == 35:
+            return []
+        return [] if byte == 0 or byte < 32 or byte == 127
+        return [] if decoded.count >= 4096
+        decoded.push(byte)
+        cursor <- cursor + 1
+    if decoded.count == 0 or decoded[0] != 47:
+        return []
+    path: sview = ShellBytes::view_of(&decoded)
+    return [] if UiText::valid_utf8_prefix(path, decoded.count) != decoded.count
+    return [] if not path_has_suffix(path, ".elisa")
+    return decoded
+
+def selected_related_uri(shell: mutable Shell&, related_index: i32) -> sview:
+    return "" if related_index < 0 or related_index >= shell.selected_related_count
+    offset: usize = (related_index.usize() * SELECTED_RELATED_URI_STRIDE)
+    length: usize = shell.selected_related_uri_lengths[related_index.usize()].usize()
+    return UiText::fixed_bytes_view_range[1024](shell.selected_related_uri_storage, offset, length)
+
+def capture_selected_related_locations(shell: mutable Shell&, diagnostic_index: i32) -> void:
+    stored_count: i32 = ShellLsp::diagnostic_related_stored_count(shell, diagnostic_index)
+    shell.selected_related_count <- stored_count
+    shell.selected_related_location_index <- -1
+    index: mutable i32 = 0
+    while index < MAX_SELECTED_RELATED:
+        shell.selected_related_lines[index.usize()] <- -1
+        shell.selected_related_characters[index.usize()] <- -1
+        shell.selected_related_uri_lengths[index.usize()] <- 0
+        flat_offset: usize = index.usize() * SELECTED_RELATED_URI_STRIDE
+        byte_index: mutable usize = 0
+        while byte_index < SELECTED_RELATED_URI_STRIDE:
+            shell.selected_related_uri_storage[flat_offset + byte_index] <- 0
+            byte_index <- byte_index + 1
+        if index < stored_count:
+            uri: sview = ShellLsp::diagnostic_related_uri_at(shell, diagnostic_index, index)
+            length: mutable usize = uri.len
+            length <- SELECTED_RELATED_URI_STRIDE if length > SELECTED_RELATED_URI_STRIDE
+            byte_index <- 0
+            while byte_index < length:
+                shell.selected_related_uri_storage[flat_offset + byte_index] <- uri[byte_index].u8()
+                byte_index <- byte_index + 1
+            shell.selected_related_uri_lengths[index.usize()] <- length.i32()
+            shell.selected_related_lines[index.usize()] <- ShellLsp::diagnostic_related_line_at(shell, diagnostic_index, index)
+            shell.selected_related_characters[index.usize()] <- ShellLsp::diagnostic_related_character_at(shell, diagnostic_index, index)
+        index <- index + 1
+
+def open_next_related_location(shell: mutable Shell&) -> void:
+    diagnostic_index: i32 = shell.selected_lsp_diagnostic_index
+    stored_count: i32 = shell.selected_related_count
+    if diagnostic_index < 0 or stored_count <= 0:
+        set_status_view(shell, "Select an Elisa-LSP diagnostic with a related location first")
+        return
+    related_index: i32 = (shell.selected_related_location_index + 1) % stored_count
+    uri: sview = selected_related_uri(shell, related_index)
+    path: mutable darray[u8] = decode_local_file_uri(uri)
+    if path.count == 0:
+        set_status_view(shell, "This related Elisa-LSP location is not a local .elisa file")
+        return
+    if not commit_pending_inspector_edits(shell, host_process):
+        set_status(shell, HostClient::request(host_process, 56, 0, 0).text)
+        return
+    if HostClient::request(host_process, 130, 0, 0).result == 1:
+        refresh_all(shell, host_process)
+        set_status_view(shell, "Save this source file before opening a related location")
+        return
+    if HostClient::request(host_process, 40, 0, 0).result == 1:
+        refresh_all(shell, host_process)
+        set_status_view(shell, "Save this document before opening a related location")
+        return
+    opened: HostClient::HostReply = HostClient::request_text(host_process, 112, 0, 0, ShellBytes::view_of(&path))
+    if opened.result != 1:
+        set_status(shell, HostClient::request(host_process, 56, 0, 0).text)
+        return
+    shell.selected_related_location_index <- related_index
+    shell.source_mode <- true
+    shell.source_compare_mode <- false
+    shell.source_page_start <- 0
+    apply_shell_layout(shell)
+    refresh_all(shell, host_process)
+    line: i32 = shell.selected_related_lines[related_index.usize()]
+    character: i32 = shell.selected_related_characters[related_index.usize()]
+    if line >= 0:
+        _ = go_to_source_position(shell, line.i64() + 1, character, ShellLsp::position_encoding(shell))
+    status: mutable darray[u8] = []
+    append_panel_text(&status, "Opened related Elisa-LSP location ")
+    append_nonnegative(&status, related_index.i64() + 1)
+    append_panel_text(&status, " of ")
+    append_nonnegative(&status, stored_count.i64())
+    if line >= 0:
+        append_panel_text(&status, " at line ")
+        append_nonnegative(&status, line.i64() + 1)
+    set_status_view(shell, ShellBytes::view_of(&status))
+    refresh_problems(shell, host_process)
+
 def open_document(shell: mutable Shell&) -> void:
     return if not shell.host_running
     if not commit_pending_inspector_edits(shell, host_process):
         set_status(shell, HostClient::request(host_process, 56, 0, 0).text)
+        return
+    if HostClient::request(host_process, 130, 0, 0).result == 1:
+        refresh_all(shell, host_process)
+        set_status_view(shell, "Save this source file before opening another")
         return
     if HostClient::request(host_process, 40, 0, 0).result == 1:
         refresh_all(shell, host_process)
@@ -826,6 +986,7 @@ def open_document(shell: mutable Shell&) -> void:
         if opened_source.result == 1:
             shell.source_page_start <- 0
             shell.source_mode <- true
+            shell.standalone_source <- true
             apply_shell_layout(shell)
             refresh_all(shell, host_process)
         else:
@@ -834,6 +995,7 @@ def open_document(shell: mutable Shell&) -> void:
     opened_form: HostClient::HostReply = HostClient::request_text(host_process, 11, 0, 0, path)
     if opened_form.result == 1:
         shell.source_mode <- false
+        shell.standalone_source <- false
         shell.source_page_start <- 0
         apply_shell_layout(shell)
     refresh_all(shell, host_process)
@@ -849,6 +1011,7 @@ def create_project(shell: mutable Shell&) -> void:
         return
     path: sview = UiHandles::text_value(shell.compact_open_path_field) if shell.compact_mode else UiHandles::text_value(shell.open_path_field)
     _ = HostClient::request_text(host_process, 19, 0, 0, path)
+    shell.standalone_source <- false
     refresh_all(shell, host_process)
 
 def save_as_form(shell: mutable Shell&) -> void:
@@ -866,6 +1029,60 @@ def build_project_path(shell: mutable Shell&) -> cstr:
         path <- (&shell.build_project_path_storage[0]).cast[cstr] can Unsafe.PointerCast
     return path
 
+def source_build_path(shell: mutable Shell&) -> cstr:
+    path: mutable cstr = ""
+    can Unsafe.PointerCast:
+        path <- (&shell.building_source_path_storage[0]).cast[cstr] can Unsafe.PointerCast
+    return path
+
+def copy_source_build_path(shell: mutable Shell&, path: sview) -> bool:
+    return false if path.len <= 0 or path.len >= SOURCE_PATH_CAPACITY.i64()
+    return false if not path_has_suffix(path, ".elisa")
+    index: mutable i64 = 0
+    while index < path.len:
+        byte: u8 = path[index]
+        return false if byte == 0 or byte < 32 or byte == 127
+        shell.building_source_path_storage[index.usize()] <- byte
+        index <- index + 1
+    shell.building_source_path_storage[index.usize()] <- 0
+    shell.building_source_path_length <- index
+    return true
+
+def source_path_matches_artifact(shell: Shell&, path: sview) -> bool:
+    return false if not shell.source_artifact_valid or path.len != shell.source_artifact_path_length
+    index: mutable i64 = 0
+    while index < path.len:
+        return false if path[index] != shell.source_artifact_path_storage[index.usize()]
+        index <- index + 1
+    return true
+
+def build_source_still_current(shell: Shell&) -> bool can[Blocking.IO, Memory.Allocate, Memory.Release]:
+    return false if not shell.standalone_source or not shell.host_running
+    return false if HostClient::request(host_process, 113, 0, 0).result != 1
+    return false if HostClient::request(host_process, 130, 0, 0).result == 1
+    return false if HostClient::request(host_process, 138, 0, 0).result == 1
+    path_reply: HostClient::HostReply = HostClient::request(host_process, 114, 0, 0)
+    return false if path_reply.result != 1
+    path: sview = ShellBytes::view_of(&path_reply.text)
+    return false if path.len != shell.building_source_path_length
+    return false if HostClient::request(host_process, 152, 0, 0).result != shell.building_source_fingerprint
+    index: mutable i64 = 0
+    while index < path.len:
+        return false if path[index] != shell.building_source_path_storage[index.usize()]
+        index <- index + 1
+    return true
+
+def source_artifact_is_current(shell: Shell&) -> bool can[Blocking.IO, Memory.Allocate, Memory.Release]:
+    return false if not shell.standalone_source or not shell.source_artifact_valid or not shell.host_running
+    return false if HostClient::request(host_process, 113, 0, 0).result != 1
+    return false if HostClient::request(host_process, 130, 0, 0).result == 1
+    return false if HostClient::request(host_process, 138, 0, 0).result == 1
+    path_reply: HostClient::HostReply = HostClient::request(host_process, 114, 0, 0)
+    return false if path_reply.result != 1
+    path: sview = ShellBytes::view_of(&path_reply.text)
+    return false if not source_path_matches_artifact(shell, path)
+    return HostClient::request(host_process, 152, 0, 0).result == shell.source_artifact_fingerprint
+
 def copy_build_project_path(shell: mutable Shell&) -> bool:
     source: sview = UiHandles::text_value(shell.compact_open_path_field) if shell.compact_mode else UiHandles::text_value(shell.open_path_field)
     shell.build_project_path_length <- 0
@@ -874,6 +1091,15 @@ def copy_build_project_path(shell: mutable Shell&) -> bool:
         shell.build_project_path_length <- shell.build_project_path_length + 1
     shell.build_project_path_storage[shell.build_project_path_length.usize()] <- 0
     return shell.build_project_path_length > 0
+
+def project_path_matches_build(shell: Shell&) -> bool:
+    path: sview = UiHandles::text_value(shell.compact_open_path_field) if shell.compact_mode else UiHandles::text_value(shell.open_path_field)
+    return false if path.len != shell.build_project_path_length
+    index: mutable i64 = 0
+    while index < path.len:
+        return false if path[index] != shell.build_project_path_storage[index.usize()]
+        index <- index + 1
+    return true
 
 def refresh_build_output(shell: mutable Shell&) -> void:
     output: sview = BuildJob::output_view(&build_job)
@@ -886,14 +1112,16 @@ def refresh_build_output(shell: mutable Shell&) -> void:
         if shell.host_running:
             refresh_problems(shell, host_process)
 
-def start_run_process(shell: mutable Shell&) -> void can[Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast]:
+def start_run_process(shell: mutable Shell&, source_run: bool) -> void can[Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast]:
     return if run_active
     arguments: mutable darray[cstr] = []
-    arguments.push(PROJECT_RUN_BINARY)
+    arguments.push(SOURCE_RUN_BINARY if source_run else PROJECT_RUN_BINARY)
     run_process <- PosixProcess::start(&arguments)
     run_active <- PosixProcess::valid(run_process)
     if run_active:
-        set_status_view(shell, "Running generated application...")
+        BuildJob::append_output(&build_job, "\n--- application run ---\n")
+        set_status_view(shell, "Running Elisa source application..." if source_run else "Running generated application...")
+        refresh_build_output(shell)
     else:
         set_status_view(shell, "Run could not start; build the project again")
 
@@ -904,20 +1132,52 @@ def start_build_process(shell: mutable Shell&, run_after: bool) -> void can[Bloc
     if run_active:
         set_status_view(shell, "Stop the running application before building")
         return
-    if not copy_build_project_path(shell):
-        set_status_view(shell, "Choose a project folder or .elisaproject.json in the path field")
+    source_build: bool = shell.standalone_source and HostClient::request(host_process, 113, 0, 0).result == 1
+    if source_build:
+        if HostClient::request(host_process, 130, 0, 0).result == 1:
+            set_status_view(shell, "Save the source file before building it")
+            return
+        if HostClient::request(host_process, 138, 0, 0).result == 1:
+            set_status_view(shell, "Source changed on disk; compare or reload it before building")
+            return
+        source_path_reply: HostClient::HostReply = HostClient::request(host_process, 114, 0, 0)
+        if source_path_reply.result != 1 or not copy_source_build_path(shell, ShellBytes::view_of(&source_path_reply.text)):
+            set_status_view(shell, "Open a saved .elisa source file with a buildable path")
+            return
+        shell.building_source_fingerprint <- HostClient::request(host_process, 152, 0, 0).result
+    elif not copy_build_project_path(shell):
+        set_status_view(shell, "Choose a project folder, .elisaproject.json, or open Elisa source")
         return
+    elif HostClient::request(host_process, 113, 0, 0).result == 1 and HostClient::request(host_process, 130, 0, 0).result == 1:
+        set_status_view(shell, "Save the open source file before building its project")
+        return
+    elif HostClient::request(host_process, 113, 0, 0).result == 1 and HostClient::request(host_process, 138, 0, 0).result == 1:
+        set_status_view(shell, "Open source file changed on disk; compare or reload before building")
+        return
+    elif HostClient::request(host_process, 154, 0, 0).result == 1:
+        set_status_view(shell, "Project form changed on disk; reload it before building")
+        return
+    else:
+        shell.building_form_revision <- HostClient::request(host_process, 153, 0, 0).result
     build_revision <- build_revision + 1
     if not BuildJob::begin(&build_job, build_revision):
         set_status_view(shell, "Build could not start")
         return
     build_run_after <- run_after
+    shell.building_source <- source_build
+    if source_build:
+        shell.source_artifact_valid <- false
     shell.build_problem_count <- 0
     arguments: mutable darray[cstr] = []
-    arguments.push(PROJECT_BUILD_SCRIPT)
-    arguments.push(build_project_path(shell))
-    arguments.push("--name")
-    arguments.push("elisa_project_app")
+    if source_build:
+        arguments.push("scripts/build_core.sh")
+        arguments.push(source_build_path(shell))
+        arguments.push("elisa_ide_source_app")
+    else:
+        arguments.push(PROJECT_BUILD_SCRIPT)
+        arguments.push(build_project_path(shell))
+        arguments.push("--name")
+        arguments.push("elisa_project_app")
     build_process <- PosixProcess::start(&arguments)
     if not PosixProcess::valid(build_process):
         _ = BuildJob::finish(&build_job, build_revision, -1)
@@ -948,10 +1208,24 @@ def poll_build_process(shell: mutable Shell&) -> void can[Blocking.IO, Memory.Al
     _ = BuildJob::finish(&build_job, build_revision, exit_code)
     PosixProcess::dispose(&build_process)
     if build_job.state == BuildJob::State.Succeeded:
-        set_status_view(shell, "Build succeeded")
+        if shell.building_source:
+            if build_source_still_current(shell):
+                artifact_index: mutable i64 = 0
+                while artifact_index < shell.building_source_path_length:
+                    shell.source_artifact_path_storage[artifact_index.usize()] <- shell.building_source_path_storage[artifact_index.usize()]
+                    artifact_index <- artifact_index + 1
+                shell.source_artifact_path_storage[artifact_index.usize()] <- 0
+                shell.source_artifact_path_length <- artifact_index
+                shell.source_artifact_fingerprint <- shell.building_source_fingerprint
+                shell.source_artifact_valid <- true
+                set_status_view(shell, "Source build succeeded; Run is ready")
+            else:
+                set_status_view(shell, "Source changed during build; rebuild before running")
+        else:
+            set_status_view(shell, "Build succeeded")
         if build_run_after:
             build_run_after <- false
-            start_run_process(shell)
+            run_project(shell)
     elif build_job.state == BuildJob::State.Cancelled:
         build_run_after <- false
         set_status_view(shell, "Build cancelled")
@@ -960,14 +1234,25 @@ def poll_build_process(shell: mutable Shell&) -> void can[Blocking.IO, Memory.Al
         set_status_view(shell, "Build failed; inspect the Problems panel or build log")
     refresh_build_output(shell)
 
-def poll_run_process(shell: mutable Shell&) -> void can[Blocking.IO, Memory.Release]:
+def poll_run_process(shell: mutable Shell&) -> void can[Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast]:
     return if not run_active
     _ = PosixProcess::poll(&run_process, 0)
+    output: mutable darray[u8] = []
+    amount: usize = PosixProcess::read_stdout(&run_process, &output, PROCESS_OUTPUT_CAPACITY)
+    if amount > 0:
+        BuildJob::append_output(&build_job, ShellBytes::view_of(&output))
+    error_output: mutable darray[u8] = []
+    error_amount: usize = PosixProcess::read_stderr(&run_process, &error_output, PROCESS_OUTPUT_CAPACITY)
+    if error_amount > 0:
+        BuildJob::append_output(&build_job, ShellBytes::view_of(&error_output))
+    if amount > 0 or error_amount > 0:
+        refresh_build_output(shell)
     status: PosixProcess::Status = PosixProcess::status(&run_process)
     return if not status.finished
     exit_code: i32 = status.exit_code
     PosixProcess::dispose(&run_process)
     run_active <- false
+    refresh_build_output(shell)
     if status.cancelled:
         set_status_view(shell, "Application stopped")
     elif exit_code == 0:
@@ -995,10 +1280,47 @@ def run_project(shell: mutable Shell&) -> void can[Blocking.IO, Memory.Allocate,
     if BuildJob::is_running(&build_job):
         set_status_view(shell, "Wait for the build to finish")
         return
+    if shell.standalone_source:
+        if not shell.source_artifact_valid:
+            set_status_view(shell, "Build this Elisa source file before running it")
+            return
+        if HostClient::request(host_process, 130, 0, 0).result == 1:
+            set_status_view(shell, "Save the source file and rebuild before running it")
+            return
+        if HostClient::request(host_process, 138, 0, 0).result == 1:
+            set_status_view(shell, "Source changed on disk; compare or reload it before running")
+            return
+        if not source_artifact_is_current(shell):
+            set_status_view(shell, "Source changed since its last successful build; rebuild before running")
+            return
+        start_run_process(shell, true)
+        return
     if build_job.state != BuildJob::State.Succeeded:
         set_status_view(shell, "Build the project before running it")
         return
-    start_run_process(shell)
+    if shell.building_source:
+        set_status_view(shell, "Build the visual project before running its artifact")
+        return
+    if HostClient::request(host_process, 40, 0, 0).result == 1:
+        set_status_view(shell, "Save the project and rebuild before running it")
+        return
+    if HostClient::request(host_process, 154, 0, 0).result == 1:
+        set_status_view(shell, "Project form changed on disk; reload it before running")
+        return
+    if HostClient::request(host_process, 113, 0, 0).result == 1:
+        if HostClient::request(host_process, 130, 0, 0).result == 1:
+            set_status_view(shell, "Save the open source file and rebuild before running")
+            return
+        if HostClient::request(host_process, 138, 0, 0).result == 1:
+            set_status_view(shell, "Open source file changed on disk; compare or reload before running")
+            return
+    if HostClient::request(host_process, 153, 0, 0).result != shell.building_form_revision:
+        set_status_view(shell, "Project changed since its build; rebuild before running")
+        return
+    if not project_path_matches_build(shell):
+        set_status_view(shell, "Project path changed since its build; build it before running")
+        return
+    start_run_process(shell, false)
 
 def source_history_action(shell: mutable Shell&, opcode: i64) -> bool:
     return false if not shell.host_running or not shell.source_mode or HostClient::request(host_process, 113, 0, 0).result != 1
@@ -1025,6 +1347,7 @@ def source_history_action(shell: mutable Shell&, opcode: i64) -> bool:
         set_status(shell, HostClient::request(host_process, 56, 0, 0).text)
         refresh_history_buttons(shell, host_process)
         return true
+    ShellLsp::sync_active(shell, host_process)
     total: i64 = HostClient::request(host_process, 115, 0, 0).result
     if total <= 0:
         target_line <- 0
@@ -1051,6 +1374,7 @@ def source_history_action(shell: mutable Shell&, opcode: i64) -> bool:
 def run_shell_command(shell: mutable Shell&, command_id: u32) -> void:
     if command_id == ShellCommand.NewDocument.u32():
         command(shell, 10, 0)
+        shell.standalone_source <- false
     elif command_id == ShellCommand.OpenDocument.u32():
         open_document(shell)
     elif command_id == ShellCommand.NewProject.u32():
@@ -1071,6 +1395,7 @@ def run_shell_command(shell: mutable Shell&, command_id: u32) -> void:
             set_status(shell, HostClient::request(host_process, 56, 0, 0).text)
             if saved.result == 1:
                 shell.source_compare_mode <- false
+                ShellLsp::sync_active(shell, host_process)
                 refresh_source_view(shell, host_process)
                 UiHandles::layout(UiCore::viewport_width(), UiCore::viewport_height())
         else:
@@ -1144,6 +1469,14 @@ def handle_shell_event(shell: mutable Shell&, incoming: UiCore::Event) -> void:
             UiHandles::layout(UiCore::viewport_width(), UiCore::viewport_height())
             return
         UiCore::PointerEvent.Down(at, button):
+            if shell.source_mode and shell.host_running and button == UiCore::PointerButton.Primary.i32():
+                focused_before_click: i32 = focused_source_row(shell)
+                if focused_before_click >= 0 and focused_before_click < shell.source_line_count:
+                    focused_row: UiHandles::Handle = shell.source_line_rows[focused_before_click.usize()]
+                    shell.source_selected_line <- shell.source_line_offsets[focused_before_click.usize()] + 1
+                    prefix_before_click: darray[u8] = source_line_prefix(shell.source_selected_line)
+                    caret_before_click: usize = UiFlat::selection_utf16_location(focused_row.widget_id.usize())
+                    shell.source_selected_character <- (caret_before_click - prefix_before_click.count if caret_before_click >= prefix_before_click.count else 0).i32()
             if shell.source_mode and shell.host_running and button == UiCore::PointerButton.Primary.i32() and HostClient::request(host_process, 113, 0, 0).result == 1:
                 source_row: i32 = source_row_at(shell, at)
                 if source_row >= 0:
@@ -1216,10 +1549,19 @@ def handle_shell_event(shell: mutable Shell&, incoming: UiCore::Event) -> void:
                     result: HostClient::HostReply = HostClient::request(host_process, 108, shell.source_line_offsets[source_row.usize()], 0)
                     if result.result == 1:
                         refresh_all(shell, host_process)
+                        set_status_view(shell, "Selected form owner from generated source")
                     else:
                         set_status_view(shell, "This generated source line has no selectable form owner")
                     return
             UiHandles::handle(incoming)
+            if shell.source_mode and shell.host_running and HostClient::request(host_process, 113, 0, 0).result == 1:
+                focused: i32 = focused_source_row(shell)
+                if focused >= 0 and focused < shell.source_line_count:
+                    row: UiHandles::Handle = shell.source_line_rows[focused.usize()]
+                    shell.source_selected_line <- shell.source_line_offsets[focused.usize()] + 1
+                    prefix: darray[u8] = source_line_prefix(shell.source_selected_line)
+                    caret: usize = UiFlat::selection_utf16_location(row.widget_id.usize())
+                    shell.source_selected_character <- (caret - prefix.count if caret >= prefix.count else 0).i32()
             if button == UiCore::PointerButton.Primary.i32() and ShellPreview::select_at(shell, host_process, at):
                 refresh_all(shell, host_process)
         UiCore::PointerEvent.Leave:
@@ -1243,6 +1585,9 @@ def handle_shell_event(shell: mutable Shell&, incoming: UiCore::Event) -> void:
             if shell.source_mode and shell.host_running and HostClient::request(host_process, 113, 0, 0).result == 1 and focused_source_row(shell) >= 0:
                 source_modifiers: UiFlat::Modifiers = UiHandles::modifiers()
                 source_primary: bool = source_modifiers.control or source_modifiers.super
+                if raw_key == UiCore::Key.F12.i32():
+                    request_source_definition(shell)
+                    return
                 if source_primary and not source_modifiers.shift and not source_modifiers.alt and raw_key == UiCore::Key.F.i32():
                     _ = UiHandles::request_focus(shell.source_find_field)
                     UiHandles::set_selection_utf16(shell.source_find_field, 0, UiFlat::text_utf16_length(shell.source_find_field.widget_id.usize()))
@@ -1352,9 +1697,488 @@ def go_to_source_line(shell: mutable Shell&, requested_line: i64) -> bool:
     set_status_view(shell, ShellBytes::view_of(&status))
     return true
 
+def go_to_source_position(shell: mutable Shell&, requested_line: i64, requested_character: i32, encoding: i32) -> bool:
+    return false if not go_to_source_line(shell, requested_line)
+    return true if requested_character < 0
+    target_index: i32 = (requested_line - 1 - shell.source_page_start).i32()
+    return false if target_index < 0 or target_index >= shell.source_line_count
+    target: UiHandles::Handle = shell.source_line_rows[target_index.usize()]
+    prefix: darray[u8] = source_line_prefix(requested_line)
+    value: sview = UiHandles::text_value(target)
+    body: sview = string_view_slice(value, prefix.count.i64(), value.len)
+    body_column_utf16: usize = ShellLsp::character_to_utf16(body, encoding, requested_character)
+    desired: mutable usize = prefix.count + body_column_utf16
+    total: usize = UiFlat::text_utf16_length(target.widget_id.usize())
+    desired <- total if desired > total
+    UiHandles::set_selection_utf16(target, desired, 0)
+    reveal_source_row(shell, target)
+    return true
+
+def request_source_definition(shell: mutable Shell&) -> void:
+    if not shell.host_running or not shell.source_mode or shell.source_compare_mode:
+        set_status_view(shell, "Go to Definition is available for an opened Elisa source file")
+        return
+    if HostClient::request(host_process, 113, 0, 0).result != 1:
+        set_status_view(shell, "Generated source has no handwritten LSP definition context")
+        return
+    selected_index: i32 = focused_source_row(shell)
+    requested_line: mutable i64 = shell.source_selected_line - 1
+    requested_utf16: mutable usize = shell.source_selected_character.usize()
+    if selected_index >= 0 and selected_index < shell.source_line_count:
+        selected_row: UiHandles::Handle = shell.source_line_rows[selected_index.usize()]
+        requested_line <- shell.source_line_offsets[selected_index.usize()]
+        prefix: darray[u8] = source_line_prefix(requested_line + 1)
+        caret: usize = UiFlat::selection_utf16_location(selected_row.widget_id.usize())
+        requested_utf16 <- caret - prefix.count if caret >= prefix.count else 0
+        shell.source_selected_line <- requested_line + 1
+        shell.source_selected_character <- requested_utf16.i32()
+    if requested_line < 0:
+        set_status_view(shell, "Place the caret on a source line before requesting a definition")
+        return
+    line_reply: HostClient::HostReply = HostClient::request(host_process, 116, requested_line, 0)
+    if line_reply.result != 1:
+        set_status_view(shell, "The selected source line is no longer available")
+        return
+    body: sview = ShellBytes::view_of(&line_reply.text)
+    character: usize = ShellLsp::utf16_to_character(body, ShellLsp::position_encoding(shell), requested_utf16)
+    if ShellLsp::request_definition(shell, requested_line, character.i32()):
+        set_status_view(shell, "Requesting Elisa-LSP definition")
+    else:
+        set_status_view(shell, "Elisa-LSP is unavailable or a definition request is already running")
+
+def open_definition_result(shell: mutable Shell&) -> void:
+    return if not shell.source_lsp_definition_complete
+    shell.source_lsp_definition_complete <- false
+    if not shell.source_lsp_definition_pending:
+        set_status_view(shell, "Elisa-LSP has no definition at this source position")
+        return
+    shell.source_lsp_definition_pending <- false
+    uri: sview = ShellLsp::definition_uri(shell)
+    path: mutable darray[u8] = decode_local_file_uri(uri)
+    if path.count == 0 or not path_has_suffix(ShellBytes::view_of(&path), ".elisa"):
+        set_status_view(shell, "Elisa-LSP returned a definition outside a local Elisa source file")
+        return
+    current_path: HostClient::HostReply = HostClient::request(host_process, 114, 0, 0)
+    same_document: bool = current_path.result == 1 and ShellBytes::equal(ShellBytes::view_of(&path), ShellBytes::view_of(&current_path.text))
+    if not same_document:
+        if not commit_pending_inspector_edits(shell, host_process):
+            set_status(shell, HostClient::request(host_process, 56, 0, 0).text)
+            return
+        if HostClient::request(host_process, 130, 0, 0).result == 1:
+            refresh_all(shell, host_process)
+            set_status_view(shell, "Save this source file before opening the definition")
+            return
+        if HostClient::request(host_process, 40, 0, 0).result == 1:
+            refresh_all(shell, host_process)
+            set_status_view(shell, "Save this document before opening the definition")
+            return
+        opened: HostClient::HostReply = HostClient::request_text(host_process, 112, 0, 0, ShellBytes::view_of(&path))
+        if opened.result != 1:
+            set_status(shell, HostClient::request(host_process, 56, 0, 0).text)
+            return
+        shell.source_mode <- true
+        shell.source_compare_mode <- false
+        shell.source_page_start <- 0
+        apply_shell_layout(shell)
+        refresh_all(shell, host_process)
+    target_line: i64 = ShellLsp::definition_line(shell) + 1
+    target_character: i32 = ShellLsp::definition_character(shell)
+    if not go_to_source_position(shell, target_line, target_character, ShellLsp::position_encoding(shell)):
+        set_status_view(shell, "The Elisa-LSP definition is outside the opened source file")
+        return
+    status: mutable darray[u8] = []
+    append_panel_text(&status, "Opened Elisa-LSP definition at line ")
+    append_nonnegative(&status, target_line)
+    set_status_view(shell, ShellBytes::view_of(&status))
+
+def navigate_to_workspace_symbol(shell: mutable Shell&, index: i32) -> void:
+    return if index < 0 or index >= ShellLsp::workspace_symbol_count(shell)
+    uri: sview = ShellLsp::workspace_symbol_uri(shell, index)
+    path: mutable darray[u8] = decode_local_file_uri(uri)
+    if path.count == 0:
+        set_status_view(shell, "Workspace symbol is not in a local Elisa source file")
+        return
+    current_path: HostClient::HostReply = HostClient::request(host_process, 114, 0, 0)
+    same_document: bool = current_path.result == 1 and ShellBytes::equal(ShellBytes::view_of(&path), ShellBytes::view_of(&current_path.text))
+    if not same_document:
+        if not commit_pending_inspector_edits(shell, host_process):
+            set_status(shell, HostClient::request(host_process, 56, 0, 0).text)
+            return
+        if HostClient::request(host_process, 130, 0, 0).result == 1:
+            refresh_all(shell, host_process)
+            set_status_view(shell, "Save this source file before opening a workspace symbol")
+            return
+        if HostClient::request(host_process, 40, 0, 0).result == 1:
+            refresh_all(shell, host_process)
+            set_status_view(shell, "Save this document before opening a workspace symbol")
+            return
+        opened: HostClient::HostReply = HostClient::request_text(host_process, 112, 0, 0, ShellBytes::view_of(&path))
+        if opened.result != 1:
+            set_status(shell, HostClient::request(host_process, 56, 0, 0).text)
+            return
+        shell.source_mode <- true
+        shell.standalone_source <- true
+        shell.source_compare_mode <- false
+        shell.source_page_start <- 0
+        apply_shell_layout(shell)
+        refresh_all(shell, host_process)
+    else:
+        shell.source_mode <- true
+        shell.source_compare_mode <- false
+        refresh_source_view(shell, host_process)
+    line: i32 = ShellLsp::workspace_symbol_line(shell, index)
+    character: i32 = ShellLsp::workspace_symbol_character(shell, index)
+    if line < 0 or character < 0 or not go_to_source_position(shell, line.i64() + 1, character, ShellLsp::position_encoding(shell)):
+        set_status_view(shell, "Workspace symbol location is outside the opened source file")
+        return
+    shell.source_lsp_symbol_selected <- index
+    status: mutable darray[u8] = []
+    append_panel_text(&status, "Opened workspace symbol ")
+    append_panel_text(&status, ShellLsp::workspace_symbol_name(shell, index))
+    append_panel_text(&status, " at line ")
+    append_nonnegative(&status, line.i64() + 1)
+    set_status_view(shell, ShellBytes::view_of(&status))
+
+def request_workspace_symbol_search(shell: mutable Shell&) -> void:
+    query: sview = UiHandles::text_value(shell.source_symbol_query)
+    if query.len <= 0 or query.len > 256:
+        set_status_view(shell, "Enter a workspace symbol query up to 256 UTF-8 bytes")
+        return
+    if not ShellLsp::request_workspace_symbols(shell, query):
+        set_status_view(shell, "Elisa-LSP does not advertise workspace symbol search")
+        return
+    set_status_view(shell, "Searching the Elisa-LSP workspace")
+
+def advance_workspace_symbol(shell: mutable Shell&) -> void:
+    count: i32 = ShellLsp::workspace_symbol_count(shell)
+    if count <= 0:
+        set_status_view(shell, "Search the workspace for a symbol first")
+        return
+    index: mutable i32 = shell.source_lsp_symbol_selected + 1
+    if index >= count:
+        index <- 0
+    navigate_to_workspace_symbol(shell, index)
+
 def submit_source_line_navigation(shell: mutable Shell&) -> bool:
     requested: i64 = parse_source_line_number(UiHandles::text_value(shell.source_goto_field))
     return go_to_source_line(shell, requested)
+
+def parse_build_number(text: sview, start: i64, stop: i64) -> i64:
+    return -1 if start < 0 or stop <= start or stop > text.len
+    parsed: mutable i64 = 0
+    cursor: mutable i64 = start
+    while cursor < stop:
+        return -1 if text[cursor] < 48 or text[cursor] > 57
+        parsed <- parsed * 10 + (text[cursor] - 48)
+        return -1 if parsed > 1048576
+        cursor <- cursor + 1
+    return parsed if parsed > 0 else -1
+
+def text_starts_ascii_fold(text: sview, offset: i64, needle: sview) -> bool:
+    return false if offset < 0 or offset + needle.len > text.len
+    index: mutable i64 = 0
+    while index < needle.len:
+        left: mutable i32 = text[offset + index].i32()
+        right: mutable i32 = needle[index].i32()
+        left <- left + 32 if left >= 65 and left <= 90
+        right <- right + 32 if right >= 65 and right <= 90
+        return false if left != right
+        index <- index + 1
+    return true
+
+def build_severity_suffix(text: sview, separator: i64) -> bool:
+    return false if separator < 0 or separator + 2 >= text.len or text[separator] != 58
+    return false if text[separator + 1] != 32 and text[separator + 1] != 9
+    token: i64 = separator + 2
+    return true if text_starts_ascii_fold(text, token, "error:")
+    return true if text_starts_ascii_fold(text, token, "warning:")
+    return true if text_starts_ascii_fold(text, token, "fatal error:")
+    return true if text_starts_ascii_fold(text, token, "note:")
+    return true if text_starts_ascii_fold(text, token, "info:")
+    return false
+
+def store_build_diagnostic_path(text: sview, stop: i64, path_out: mutable darray[u8]&) -> bool:
+    return false if stop <= 0 or stop > 4096
+    path_out.resize(0)
+    index: mutable i64 = 0
+    while index < stop:
+        byte: u8 = text[index]
+        return false if byte == 0 or byte < 32 or byte == 127
+        path_out.push(byte)
+        index <- index + 1
+    return path_out.count > 0
+
+def parse_build_diagnostic_location(text: sview, path_out: mutable darray[u8]&, line_out: mutable i64&, character_out: mutable i32&) -> bool:
+    path_out.resize(0)
+    path_separator: mutable i64 = 0
+    while path_separator < text.len:
+        if text[path_separator] == 58:
+            line_stop: mutable i64 = path_separator + 1
+            while line_stop < text.len and text[line_stop] >= 48 and text[line_stop] <= 57:
+                line_stop <- line_stop + 1
+            line_number: i64 = parse_build_number(text, path_separator + 1, line_stop)
+            if line_number > 0:
+                if build_severity_suffix(text, line_stop):
+                    if store_build_diagnostic_path(text, path_separator, path_out):
+                        line_out <- line_number - 1
+                        character_out <- -1
+                        return true
+                if line_stop < text.len and text[line_stop] == 58:
+                    column_stop: mutable i64 = line_stop + 1
+                    while column_stop < text.len and text[column_stop] >= 48 and text[column_stop] <= 57:
+                        column_stop <- column_stop + 1
+                    column_number: i64 = parse_build_number(text, line_stop + 1, column_stop)
+                    if column_number > 0 and build_severity_suffix(text, column_stop):
+                        if store_build_diagnostic_path(text, path_separator, path_out):
+                            line_out <- line_number - 1
+                            character_out <- (column_number - 1).i32()
+                            return true
+        elif text[path_separator] == 40:
+            line_stop: mutable i64 = path_separator + 1
+            while line_stop < text.len and text[line_stop] >= 48 and text[line_stop] <= 57:
+                line_stop <- line_stop + 1
+            line_number: i64 = parse_build_number(text, path_separator + 1, line_stop)
+            if line_number > 0:
+                column_number: mutable i64 = -1
+                valid_column: mutable bool = true
+                location_stop: mutable i64 = line_stop
+                if location_stop < text.len and text[location_stop] == 44:
+                    column_stop: mutable i64 = location_stop + 1
+                    while column_stop < text.len and text[column_stop] >= 48 and text[column_stop] <= 57:
+                        column_stop <- column_stop + 1
+                    column_number <- parse_build_number(text, location_stop + 1, column_stop)
+                    valid_column <- column_number > 0
+                    location_stop <- column_stop
+                if valid_column and location_stop < text.len and text[location_stop] == 41 and build_severity_suffix(text, location_stop + 1):
+                    if store_build_diagnostic_path(text, path_separator, path_out):
+                        line_out <- line_number - 1
+                        character_out <- (column_number - 1).i32() if column_number > 0 else -1
+                        return true
+        path_separator <- path_separator + 1
+    return false
+
+def build_diagnostic_matches_open_source(text: sview, process: mutable PosixProcess::Process&, line_out: mutable i64&, character_out: mutable i32&) -> bool:
+    return false if HostClient::request(process, 113, 0, 0).result != 1
+    path_reply: HostClient::HostReply = HostClient::request(process, 114, 0, 0)
+    return false if path_reply.result != 1 or path_reply.text.count == 0
+    diagnostic_path: mutable darray[u8] = []
+    return false if not parse_build_diagnostic_location(text, &diagnostic_path, line_out, character_out)
+    return ShellBytes::equal(ShellBytes::view_of(&diagnostic_path), ShellBytes::view_of(&path_reply.text))
+
+def safe_build_source_path(path: sview) -> bool:
+    return false if path.len <= 6 or not path_has_suffix(path, ".elisa")
+    return false if path[0] == 126
+    segment_start: mutable i64 = 0
+    segment_start <- 1 if path[0] == 47
+    index: mutable i64 = 0
+    while index <= path.len:
+        if index == path.len or path[index] == 47:
+            if index - segment_start == 2 and path[segment_start] == 46 and path[segment_start + 1] == 46:
+                return false
+            if index - segment_start == 9:
+                generated_segment: mutable bool = true
+                generated_word: sview = "generated"
+                segment_index: mutable i64 = 0
+                while segment_index < generated_word.len:
+                    if path[segment_start + segment_index] != generated_word[segment_index]:
+                        generated_segment <- false
+                    segment_index <- segment_index + 1
+                return false if generated_segment
+            segment_start <- index + 1
+        index <- index + 1
+    return true
+
+def navigate_to_build_source(shell: mutable Shell&, path: sview, line: i64, character: i32) -> bool:
+    if not commit_pending_inspector_edits(shell, host_process):
+        set_status(shell, HostClient::request(host_process, 56, 0, 0).text)
+        return false
+    if not commit_pending_event_edits(shell, host_process):
+        return false
+    if HostClient::request(host_process, 130, 0, 0).result == 1:
+        refresh_all(shell, host_process)
+        set_status_view(shell, "Save this source file before opening the build diagnostic source")
+        return false
+    if HostClient::request(host_process, 40, 0, 0).result == 1:
+        refresh_all(shell, host_process)
+        set_status_view(shell, "Save this document before opening the build diagnostic source")
+        return false
+    opened: HostClient::HostReply = HostClient::request_text(host_process, 112, 0, 0, path)
+    if opened.result != 1:
+        set_status(shell, HostClient::request(host_process, 56, 0, 0).text)
+        return false
+    shell.source_mode <- true
+    shell.source_compare_mode <- false
+    shell.source_page_start <- 0
+    apply_shell_layout(shell)
+    refresh_all(shell, host_process)
+    full_source: HostClient::HostReply = HostClient::request(host_process, 151, 0, 0)
+    source_offset: mutable i64 = -1
+    if full_source.result != 1 or not generated_source_location_offset(full_source.text, line, character, &source_offset):
+        set_status_view(shell, "Build diagnostic location is outside the opened source file")
+        return false
+    if not go_to_source_position(shell, line + 1, character, 8):
+        set_status_view(shell, "Build diagnostic location could not be shown in the source pane")
+        return false
+    status: mutable darray[u8] = []
+    append_panel_text(&status, "Opened build diagnostic source at line ")
+    append_nonnegative(&status, line + 1)
+    set_status_view(shell, ShellBytes::view_of(&status))
+    return true
+
+def generated_source_location_offset(source: darray[u8]&, line: i64, character: i32, offset_out: mutable i64&) -> bool:
+    return false if line < 0 or source.count == 0
+    line_start: mutable i64 = 0
+    current_line: mutable i64 = 0
+    while current_line < line:
+        while line_start < source.count.i64() and source[line_start.usize()] != 10:
+            line_start <- line_start + 1
+        return false if line_start >= source.count.i64()
+        line_start <- line_start + 1
+        current_line <- current_line + 1
+    return false if line_start >= source.count.i64()
+    line_end: mutable i64 = line_start
+    while line_end < source.count.i64() and source[line_end.usize()] != 10:
+        line_end <- line_end + 1
+    offset: mutable i64 = line_start
+    if character >= 0:
+        return false if character.i64() > line_end - line_start
+        offset <- line_start + character.i64()
+    return false if offset < 0 or offset >= source.count.i64()
+    offset_out <- offset
+    return true
+
+def build_generated_diagnostic_offset(text: sview, process: mutable PosixProcess::Process&, offset_out: mutable i64&) -> bool:
+    location_path: mutable darray[u8] = []
+    line: mutable i64 = -1
+    character: mutable i32 = -1
+    return false if not parse_build_diagnostic_location(text, &location_path, &line, &character)
+    return false if location_path.count < 6
+    suffix_start: i64 = location_path.count.i64() - 6
+    location_path_view: sview = ShellBytes::view_of(&location_path)
+    return false if not ShellBytes::equal(string_view_slice(location_path_view, suffix_start, location_path_view.len), ".elisa")
+    form_path: HostClient::HostReply = HostClient::request(process, 109, 0, 0)
+    return false if form_path.result != 1 or form_path.text.count == 0
+    current_source: HostClient::HostReply = HostClient::request(process, 106, 0, 0)
+    return false if current_source.result != 1 or current_source.text.count == 0 or current_source.text.count > 1048576
+    current_map: HostClient::HostReply = HostClient::request(process, 107, 0, 0)
+    return false if current_map.result != 1 or current_map.text.count == 0 or current_map.text.count > 8388608
+
+    source_path: mutable darray[u8] = []
+    path_index: mutable i64 = 0
+    while path_index < location_path.count.i64():
+        source_path.push(location_path[path_index.usize()])
+        path_index <- path_index + 1
+    source_path.push(0)
+    source_path_cstr: mutable cstr = ""
+    can Unsafe.PointerCast:
+        source_path_cstr <- (&source_path[0]).cast[cstr] can Unsafe.PointerCast
+    generated_bytes: mutable darray[u8] = []
+    generated_length: i64 = PosixFile::read_bytes_result(&generated_bytes, source_path_cstr, 1048577)
+    return false if generated_length < 0 or generated_length != current_source.text.count.i64()
+    return false if not ShellBytes::equal(ShellBytes::view_of(&generated_bytes), ShellBytes::view_of(&current_source.text))
+
+    map_path: mutable darray[u8] = []
+    path_index <- 0
+    while path_index < location_path.count.i64():
+        map_path.push(location_path[path_index.usize()])
+        path_index <- path_index + 1
+    append_panel_text(&map_path, ".map.json")
+    map_path.push(0)
+    map_path_cstr: mutable cstr = ""
+    can Unsafe.PointerCast:
+        map_path_cstr <- (&map_path[0]).cast[cstr] can Unsafe.PointerCast
+    map_bytes: mutable darray[u8] = []
+    map_length: i64 = PosixFile::read_bytes_result(&map_bytes, map_path_cstr, 8388609)
+    return false if map_length < 0 or map_length != current_map.text.count.i64()
+    return false if not ShellBytes::equal(ShellBytes::view_of(&map_bytes), ShellBytes::view_of(&current_map.text))
+    return generated_source_location_offset(generated_bytes, line, character, offset_out)
+
+def handler_declaration_query(handler: sview) -> darray[u8]:
+    query: mutable darray[u8] = []
+    return query if handler.len == 0
+    leaf_start: mutable i64 = 0
+    index: mutable i64 = 0
+    while index + 1 < handler.len:
+        if handler[index] == 58 and handler[index + 1] == 58:
+            leaf_start <- index + 2
+            index <- index + 1
+        index <- index + 1
+    return query if leaf_start >= handler.len
+    append_panel_text(&query, "def ")
+    while leaf_start < handler.len:
+        query.push(handler[leaf_start])
+        leaf_start <- leaf_start + 1
+    append_panel_text(&query, "(")
+    return query
+
+def selected_event_declaration_query(shell: mutable Shell&, process: mutable PosixProcess::Process&) -> darray[u8]:
+    index: mutable i32 = shell.selected_event_index
+    if index >= 0 and index < shell.event_count:
+        handler: HostClient::HostReply = HostClient::request(process, 92, index.i64(), 0)
+        if handler.text.count > 0:
+            return handler_declaration_query(ShellBytes::view_of(&handler.text))
+    index <- 0
+    while index < shell.event_count and index < MAX_EVENT_ROWS:
+        handler: HostClient::HostReply = HostClient::request(process, 92, index.i64(), 0)
+        if handler.text.count > 0:
+            shell.selected_event_index <- index
+            return handler_declaration_query(ShellBytes::view_of(&handler.text))
+        index <- index + 1
+    return []
+
+def commit_pending_event_edits(shell: mutable Shell&, process: mutable PosixProcess::Process&) -> bool:
+    changed: mutable bool = false
+    index: mutable i32 = 0
+    while index < shell.event_count and index < MAX_EVENT_ROWS:
+        if shell.event_edit_dirty[index.usize()]:
+            editor: UiHandles::Handle = shell.event_editors[index.usize()]
+            value: sview = UiHandles::text_value(editor)
+            if HostClient::request_text(process, 94, index.i64(), 0, value).result != 1:
+                set_status(shell, HostClient::request(process, 56, 0, 0).text)
+                return false
+            shell.selected_event_index <- index if shell.selected_event_index < 0
+            changed <- true
+        index <- index + 1
+    if changed:
+        refresh_all(shell, process)
+    return true
+
+def navigate_to_source_query(shell: mutable Shell&, query: sview) -> bool:
+    return false if not shell.host_running or not shell.source_mode or HostClient::request(host_process, 113, 0, 0).result != 1
+    match_offset: i64 = HostClient::request_text(host_process, 147, 0, 1, query).result
+    if match_offset < 0:
+        set_status_view(shell, "Handler declaration was not found in the opened source file")
+        return false
+    target_line: i64 = HostClient::request(host_process, 149, match_offset, 0).result
+    if target_line < 0:
+        set_status_view(shell, "The handler declaration is no longer available")
+        return false
+    shell.source_compare_mode <- false
+    shell.source_page_start <- (target_line / MAX_SOURCE_LINES.i64()) * MAX_SOURCE_LINES.i64()
+    refresh_source_view(shell, host_process)
+    target_index: i32 = (target_line - shell.source_page_start).i32()
+    if target_index < 0 or target_index >= shell.source_line_count:
+        set_status_view(shell, "The handler declaration could not be shown in the source page")
+        return false
+    target: UiHandles::Handle = shell.source_line_rows[target_index.usize()]
+    shell.source_selected_line <- target_line + 1
+    shell.source_find_match_start <- match_offset
+    shell.source_find_match_valid <- false
+    if not UiHandles::is_enabled(target):
+        reveal_source_row(shell, target)
+        set_status_view(shell, "Handler declaration is on a clipped line; use Open in Editor to inspect it")
+        return true
+    _ = UiHandles::request_focus(target)
+    line_start: i64 = HostClient::request(host_process, 118, target_line, 0).result
+    column: usize = (match_offset - line_start).usize()
+    prefix: darray[u8] = source_line_prefix(target_line + 1)
+    UiHandles::set_selection(target, prefix.count + column, prefix.count + column + query.len.usize())
+    reveal_source_row(shell, target)
+    status: mutable darray[u8] = []
+    append_panel_text(&status, "Opened handler declaration at line ")
+    append_nonnegative(&status, target_line + 1)
+    set_status_view(shell, ShellBytes::view_of(&status))
+    return true
 
 def find_source_text(shell: mutable Shell&, forward: bool) -> bool:
     return false if not shell.host_running or not shell.source_mode or HostClient::request(host_process, 113, 0, 0).result != 1
@@ -1462,6 +2286,7 @@ def replace_next_source_text(shell: mutable Shell&) -> bool:
         set_status(shell, HostClient::request(host_process, 56, 0, 0).text)
         return false
     shell.source_find_match_valid <- false
+    ShellLsp::sync_active(shell, host_process)
     refresh_source_view(shell, host_process)
     current_line: i64 = HostClient::request(host_process, 149, match_offset, 0).result
     target_index <- (current_line - shell.source_page_start).i32()
@@ -1501,6 +2326,7 @@ def replace_all_source_text(shell: mutable Shell&) -> bool:
         set_status_view(shell, "No source matches to replace")
         return false
     shell.source_find_match_valid <- false
+    ShellLsp::sync_active(shell, host_process)
     refresh_source_view(shell, host_process)
     status: mutable darray[u8] = []
     append_panel_text(&status, "Replaced ")
@@ -1558,6 +2384,7 @@ def source_line_changed(shell: mutable Shell&, index: i32) -> void:
     result: HostClient::HostReply = HostClient::request_text(host_process, 132, line_index, 0, body)
     if result.result == 1:
         shell.source_find_match_valid <- false
+        ShellLsp::sync_active(shell, host_process)
         dirty: bool = HostClient::request(host_process, 130, 0, 0).result == 1
         UiHandles::set_text(shell.source_title, "Elisa source (modified)" if dirty else "Elisa source", 15.0, shell_color(230, 234, 242))
         refresh_history_buttons(shell, host_process)
@@ -1581,6 +2408,10 @@ def widget_event(shell: mutable Shell&, widget: usize, event: i32) -> void:
         index: mutable i32 = 0
         while index < shell.source_line_count:
             if UiHandles::callback_matches(widget, shell.source_line_rows[index.usize()]):
+                shell.source_selected_line <- shell.source_line_offsets[index.usize()] + 1
+                prefix: darray[u8] = source_line_prefix(shell.source_selected_line)
+                caret: usize = UiFlat::selection_utf16_location(widget)
+                shell.source_selected_character <- (caret - prefix.count if caret >= prefix.count else 0).i32()
                 source_line_changed(shell, index)
                 return
             index <- index + 1
@@ -1596,6 +2427,7 @@ def widget_event(shell: mutable Shell&, widget: usize, event: i32) -> void:
         while index < MAX_EVENT_ROWS:
             if UiHandles::callback_matches(widget, shell.event_editors[index.usize()]):
                 shell.event_edit_dirty[index.usize()] <- true
+                shell.selected_event_index <- index
                 return
             index <- index + 1
     if UiHandles::event_is(event, UiConst::WidgetEvent.Submit):
@@ -1605,6 +2437,9 @@ def widget_event(shell: mutable Shell&, widget: usize, event: i32) -> void:
             return
         if UiHandles::callback_matches(widget, shell.source_goto_field):
             _ = submit_source_line_navigation(shell)
+            return
+        if UiHandles::callback_matches(widget, shell.source_symbol_query):
+            request_workspace_symbol_search(shell)
             return
         if UiHandles::callback_matches(widget, shell.source_find_field):
             _ = find_source_text(shell, true)
@@ -1660,12 +2495,26 @@ def widget_event(shell: mutable Shell&, widget: usize, event: i32) -> void:
         return
     if UiHandles::callback_matches(widget, shell.event_handler_source_button):
         if shell.host_running:
+            if HostClient::request(host_process, 130, 0, 0).result == 1:
+                refresh_all(shell, host_process)
+                set_status_view(shell, "Save this source file before opening handlers")
+                return
+            if not commit_pending_event_edits(shell, host_process):
+                return
+            if HostClient::request(host_process, 40, 0, 0).result == 1:
+                refresh_all(shell, host_process)
+                set_status_view(shell, "Save this document before opening handlers")
+                return
+            handler_query: mutable darray[u8] = selected_event_declaration_query(shell, host_process)
             opened: HostClient::HostReply = HostClient::request(host_process, 117, 0, 0)
             if opened.result == 1:
                 shell.source_mode <- true
+                shell.standalone_source <- false
                 shell.source_page_start <- 0
                 apply_shell_layout(shell)
                 refresh_all(shell, host_process)
+                if handler_query.count > 0:
+                    _ = navigate_to_source_query(shell, ShellBytes::view_of(&handler_query))
             else:
                 set_status(shell, HostClient::request(host_process, 56, 0, 0).text)
         return
@@ -1716,6 +2565,12 @@ def widget_event(shell: mutable Shell&, widget: usize, event: i32) -> void:
         return
     if UiHandles::callback_matches(widget, preview_retry_handle):
         ShellPreview::retry(shell, host_process)
+        return
+    if UiHandles::callback_matches(widget, shell.source_lsp_restart_button):
+        ShellLsp::restart(shell, host_process)
+        return
+    if UiHandles::callback_matches(widget, shell.source_lsp_definition_button):
+        request_source_definition(shell)
         return
     if UiHandles::callback_matches(widget, shell.compact_palette_button):
         shell.compact_panel <- 1
@@ -1810,6 +2665,7 @@ def widget_event_events(shell: mutable Shell&, widget: usize, event: i32) -> boo
         editor: UiHandles::Handle = shell.event_editors[index.usize()]
         clear: UiHandles::Handle = shell.event_clear_buttons[index.usize()]
         if UiHandles::event_is(event, UiConst::WidgetEvent.Submit) and UiHandles::callback_matches(widget, editor):
+            shell.selected_event_index <- index
             if shell.host_running:
                 value: sview = UiHandles::text_value(editor)
                 if HostClient::request_text(host_process, 94, index.i64(), 0, value).result == 1:
@@ -1818,21 +2674,37 @@ def widget_event_events(shell: mutable Shell&, widget: usize, event: i32) -> boo
                     set_status(shell, HostClient::request(host_process, 56, 0, 0).text)
             return true
         if UiHandles::event_is(event, UiConst::WidgetEvent.Click) and UiHandles::callback_matches(widget, clear):
+            shell.selected_event_index <- index
             if shell.host_running:
                 if HostClient::request(host_process, 95, index.i64(), 0).result == 1:
                     refresh_all(shell, host_process)
                 else:
                     set_status(shell, HostClient::request(host_process, 56, 0, 0).text)
             return true
+        if UiHandles::event_is(event, UiConst::WidgetEvent.Click) and UiHandles::callback_matches(widget, editor):
+            shell.selected_event_index <- index
+            return true
         index <- index + 1
     return false
 
 def widget_event_rows(shell: mutable Shell&, widget: usize) -> bool:
+    if UiHandles::callback_matches(widget, shell.source_symbol_search_button):
+        request_workspace_symbol_search(shell)
+        return true
+    if UiHandles::callback_matches(widget, shell.source_symbol_next_button):
+        advance_workspace_symbol(shell)
+        return true
+    if UiHandles::callback_matches(widget, shell.problem_related_button):
+        open_next_related_location(shell)
+        return true
     if UiHandles::callback_matches(widget, shell.problem_copy_button):
         copy_selected_problem(shell)
         return true
     if UiHandles::callback_matches(widget, shell.source_goto_button):
         _ = submit_source_line_navigation(shell)
+        return true
+    if UiHandles::callback_matches(widget, shell.source_lsp_definition_button):
+        request_source_definition(shell)
         return true
     if UiHandles::callback_matches(widget, shell.source_find_previous_button):
         _ = find_source_text(shell, false)
@@ -1855,6 +2727,7 @@ def widget_event_rows(shell: mutable Shell&, widget: usize) -> bool:
     if UiHandles::callback_matches(widget, shell.source_keep_buffer_button):
         if shell.host_running and HostClient::request(host_process, 145, 0, 0).result == 1:
             shell.source_compare_mode <- false
+            ShellLsp::sync_active(shell, host_process)
             refresh_source_view(shell, host_process)
             set_status(shell, HostClient::request(host_process, 56, 0, 0).text)
             UiHandles::layout(UiCore::viewport_width(), UiCore::viewport_height())
@@ -1865,6 +2738,7 @@ def widget_event_rows(shell: mutable Shell&, widget: usize) -> bool:
         if shell.host_running and HostClient::request(host_process, 144, 0, 0).result == 1:
             shell.source_compare_mode <- false
             shell.source_page_start <- 0
+            ShellLsp::sync_active(shell, host_process)
             refresh_source_view(shell, host_process)
             set_status(shell, HostClient::request(host_process, 56, 0, 0).text)
             UiHandles::layout(UiCore::viewport_width(), UiCore::viewport_height())
@@ -1923,7 +2797,10 @@ def widget_event_rows(shell: mutable Shell&, widget: usize) -> bool:
             if shell.host_running:
                 ancestor_index: mutable i64 = breadcrumb_index.i64()
                 if shell.hierarchy_breadcrumb_truncated:
-                    ancestor_index <- shell.hierarchy_breadcrumb_first - 1 if breadcrumb_index == 0
+                    # Jump to the end of the first full visible chunk. Selecting
+                    # the ancestor directly before the trailing window would
+                    # leave the breadcrumb truncated and make the ellipsis inert.
+                    ancestor_index <- MAX_HIERARCHY_BREADCRUMB_SEGMENTS.i64() - 1 if breadcrumb_index == 0
                     ancestor_index <- shell.hierarchy_breadcrumb_first + breadcrumb_index.i64() - 1 if breadcrumb_index > 0
                 ancestor_row: i64 = HostClient::request(host_process, 65, ancestor_index, 0).result
                 if ancestor_row >= 0:
@@ -1995,8 +2872,69 @@ def widget_event_rows(shell: mutable Shell&, widget: usize) -> bool:
                 target_row: i64 = HostClient::request(host_process, 100, logical_row, 0).result
                 if target_row >= 0:
                     command(shell, 31, target_row)
+            elif logical_row < shell.projection.problem_count + shell.source_lsp_diagnostics.i64():
+                diagnostic_index: i32 = (logical_row - shell.projection.problem_count).i32()
+                shell.selected_lsp_diagnostic_index <- diagnostic_index
+                capture_selected_related_locations(shell, diagnostic_index)
+                refresh_problems(shell, host_process)
+                line: i32 = ShellLsp::diagnostic_line(shell, diagnostic_index)
+                if line >= 0 and HostClient::request(host_process, 113, 0, 0).result == 1:
+                    shell.source_mode <- true
+                    shell.source_compare_mode <- false
+                    apply_shell_layout(shell)
+                    character: i32 = ShellLsp::diagnostic_character(shell, diagnostic_index)
+                    _ = go_to_source_position(shell, line.i64() + 1, character, ShellLsp::position_encoding(shell))
+                    status: mutable darray[u8] = []
+                    append_panel_text(&status, "Selected Elisa-LSP diagnostic at source line ")
+                    append_nonnegative(&status, line.i64() + 1)
+                    set_status_view(shell, ShellBytes::view_of(&status))
+                else:
+                    set_status_view(shell, "This Elisa-LSP diagnostic has no navigable source line")
             else:
-                set_status_view(shell, "Build diagnostic source mapping is unavailable for this output line")
+                build_line: sview = build_diagnostic_at(build_output_text(shell), (logical_row - shell.projection.problem_count - shell.source_lsp_diagnostics.i64()).i32())
+                build_source_line: mutable i64 = -1
+                build_source_character: mutable i32 = -1
+                if build_diagnostic_matches_open_source(build_line, host_process, &build_source_line, &build_source_character):
+                    shell.source_mode <- true
+                    shell.source_compare_mode <- false
+                    apply_shell_layout(shell)
+                    _ = go_to_source_position(shell, build_source_line + 1, build_source_character, 8)
+                    status: mutable darray[u8] = []
+                    append_panel_text(&status, "Selected build diagnostic at source line ")
+                    append_nonnegative(&status, build_source_line + 1)
+                    set_status_view(shell, ShellBytes::view_of(&status))
+                else:
+                    generated_offset: mutable i64 = -1
+                    generated_mapped: bool = build_generated_diagnostic_offset(build_line, host_process, &generated_offset)
+                    if generated_mapped:
+                        if HostClient::request(host_process, 130, 0, 0).result == 1:
+                            refresh_all(shell, host_process)
+                            set_status_view(shell, "Save this source file before following the build diagnostic")
+                        elif HostClient::request(host_process, 108, generated_offset, 0).result == 1:
+                            shell.source_mode <- false
+                            shell.source_compare_mode <- false
+                            refresh_all(shell, host_process)
+                            status: mutable darray[u8] = []
+                            append_panel_text(&status, "Selected generated build diagnostic at line ")
+                            generated_line: mutable i64 = -1
+                            generated_character: mutable i32 = -1
+                            location_path: mutable darray[u8] = []
+                            if parse_build_diagnostic_location(build_line, &location_path, &generated_line, &generated_character):
+                                append_nonnegative(&status, generated_line + 1)
+                            set_status_view(shell, ShellBytes::view_of(&status))
+                        else:
+                            set_status_view(shell, "Build diagnostic source mapping is unavailable for this output line")
+                    else:
+                        location_path: mutable darray[u8] = []
+                        location_line: mutable i64 = -1
+                        location_character: mutable i32 = -1
+                        location_valid: mutable bool = parse_build_diagnostic_location(build_line, &location_path, &location_line, &location_character)
+                        if location_valid:
+                            location_valid <- safe_build_source_path(ShellBytes::view_of(&location_path))
+                        if location_valid:
+                            _ = navigate_to_build_source(shell, ShellBytes::view_of(&location_path), location_line, location_character)
+                        else:
+                            set_status_view(shell, "Build diagnostic source mapping is unavailable for this output line")
             return true
         index <- index + 1
     hierarchy_total: i32 = shell.hierarchy_count
@@ -2019,12 +2957,37 @@ def init(shell: mutable Shell&) -> void:
     build_shell(shell)
     ShellPreview::initialize(shell)
     start_host(shell)
+    ShellLsp::refresh_status(shell)
     if shell.host_running:
         refresh_all(shell, host_process)
 
 def frame(shell: mutable Shell&) -> void can[Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast, Ui.Draw]:
     poll_build_process(shell)
     poll_run_process(shell)
+    ShellLsp::poll(shell)
+    if shell.source_lsp_problems_dirty:
+        shell.source_lsp_problems_dirty <- false
+        refresh_problems(shell, host_process)
+        if shell.source_mode and not shell.source_compare_mode and HostClient::request(host_process, 113, 0, 0).result == 1:
+            refresh_source_file_lines(shell, host_process)
+        UiHandles::layout(UiCore::viewport_width(), UiCore::viewport_height())
+    open_definition_result(shell)
+    if shell.source_lsp_symbol_results_ready:
+        shell.source_lsp_symbol_results_ready <- false
+        current_symbol_path: HostClient::HostReply = HostClient::request(host_process, 114, 0, 0)
+        current_symbol_fingerprint: HostClient::HostReply = HostClient::request(host_process, 152, 0, 0)
+        identity_matches: bool = (ShellLsp::workspace_symbol_request_identity_valid(shell)
+            and current_symbol_path.result == 1
+            and ShellBytes::equal(ShellBytes::view_of(&current_symbol_path.text), ShellLsp::workspace_symbol_request_path(shell))
+            and current_symbol_fingerprint.result == ShellLsp::workspace_symbol_request_fingerprint(shell))
+        if not identity_matches:
+            shell.source_lsp_symbol_result_count <- 0
+            set_status_view(shell, "Discarded workspace symbols for a source buffer that changed during search")
+        elif ShellLsp::workspace_symbol_count(shell) > 0:
+            shell.source_lsp_symbol_selected <- -1
+            advance_workspace_symbol(shell)
+        else:
+            set_status_view(shell, "Elisa-LSP found no local Elisa workspace symbols for this query")
     ShellPreview::poll_and_bind(shell)
     UiCore::clear(shell_color(12, 14, 20))
     UiHandles::paint()

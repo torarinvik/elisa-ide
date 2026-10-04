@@ -115,6 +115,39 @@ class LspWorkspace:
         self._after_source_change(buffer, count > 0)
         return count
 
+    def definition(self, uri: str, line: int, character: int) -> object:
+        """Request a definition for the current synchronized buffer snapshot."""
+        buffer = self._buffer(uri)
+        if buffer.synced_revision != buffer.document.revision:
+            raise LspError(f"document is not synchronized with Elisa-LSP: {uri}")
+        if self.supervisor.state != SupervisorState.RUNNING:
+            raise LspError("Elisa-LSP is not running")
+        if not self.supervisor.capabilities.supports("definitionProvider"):
+            raise LspError("Elisa-LSP does not support definition requests")
+        return self.supervisor.request(
+            "textDocument/definition",
+            {
+                "textDocument": {"uri": uri},
+                "position": {"line": line, "character": character},
+            },
+        ).get("result")
+
+    def workspace_symbols(self, uri: str, query: str = "") -> object:
+        """Search the synchronized workspace when the server advertises it."""
+        buffer = self._buffer(uri)
+        if buffer.synced_revision != buffer.document.revision:
+            raise LspError(f"document is not synchronized with Elisa-LSP: {uri}")
+        if self.supervisor.state != SupervisorState.RUNNING:
+            raise LspError("Elisa-LSP is not running")
+        if not self.supervisor.capabilities.supports("workspaceSymbolProvider"):
+            raise LspError("Elisa-LSP does not support workspace symbol requests")
+        if len(query.encode("utf-8")) > 256:
+            raise ValueError("workspace symbol query exceeds 256 UTF-8 bytes")
+        result = self.supervisor.request("workspace/symbol", {"query": query}).get("result")
+        if result is not None and not isinstance(result, list):
+            raise LspError("Elisa-LSP returned a malformed workspace symbol result")
+        return result
+
     def indent_lines(
         self,
         uri: str,

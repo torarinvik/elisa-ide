@@ -58,7 +58,7 @@ clang -Wl,-dead_strip -o "$ROOT/build/preview_worker" \
     "$ROOT/build/appkit_canvas_shim.o" \
     "$ROOT/build/designer_posix.o" \
     "$RUNTIME" \
-    -framework Cocoa -framework CoreText -framework CoreGraphics -framework ImageIO
+    -framework Cocoa -framework QuartzCore -framework CoreText -framework CoreGraphics -framework ImageIO
 python3 "$ROOT/scripts/compiler_provenance.py" verify \
     "$ROOT/build/provenance-preview-worker.json" "$STAGE1"
 echo "built $ROOT/build/preview_worker"

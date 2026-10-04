@@ -8,6 +8,12 @@
 include "../model/design_text.elisa"
 
 module BuildJob:
+    private:
+        # Build output outlives the UI poll that receives each process chunk.
+        # Keep its backing storage in a process-lifetime arena instead of the
+        # short-lived function region used by ordinary darray.push growth.
+        global mutable output_arena: Arena = Arena{begin: null, end: null, end_index: 0, strategy: 0}
+
     public:
         const MAX_OUTPUT_BYTES: usize = 262144
 
@@ -23,8 +29,6 @@ module BuildJob:
             input_revision: mutable u64
             exit_code: mutable i64
             output: mutable darray[u8]
-            output_cstr_storage: mutable u8[262145]
-            output_cstr_length: mutable usize
             output_truncated: mutable bool
             cancel_requested: mutable bool
 
@@ -34,8 +38,6 @@ module BuildJob:
                 input_revision: 0,
                 exit_code: 0,
                 output: [],
-                output_cstr_storage: zeroed,
-                output_cstr_length: 0,
                 output_truncated: false,
                 cancel_requested: false,
             }
@@ -50,8 +52,6 @@ module BuildJob:
             job.input_revision <- revision
             job.exit_code <- 0
             job.output.clear()
-            job.output_cstr_length <- 0
-            job.output_cstr_storage[0] <- 0
             job.output_truncated <- false
             job.cancel_requested <- false
             return true
@@ -68,13 +68,11 @@ module BuildJob:
                 job.output_truncated <- true
                 return
             copy_count: i64 = bytes.len if bytes.len < remaining else remaining
+            _ = arena_da_reserve(&output_arena, &job.output, job.output.count + copy_count.usize())
             index: mutable i64 = 0
             while index < copy_count:
                 job.output.push(bytes[index])
-                job.output_cstr_storage[job.output_cstr_length] <- bytes[index]
-                job.output_cstr_length <- job.output_cstr_length + 1
                 index <- index + 1
-            job.output_cstr_storage[job.output_cstr_length] <- 0
             job.output_truncated <- true if copy_count < bytes.len
 
         # Request cancellation. The process adapter performs the signal and
@@ -102,10 +100,11 @@ module BuildJob:
             return revision != 0 and revision == job.input_revision and job.state != State.Idle
 
         def output_view(job: Job&) -> sview:
-            return "" if job.output_cstr_length == 0
-            return "" if job.output_cstr_length > MAX_OUTPUT_BYTES
-            can Unsafe.PointerCast:
-                return unsafe_sview_bounded_bytes(&job.output_cstr_storage[0], job.output_cstr_length)
+            return "" if job.output.count == 0 or job.output.items == null
+            return "" if job.output.count > job.output.capacity or job.output.count > MAX_OUTPUT_BYTES
+            trusted Unsafe.UncheckedIndex:
+                can Unsafe.PointerCast:
+                    return unsafe_sview_bounded_bytes(&job.output[0], job.output.count)
 
         def state_label(state: State) -> sview:
             return "idle" if state == State.Idle

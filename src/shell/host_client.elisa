@@ -1,17 +1,25 @@
 # Host client for the editor shell (UI compilation unit).
 #
 # The shell keeps one `document_host --signal` process alive and exchanges
-# requests through build/host_request.txt and build/host_reply.bin. Request
-# lines contain three decimal fields plus a strict hex-encoded UTF-8 field for
-# text-bearing operations. Replies are `result:i32`, `textlen:i32`, then the
-# text bytes, all little-endian. File transport keeps the UI unit out of the
-# binary marshalling path that stage1 mishandles (see stage1-notes.md).
+# requests through session-private files under the local temporary directory.
+# The stdin byte is a wakeup signal; replies use a bounded binary record. The
+# paths are unique to this IDE process, so multiple instances and project
+# directories cannot race over shared build/ files.
 
 include "../platform/posix/posix_file.elisa"
 include "../platform/posix/posix_process.elisa"
 include "../preview/preview_wire.elisa"
 
 const HOST_REPLY_CAPACITY: usize = PreviewWire::MAX_PAYLOAD_BYTES + 8
+const HOST_IPC_PATH_CAPACITY: usize = 4096
+
+@link_name("designer_host_ipc_paths_create")
+extern designer_host_ipc_paths_create(request_path: mutable void&, request_capacity: usize, reply_path: mutable void&, reply_capacity: usize) -> i64 can[Blocking.IO]
+@link_name("designer_host_ipc_paths_cleanup")
+extern designer_host_ipc_paths_cleanup(request_path: cstr, reply_path: cstr) -> i64 can[Blocking.IO]
+
+global mutable host_request_path: mutable u8[4096] = zeroed
+global mutable host_reply_path: mutable u8[4096] = zeroed
 
 module ShellBytes:
     public:
@@ -76,7 +84,12 @@ module HostClient:
 
         def request_impl(process: mutable PosixProcess::Process&, opcode: i64, arg0: i64, arg1: i64, text: sview, include_text: bool) -> HostReply:
             can Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast:
-                _ = PosixFile::remove("build/host_request.txt")
+                request_path: mutable cstr = ""
+                reply_path: mutable cstr = ""
+                request_path <- (&host_request_path[0]).cast[cstr] can Unsafe.PointerCast
+                reply_path <- (&host_reply_path[0]).cast[cstr] can Unsafe.PointerCast
+                return HostReply{result: -1, text: []} if host_request_path[0] == 0 or host_reply_path[0] == 0
+                _ = PosixFile::remove(request_path)
                 request: mutable darray[u8] = []
                 append_i64(&request, opcode)
                 request.push(32)
@@ -88,11 +101,11 @@ module HostClient:
                     append_hex_bytes(&request, text)
                 request.push(10)
                 view: sview = ShellBytes::view_of(&request)
-                if PosixFile::write_plain("build/host_request.txt", view) < 0:
+                if PosixFile::write_plain(request_path, view) < 0:
                     return HostReply{result: -1, text: []}
                 # Remove the previous reply so a stale file cannot be read as
                 # this request's answer while the host is still working.
-                _ = PosixFile::remove("build/host_reply.bin")
+                _ = PosixFile::remove(reply_path)
                 one_byte: mutable darray[u8] = []
                 one_byte.push(10)
                 _ = PosixProcess::write_stdin(process, ShellBytes::view_of(&one_byte))
@@ -100,7 +113,7 @@ module HostClient:
                 reply: mutable darray[u8] = []
                 waited: mutable i64 = 0
                 while waited < 30000:
-                    amount: usize = PosixFile::read_bytes(&reply, "build/host_reply.bin", HOST_REPLY_CAPACITY)
+                    amount: usize = PosixFile::read_bytes(&reply, reply_path, HOST_REPLY_CAPACITY)
                     if amount >= 8:
                         result: i64 = i32_at(reply, 0)
                         text_length: i64 = i32_at(reply, 4)
@@ -119,19 +132,47 @@ module HostClient:
         # Start one long-lived host so document, history, and selection survive
         # across shell actions.
         def start(host_path: cstr) -> PosixProcess::Process:
-            can Blocking.IO, Memory.Allocate, Memory.Release:
+            can Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast:
+                host_request_path[0] <- 0
+                host_reply_path[0] <- 0
+                request_pointer: mutable void& = (&host_request_path[0]).cast[mutable void&] can Unsafe.PointerCast
+                reply_pointer: mutable void& = (&host_reply_path[0]).cast[mutable void&] can Unsafe.PointerCast
+                if designer_host_ipc_paths_create(request_pointer, HOST_IPC_PATH_CAPACITY, reply_pointer, HOST_IPC_PATH_CAPACITY) != 0:
+                    return PosixProcess::Process{handle: null}
+                request_path: mutable cstr = ""
+                reply_path: mutable cstr = ""
+                request_path <- (&host_request_path[0]).cast[cstr] can Unsafe.PointerCast
+                reply_path <- (&host_reply_path[0]).cast[cstr] can Unsafe.PointerCast
                 arguments: mutable darray[cstr] = []
                 arguments.push(host_path)
                 arguments.push("--signal")
-                return PosixProcess::start(&arguments)
+                arguments.push(request_path)
+                arguments.push(reply_path)
+                process: PosixProcess::Process = PosixProcess::start(&arguments)
+                if not PosixProcess::valid(process):
+                    _ = designer_host_ipc_paths_cleanup(request_path, reply_path)
+                    host_request_path[0] <- 0
+                    host_reply_path[0] <- 0
+                return process
 
-        # Close the host's stdin so its read loop sees end-of-input and exits.
-        # The short-lived staging files are left for the next session; the
-        # process is reaped by the OS. (Calling cancel/dispose on the
-        # signal-mode handle aborts on stage1; noted in stage1-notes.md.)
+        # Close stdin, reap the host, and remove only this session's private
+        # files after the process can no longer be using them.
         def stop(process: mutable PosixProcess::Process&) -> void:
-            can Blocking.IO:
-                _ = PosixProcess::close_stdin(process)
+            can Blocking.IO, Memory.Release, Unsafe.PointerCast:
+                if PosixProcess::valid(process):
+                    _ = PosixProcess::close_stdin(process)
+                    stopped: bool = PosixProcess::poll(process, 1000)
+                    if not stopped:
+                        _ = PosixProcess::cancel(process)
+                    PosixProcess::dispose(process)
+                if host_request_path[0] != 0 and host_reply_path[0] != 0:
+                    request_path: mutable cstr = ""
+                    reply_path: mutable cstr = ""
+                    request_path <- (&host_request_path[0]).cast[cstr] can Unsafe.PointerCast
+                    reply_path <- (&host_reply_path[0]).cast[cstr] can Unsafe.PointerCast
+                    _ = designer_host_ipc_paths_cleanup(request_path, reply_path)
+                    host_request_path[0] <- 0
+                    host_reply_path[0] <- 0
 
         # Write one request, signal the host, and wait for its reply file.
         def request(process: mutable PosixProcess::Process&, opcode: i64, arg0: i64, arg1: i64) -> HostReply:

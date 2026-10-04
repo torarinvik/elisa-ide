@@ -52,6 +52,108 @@ def page_summary(window: ShellWindow::Window) -> darray[u8]:
     append_nonnegative(&out, window.total)
     return out
 
+def append_diagnostic_related_help(out: mutable darray[u8]&, shell: mutable Shell&, diagnostic_index: i32) -> void:
+    related_total: i32 = ShellLsp::diagnostic_related_count(shell, diagnostic_index)
+    related_stored: i32 = ShellLsp::diagnostic_related_stored_count(shell, diagnostic_index)
+    related_index: mutable i32 = 0
+    while related_index < related_stored:
+        message: sview = ShellLsp::diagnostic_related_message_at(shell, diagnostic_index, related_index)
+        uri: sview = ShellLsp::diagnostic_related_uri_at(shell, diagnostic_index, related_index)
+        line: i32 = ShellLsp::diagnostic_related_line_at(shell, diagnostic_index, related_index)
+        character: i32 = ShellLsp::diagnostic_related_character_at(shell, diagnostic_index, related_index)
+        append_panel_text(out, "\nRelated ")
+        append_nonnegative(out, related_index.i64() + 1)
+        append_panel_text(out, ": ")
+        append_panel_text(out, message if message.len > 0 else "Related location")
+        if uri.len > 0:
+            append_panel_text(out, " (")
+            append_panel_text(out, uri)
+            if line >= 0:
+                append_panel_text(out, ":")
+                append_nonnegative(out, line.i64() + 1)
+                if character >= 0:
+                    append_panel_text(out, ":")
+                    append_nonnegative(out, character.i64() + 1)
+            out.push(41)
+        related_index <- related_index + 1
+    if related_total > related_stored:
+        append_panel_text(out, "\nAdditional related locations omitted: ")
+        append_nonnegative(out, related_total.i64() - related_stored.i64())
+
+def source_line_prefix_utf16(line_number: i64) -> usize:
+    digits: mutable i64 = 1
+    remaining: mutable i64 = line_number + 1
+    while remaining >= 10:
+        digits <- digits + 1
+        remaining <- remaining / 10
+    return (digits + 2).usize()
+
+def source_diagnostic_underline_color(shell: mutable Shell&, diagnostic_index: i32) -> UiCore::Color:
+    severity: i32 = ShellLsp::diagnostic_severity(shell, diagnostic_index)
+    return shell_color(126, 68, 65) if severity == 1
+    return shell_color(140, 112, 56) if severity == 2
+    return shell_color(62, 92, 132)
+
+def append_source_line_diagnostic_underlines(shell: mutable Shell&, row: UiHandles::Handle, line_number: i64, line_text: sview) -> void:
+    UiHandles::clear_text_underlines(row)
+    prefix_units: usize = source_line_prefix_utf16(line_number)
+    encoding: i32 = ShellLsp::position_encoding(shell)
+    underline_slot: mutable i32 = 0
+    diagnostic_index: mutable i32 = 0
+    while diagnostic_index < shell.source_lsp_diagnostics and underline_slot < 3:
+        start_line: i32 = ShellLsp::diagnostic_line(shell, diagnostic_index)
+        end_line: i32 = ShellLsp::diagnostic_end_line(shell, diagnostic_index)
+        start_character: i32 = ShellLsp::diagnostic_character(shell, diagnostic_index)
+        end_character: i32 = ShellLsp::diagnostic_end_character(shell, diagnostic_index)
+        if (start_line >= 0 and end_line >= start_line and start_character >= 0
+            and line_number >= start_line.i64() and line_number <= end_line.i64()
+            and (line_number < end_line.i64() or end_character >= 0)):
+            line_start_character: i32 = 0 if line_number > start_line.i64() else start_character
+            line_end_character: i32 = 2147483647 if line_number < end_line.i64() else end_character
+            if start_line != end_line or end_character >= start_character:
+                start_units: usize = ShellLsp::character_to_utf16(line_text, encoding, line_start_character)
+                end_units: mutable usize = ShellLsp::character_to_utf16(line_text, encoding, line_end_character)
+                end_units <- start_units if end_units < start_units
+                UiHandles::set_text_underline(row, underline_slot.usize(), prefix_units + start_units, prefix_units + end_units, source_diagnostic_underline_color(shell, diagnostic_index))
+                underline_slot <- underline_slot + 1
+        diagnostic_index <- diagnostic_index + 1
+
+def source_diagnostic_help(shell: mutable Shell&, zero_based_line: i64) -> darray[u8]:
+    out: mutable darray[u8] = []
+    appended: mutable i32 = 0
+    index: mutable i32 = 0
+    while index < shell.source_lsp_diagnostics and appended < 3:
+        start_line: i32 = ShellLsp::diagnostic_line(shell, index)
+        end_line: mutable i32 = ShellLsp::diagnostic_end_line(shell, index)
+        end_line <- start_line if end_line < start_line
+        if start_line >= 0 and zero_based_line >= start_line.i64() and zero_based_line <= end_line.i64():
+            if out.count > 0:
+                append_panel_text(&out, "\n")
+            severity: i32 = ShellLsp::diagnostic_severity(shell, index)
+            append_panel_text(&out, "Elisa-LSP ")
+            append_panel_text(&out, "error" if severity == 1 else ("warning" if severity == 2 else ("hint" if severity == 4 else "information")))
+            append_panel_text(&out, " at ")
+            append_nonnegative(&out, start_line.i64() + 1)
+            append_panel_text(&out, ":")
+            append_nonnegative(&out, ShellLsp::diagnostic_character(shell, index).i64() + 1)
+            append_panel_text(&out, "-")
+            append_nonnegative(&out, end_line.i64() + 1)
+            append_panel_text(&out, ":")
+            append_nonnegative(&out, ShellLsp::diagnostic_end_character(shell, index).i64() + 1)
+            code: sview = ShellLsp::diagnostic_code(shell, index)
+            if code.len > 0:
+                append_panel_text(&out, " [")
+                append_panel_text(&out, code)
+                out.push(93)
+            message: sview = ShellLsp::diagnostic_message(shell, index)
+            if message.len > 0:
+                append_panel_text(&out, ": ")
+                append_panel_text(&out, message)
+            append_diagnostic_related_help(&out, shell, index)
+            appended <- appended + 1
+        index <- index + 1
+    return out
+
 def nav_button(parent: UiHandles::Handle, dark: bool, label: sview, help: sview) -> UiHandles::Handle:
     result: UiHandles::Handle = UiHandles::button(parent, 48.0, 22.0, shell_color(42, 47, 58), panel_hover_color(dark), panel_press_color(dark))
     UiHandles::set_text(result, label, 11.0, shell_color(220, 226, 240))
@@ -178,7 +280,7 @@ def build_events(shell: mutable Shell&, parent: UiHandles::Handle) -> void:
     UiHandles::set_grow(title, 1.0)
     shell.event_handler_source_button <- UiHandles::button(header, 100.0, 22.0, shell_color(42, 47, 58), panel_hover_color(shell.dark), panel_press_color(shell.dark))
     UiHandles::set_text(shell.event_handler_source_button, "Open Handlers", 10.0, shell_color(220, 226, 240))
-    UiHandles::set_help(shell.event_handler_source_button, "Create missing event-handler stubs for the active form or open the existing project handler file")
+    UiHandles::set_help(shell.event_handler_source_button, "Create missing project event-handler stubs or open the selected handler declaration")
     UiHandles::set_grow(shell.event_handler_source_button, 0.0)
     shell.events_list <- UiHandles::scroll(parent, UiConst::Axis.Column, 0.0, 0.0, shell_color(28, 31, 38))
     UiHandles::set_grow(shell.events_list, 0.65)
@@ -223,7 +325,9 @@ def build_problems(shell: mutable Shell&, parent: UiHandles::Handle) -> void:
     UiHandles::set_grow(shell.problem_page_label, 1.0)
     shell.problem_next_button <- nav_button(navigation, shell.dark, "Next", "Show the next page of problems")
     shell.problem_copy_button <- nav_button(navigation, shell.dark, "Copy", "Copy the last selected diagnostic to the system clipboard")
+    shell.problem_related_button <- nav_button(navigation, shell.dark, "Related", "Open the next retained related Elisa-LSP location for the selected diagnostic")
     UiHandles::set_enabled(shell.problem_copy_button, false)
+    UiHandles::set_enabled(shell.problem_related_button, false)
 
 def set_status(shell: mutable Shell&, text: darray[u8]) -> void:
     shell.status_length <- 0
@@ -453,8 +557,9 @@ def build_diagnostic_at(text: sview, wanted: i32) -> sview:
 
 def refresh_problems(shell: mutable Shell&, process: mutable PosixProcess::Process&) -> void:
     design_count: i64 = shell.projection.problem_count
+    lsp_count: i64 = shell.source_lsp_diagnostics.i64()
     build_count: i64 = build_diagnostic_count(build_output_text(shell)).i64()
-    total_count: i64 = design_count + build_count
+    total_count: i64 = design_count + lsp_count + build_count
     window: ShellWindow::Window = ShellWindow::resolve(total_count, shell.problem_page.i64(), MAX_PROBLEM_ROWS.i64())
     shell.problem_page <- window.page.i32()
     index: mutable i32 = 0
@@ -476,8 +581,61 @@ def refresh_problems(shell: mutable Shell&, process: mutable PosixProcess::Proce
                     append_panel_text(&display, ShellBytes::view_of(&path.text))
                 UiHandles::set_text(row, ShellBytes::view_of(&display), 12.0, shell_color(220, 160, 140))
                 UiHandles::set_help(row, ShellBytes::view_of(&path.text))
+            elif logical_row < design_count + lsp_count:
+                diagnostic_index: i32 = (logical_row - design_count).i32()
+                severity: i32 = ShellLsp::diagnostic_severity(shell, diagnostic_index)
+                code: sview = ShellLsp::diagnostic_code(shell, diagnostic_index)
+                message: sview = ShellLsp::diagnostic_message(shell, diagnostic_index)
+                display: mutable darray[u8] = []
+                append_panel_text(&display, "Elisa-LSP ")
+                if severity == 1:
+                    append_panel_text(&display, "error")
+                elif severity == 2:
+                    append_panel_text(&display, "warning")
+                elif severity == 4:
+                    append_panel_text(&display, "hint")
+                else:
+                    append_panel_text(&display, "information")
+                if code.len > 0:
+                    append_panel_text(&display, " [")
+                    append_panel_text(&display, code)
+                    display.push(93)
+                append_panel_text(&display, ": ")
+                append_panel_text(&display, message if message.len > 0 else "Diagnostic message unavailable")
+                color: UiCore::Color = shell_color(232, 142, 128) if severity == 1 else shell_color(226, 194, 132)
+                UiHandles::set_text(row, ShellBytes::view_of(&display), 12.0, color)
+                help: mutable darray[u8] = []
+                append_panel_text(&help, "Elisa-LSP ")
+                append_panel_text(&help, ShellLsp::active_path(shell))
+                line: i32 = ShellLsp::diagnostic_line(shell, diagnostic_index)
+                character: i32 = ShellLsp::diagnostic_character(shell, diagnostic_index)
+                if line >= 0:
+                    append_panel_text(&help, ":")
+                    append_nonnegative(&help, line.i64() + 1)
+                    if character >= 0:
+                        append_panel_text(&help, ":")
+                        append_nonnegative(&help, character.i64() + 1)
+                source: sview = ShellLsp::diagnostic_source(shell, diagnostic_index)
+                if source.len > 0:
+                    append_panel_text(&help, " | ")
+                    append_panel_text(&help, source)
+                if code.len > 0:
+                    append_panel_text(&help, " | code ")
+                    append_panel_text(&help, code)
+                if shell.source_lsp_version_valid:
+                    append_panel_text(&help, " | document v")
+                    append_nonnegative(&help, shell.source_lsp_version)
+                end_line: i32 = ShellLsp::diagnostic_end_line(shell, diagnostic_index)
+                end_character: i32 = ShellLsp::diagnostic_end_character(shell, diagnostic_index)
+                if end_line >= 0:
+                    append_panel_text(&help, " | range ")
+                    append_nonnegative(&help, end_line.i64() + 1)
+                    append_panel_text(&help, ":")
+                    append_nonnegative(&help, end_character.i64() + 1)
+                append_diagnostic_related_help(&help, shell, diagnostic_index)
+                UiHandles::set_help(row, ShellBytes::view_of(&help))
             else:
-                build_line: sview = build_diagnostic_at(build_output_text(shell), (logical_row - design_count).i32())
+                build_line: sview = build_diagnostic_at(build_output_text(shell), (logical_row - design_count - lsp_count).i32())
                 UiHandles::set_text(row, build_line, 12.0, shell_color(226, 194, 132))
                 UiHandles::set_help(row, "Build diagnostic; source mapping will be enabled when a matching source identity is available")
             UiHandles::set_visible(row, true)
@@ -489,6 +647,19 @@ def refresh_problems(shell: mutable Shell&, process: mutable PosixProcess::Proce
     UiHandles::set_enabled(shell.problem_previous_button, ShellWindow::has_previous(window))
     UiHandles::set_enabled(shell.problem_next_button, ShellWindow::has_next(window))
     UiHandles::set_enabled(shell.problem_copy_button, shell.problem_copy_length > 0)
+    related_count: i32 = shell.selected_related_count
+    if related_count > 0:
+        next_related: i32 = (shell.selected_related_location_index + 1) % related_count
+        related_label: mutable darray[u8] = []
+        append_panel_text(&related_label, "Related ")
+        append_nonnegative(&related_label, next_related.i64() + 1)
+        related_label.push(47)
+        append_nonnegative(&related_label, related_count.i64())
+        UiHandles::set_text(shell.problem_related_button, ShellBytes::view_of(&related_label), 11.0, shell_color(238, 242, 252))
+        UiHandles::set_enabled(shell.problem_related_button, true)
+    else:
+        UiHandles::set_text(shell.problem_related_button, "Related", 11.0, shell_color(238, 242, 252))
+        UiHandles::set_enabled(shell.problem_related_button, false)
 
 def refresh_history_buttons(shell: mutable Shell&, process: mutable PosixProcess::Process&) -> void:
     if shell.source_mode and HostClient::request(process, 113, 0, 0).result == 1:
@@ -501,6 +672,12 @@ def refresh_history_buttons(shell: mutable Shell&, process: mutable PosixProcess
 # Refresh every panel from the host.
 def refresh_source_lines(shell: mutable Shell&, text: sview) -> void:
     shell.source_line_count <- 0
+    UiHandles::set_visible(shell.source_lsp_restart_button, false)
+    UiHandles::set_enabled(shell.source_lsp_restart_button, false)
+    UiHandles::set_visible(shell.source_symbol_query, false)
+    UiHandles::set_visible(shell.source_symbol_search_button, false)
+    UiHandles::set_visible(shell.source_symbol_next_button, false)
+    UiHandles::set_visible(shell.source_symbol_status, false)
     line_start: mutable i64 = 0
     shell.refreshing_source <- true
     while line_start < text.len and shell.source_line_count < MAX_SOURCE_LINES:
@@ -516,6 +693,8 @@ def refresh_source_lines(shell: mutable Shell&, text: sview) -> void:
         UiHandles::set_visible(row, true)
         UiHandles::set_enabled(row, true)
         UiHandles::replace_text(row, ShellBytes::view_of(&display))
+        UiHandles::clear_text_underlines(row)
+        UiHandles::set_ring(row, UiCore::Color{r: 0, g: 0, b: 0, a: 0})
         UiHandles::set_help(row, "Select the form owner for this generated source line")
         UiHandles::set_visible(row, true)
         UiHandles::set_enabled(row, false)
@@ -527,12 +706,14 @@ def refresh_source_lines(shell: mutable Shell&, text: sview) -> void:
         row: UiHandles::Handle = shell.source_line_rows[index.usize()]
         UiHandles::set_visible(row, false)
         UiHandles::set_enabled(row, false)
+        UiHandles::clear_text_underlines(row)
         index <- index + 1
     shell.refreshing_source <- false
 
 def refresh_source_file_lines(shell: mutable Shell&, process: mutable PosixProcess::Process&) -> void:
     total: i64 = HostClient::request(process, 115, 0, 0).result
     dirty: bool = HostClient::request(process, 130, 0, 0).result == 1
+    selected_line: mutable i64 = shell.source_selected_line
     UiHandles::set_text(shell.source_title, "Elisa source (modified)" if dirty else "Elisa source", 15.0, shell_color(230, 234, 242))
     start: mutable i64 = shell.source_page_start
     start <- 0 if start < 0
@@ -541,10 +722,22 @@ def refresh_source_file_lines(shell: mutable Shell&, process: mutable PosixProce
         maximum_start <- ((total - 1) / MAX_SOURCE_LINES.i64()) * MAX_SOURCE_LINES.i64()
     start <- maximum_start if start > maximum_start
     shell.source_page_start <- start
-    shell.source_selected_line <- start + 1
+    if total > 0:
+        first_visible_line: i64 = start + 1
+        last_visible_line: mutable i64 = start + MAX_SOURCE_LINES.i64()
+        last_visible_line <- total if last_visible_line > total
+        selected_line <- first_visible_line if selected_line < first_visible_line
+        selected_line <- last_visible_line if selected_line > last_visible_line
+        shell.source_selected_line <- selected_line
     UiHandles::set_visible(shell.source_open_editor_button, true)
     UiHandles::set_enabled(shell.source_open_editor_button, total > 0)
     UiHandles::set_visible(shell.source_reveal_button, true)
+    UiHandles::set_visible(shell.source_lsp_restart_button, true)
+    UiHandles::set_enabled(shell.source_lsp_restart_button, true)
+    UiHandles::set_visible(shell.source_symbol_query, true)
+    UiHandles::set_visible(shell.source_symbol_search_button, true)
+    UiHandles::set_visible(shell.source_symbol_next_button, true)
+    UiHandles::set_visible(shell.source_symbol_status, true)
     shell.refreshing_source <- true
     visible: mutable i32 = 0
     while visible < MAX_SOURCE_LINES:
@@ -559,7 +752,18 @@ def refresh_source_file_lines(shell: mutable Shell&, process: mutable PosixProce
             UiHandles::set_visible(row, true)
             UiHandles::set_enabled(row, true)
             UiHandles::replace_text(row, ShellBytes::view_of(&display))
-            UiHandles::set_help(row, "Elisa source line; long lines are locked to prevent editing hidden text")
+            if line.result == 1:
+                append_source_line_diagnostic_underlines(shell, row, line_number, ShellBytes::view_of(&line.text))
+            else:
+                UiHandles::clear_text_underlines(row)
+            severity: i32 = ShellLsp::line_severity(shell, line_number)
+            mark: UiCore::Color = UiCore::Color{r: 0, g: 0, b: 0, a: 0} if severity == 0 else (shell_color(126, 68, 65) if severity == 1 else (shell_color(140, 112, 56) if severity == 2 else shell_color(62, 92, 132)))
+            UiHandles::set_ring(row, mark)
+            diagnostic_help: darray[u8] = source_diagnostic_help(shell, line_number)
+            if diagnostic_help.count > 0:
+                UiHandles::set_help(row, ShellBytes::view_of(&diagnostic_help))
+            else:
+                UiHandles::set_help(row, "Elisa source line; long lines are locked to prevent editing hidden text")
             UiHandles::set_visible(row, true)
             UiHandles::set_enabled(row, line.result == 1)
             shell.source_line_offsets[visible.usize()] <- line_number
@@ -567,6 +771,8 @@ def refresh_source_file_lines(shell: mutable Shell&, process: mutable PosixProce
         else:
             UiHandles::set_visible(row, false)
             UiHandles::set_enabled(row, false)
+            UiHandles::set_ring(row, UiCore::Color{r: 0, g: 0, b: 0, a: 0})
+            UiHandles::clear_text_underlines(row)
             shell.source_line_offsets[visible.usize()] <- -1
             visible <- visible + 1
     shell.refreshing_source <- false
@@ -590,6 +796,8 @@ def refresh_source_conflict_bar(shell: mutable Shell&, process: mutable PosixPro
         return
     changed: bool = HostClient::request(process, 138, 0, 0).result == 1
     available: bool = changed and HostClient::request(process, 140, 0, 0).result == 1
+    source_dirty: bool = HostClient::request(process, 130, 0, 0).result == 1
+    UiHandles::set_enabled(shell.save_button, source_dirty and not changed)
     UiHandles::set_visible(shell.source_conflict_bar, changed)
     UiHandles::set_enabled(shell.source_compare_button, available)
     UiHandles::set_enabled(shell.source_keep_buffer_button, available)
@@ -645,6 +853,11 @@ def refresh_source_view(shell: mutable Shell&, process: mutable PosixProcess::Pr
             UiHandles::set_visible(shell.source_replace_all_button, false)
             UiHandles::set_visible(shell.source_goto_field, false)
             UiHandles::set_visible(shell.source_goto_button, false)
+            UiHandles::set_enabled(shell.source_lsp_definition_button, false)
+            UiHandles::set_visible(shell.source_symbol_query, false)
+            UiHandles::set_visible(shell.source_symbol_search_button, false)
+            UiHandles::set_visible(shell.source_symbol_next_button, false)
+            UiHandles::set_visible(shell.source_symbol_status, false)
             UiHandles::set_text(shell.source_ownership, "Line-aligned differences | scroll to review | Keep Buffer or Discard + Reload to resolve", 10.0, shell_color(148, 158, 180))
             index: mutable i32 = 0
             while index < MAX_SOURCE_LINES:
@@ -669,6 +882,13 @@ def refresh_source_view(shell: mutable Shell&, process: mutable PosixProcess::Pr
         UiHandles::set_visible(shell.source_replace_all_button, true)
         UiHandles::set_visible(shell.source_goto_field, true)
         UiHandles::set_visible(shell.source_goto_button, true)
+        UiHandles::set_visible(shell.source_lsp_definition_button, true)
+        UiHandles::set_enabled(shell.source_lsp_definition_button,
+            shell.source_lsp_state == 1 and not shell.source_lsp_definition_requested)
+        UiHandles::set_visible(shell.source_symbol_query, true)
+        UiHandles::set_visible(shell.source_symbol_search_button, true)
+        UiHandles::set_visible(shell.source_symbol_next_button, true)
+        UiHandles::set_visible(shell.source_symbol_status, true)
         refresh_source_file_lines(shell, process)
         return
     shell.source_compare_mode <- false
@@ -680,6 +900,12 @@ def refresh_source_view(shell: mutable Shell&, process: mutable PosixProcess::Pr
     UiHandles::set_visible(shell.source_replace_all_button, false)
     UiHandles::set_visible(shell.source_goto_field, false)
     UiHandles::set_visible(shell.source_goto_button, false)
+    UiHandles::set_visible(shell.source_lsp_definition_button, true)
+    UiHandles::set_enabled(shell.source_lsp_definition_button, false)
+    UiHandles::set_visible(shell.source_symbol_query, false)
+    UiHandles::set_visible(shell.source_symbol_search_button, false)
+    UiHandles::set_visible(shell.source_symbol_next_button, false)
+    UiHandles::set_visible(shell.source_symbol_status, false)
     UiHandles::set_visible(shell.source_conflict_bar, false)
     UiHandles::set_enabled(shell.source_compare_button, false)
     UiHandles::set_enabled(shell.source_keep_buffer_button, false)
@@ -753,4 +979,5 @@ def refresh_all(shell: mutable Shell&, process: mutable PosixProcess::Process&) 
     set_form_title(shell, HostClient::request(process, 58, 0, 0).text, shell.projection.dirty)
     refresh_source_view(shell, process)
     ShellPreview::refresh(shell, process)
+    ShellLsp::sync_active(shell, process)
     UiHandles::layout(UiCore::viewport_width(), UiCore::viewport_height())

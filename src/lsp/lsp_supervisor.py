@@ -244,6 +244,10 @@ class LspSupervisor:
     def wait_notification(self, method: str, *, timeout: float | None = None) -> dict[str, Any]:
         return self._call("wait_notification", method, timeout=timeout)
 
+    def poll_notifications(self, *, timeout: float = 0.0) -> int:
+        """Drain asynchronous server messages without holding up the UI loop."""
+        return self._call("poll_notifications", timeout=timeout)
+
     def restart(self) -> dict[str, Any]:
         """Restart once, subject to a rolling limit, and replay open buffers."""
         if not self._ever_started:

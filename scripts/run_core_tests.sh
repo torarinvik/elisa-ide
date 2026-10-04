@@ -57,6 +57,7 @@ scripts/smoke_project_generation.sh
 python3 test/lsp/lsp_client_test.py
 python3 test/lsp/lsp_supervisor_test.py
 python3 test/lsp/workspace_service_test.py
+python3 test/lsp/ide_lsp_host_test.py
 python3 test/lsp/server_resolution_test.py
 python3 test/source/source_document_test.py
 python3 test/problems/problem_model_test.py

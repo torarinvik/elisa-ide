@@ -43,8 +43,7 @@ module WorkspacePreferencesStoreTest:
             TestSupport::check("missing home leaves preferences disabled", missing_path.count == 0)
 
             storage_path: mutable darray[u8] = path_buffer("build/workspace-preferences-store-test/deep/config/preferences.json")
-            storage_cstr: cstr = cstr_path(&storage_path)
-            _ = PosixFile::remove(storage_cstr)
+            _ = PosixFile::remove(cstr_path(&storage_path))
             _ = PosixFile::remove("build/workspace-preferences-store-test/deep/config/preferences.json.tmp")
             TestSupport::check("first save creates missing config directories and atomically writes ratios", WorkspacePreferencesStore::save_ratios_at_path(&storage_path, 0.3125, 0.375, 0.28125))
             loaded_sink: mutable DesignDiagnostics::Sink = TestSupport::sink()
@@ -63,7 +62,7 @@ module WorkspacePreferencesStoreTest:
             preserved: WorkspacePreferences::Preferences = WorkspacePreferencesStore::load_at_buffer(&storage_path, &preserved_sink)
             TestSupport::check("ratio save preserves recognized theme and recent paths", preserved.theme == WorkspacePreferences::Theme.Dark and preserved.recent_files.count == 1 and DesignText::equal(WorkspacePreferences::recent_path(preserved, 0), "/tmp/keep-this-recent-form.elisaform.json") and preserved.left_pane_ratio == 0.34375 and preserved.right_pane_ratio == 0.40625 and preserved.bottom_pane_ratio == 0.25)
 
-            _ = store_test_setenv("ELISA_IDE_CONFIG", storage_cstr)
+            _ = store_test_setenv("ELISA_IDE_CONFIG", cstr_path(&storage_path))
             TestSupport::check("native shell storage accepts bounded ratios", store_test_save_ratios(0.25, 0.34375, 0.375) == 1)
             native_left: mutable f64 = 0.0
             native_right: mutable f64 = 0.0
@@ -77,9 +76,9 @@ module WorkspacePreferencesStoreTest:
             TestSupport::check("corrupt preferences bytes can be staged", write_bytes(&storage_path, "{not-json"))
             TestSupport::check("ratio save refuses to overwrite corrupt preferences", not WorkspacePreferencesStore::save_ratios_at_path(&storage_path, 0.2, 0.3, 0.4))
             unchanged: mutable darray[u8] = []
-            amount: i64 = PosixFile::read_bytes_result(&unchanged, storage_cstr, 64)
+            amount: i64 = PosixFile::read_bytes_result(&unchanged, cstr_path(&storage_path), 64)
             TestSupport::check("refused save leaves corrupt source bytes untouched", amount == 9 and DesignText::equal(DesignText::view_of(unchanged), "{not-json"))
-            _ = PosixFile::remove(storage_cstr)
+            _ = PosixFile::remove(cstr_path(&storage_path))
             _ = PosixFile::remove("build/workspace-preferences-store-test/deep/config/preferences.json.tmp")
 
             return TestSupport::report("workspace_preferences_store")

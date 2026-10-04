@@ -282,6 +282,104 @@ long designer_preview_paths_cleanup(const char* input_path, const char* frame_pa
     return rmdir(directory) == 0 || errno == ENOENT ? 0 : -(long)errno;
 }
 
+/* Give each document-host process private request/reply files. The app's
+ * working directory contains user projects and may be cloud-synchronized;
+ * host traffic belongs in a short-lived, private local directory instead. */
+long designer_host_ipc_paths_create(char* request_path, size_t request_capacity,
+                                    char* reply_path, size_t reply_capacity) {
+    if (request_path == NULL || reply_path == NULL || request_capacity == 0 || reply_capacity == 0)
+        return -EINVAL;
+    request_path[0] = '\0';
+    reply_path[0] = '\0';
+
+    const char* temp_root = getenv("TMPDIR");
+    if (temp_root == NULL || temp_root[0] == '\0') temp_root = "/tmp";
+    size_t root_length = strlen(temp_root);
+    int has_separator = root_length > 0 && temp_root[root_length - 1] == '/';
+    static const char suffix[] = "elisa-ide-host-XXXXXX";
+    size_t template_capacity = root_length + (has_separator ? 1 : 2) + sizeof(suffix);
+    char* directory = (char*)malloc(template_capacity);
+    if (directory == NULL) return -ENOMEM;
+    int template_length = snprintf(directory, template_capacity, "%s%selisa-ide-host-XXXXXX",
+                                   temp_root, has_separator ? "" : "/");
+    if (template_length < 0 || (size_t)template_length >= template_capacity) {
+        free(directory);
+        return -ENAMETOOLONG;
+    }
+    if (mkdtemp(directory) == NULL) {
+        long failure = -(long)errno;
+        free(directory);
+        return failure;
+    }
+
+    char request_candidate[PATH_MAX];
+    char reply_candidate[PATH_MAX];
+    int request_length = snprintf(request_candidate, sizeof(request_candidate), "%s/request.txt", directory);
+    int reply_length = snprintf(reply_candidate, sizeof(reply_candidate), "%s/reply.bin", directory);
+    int failure = 0;
+    if (request_length < 0 || (size_t)request_length >= sizeof(request_candidate) ||
+        reply_length < 0 || (size_t)reply_length >= sizeof(reply_candidate)) {
+        failure = -ENAMETOOLONG;
+    } else {
+        failure = designer_copy_path(request_path, request_capacity, request_candidate);
+        if (failure == 0) failure = designer_copy_path(reply_path, reply_capacity, reply_candidate);
+    }
+    if (failure != 0) {
+        request_path[0] = '\0';
+        reply_path[0] = '\0';
+        (void)rmdir(directory);
+        free(directory);
+        return failure;
+    }
+    free(directory);
+    return 0;
+}
+
+/* Remove only the two known files inside a generated, owner-only host IPC
+ * directory. Unexpected entries keep the directory in place for inspection. */
+long designer_host_ipc_paths_cleanup(const char* request_path, const char* reply_path) {
+    if (request_path == NULL || reply_path == NULL) return -EINVAL;
+    size_t request_length = strnlen(request_path, PATH_MAX);
+    size_t reply_length = strnlen(reply_path, PATH_MAX);
+    static const char request_suffix[] = "/request.txt";
+    static const char reply_suffix[] = "/reply.bin";
+    if (request_length >= PATH_MAX || reply_length >= PATH_MAX ||
+        request_length <= sizeof(request_suffix) - 1 || reply_length <= sizeof(reply_suffix) - 1)
+        return -EINVAL;
+    size_t directory_length = request_length - (sizeof(request_suffix) - 1);
+    if (reply_length - (sizeof(reply_suffix) - 1) != directory_length ||
+        memcmp(request_path, reply_path, directory_length) != 0 ||
+        strcmp(request_path + directory_length, request_suffix) != 0 ||
+        strcmp(reply_path + directory_length, reply_suffix) != 0)
+        return -EINVAL;
+    const char* base = request_path + directory_length;
+    while (base > request_path && base[-1] != '/') base--;
+    static const char directory_prefix[] = "elisa-ide-host-";
+    size_t base_length = directory_length - (size_t)(base - request_path);
+    if (base_length != sizeof(directory_prefix) - 1 + 6 ||
+        memcmp(base, directory_prefix, sizeof(directory_prefix) - 1) != 0)
+        return -EINVAL;
+    for (size_t index = sizeof(directory_prefix) - 1; index < base_length; index++) {
+        char byte = base[index];
+        if (!((byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') ||
+              (byte >= '0' && byte <= '9'))) return -EINVAL;
+    }
+
+    struct stat directory_status;
+    char directory[PATH_MAX];
+    if (directory_length >= sizeof(directory)) return -ENAMETOOLONG;
+    memcpy(directory, request_path, directory_length);
+    directory[directory_length] = '\0';
+    if (lstat(directory, &directory_status) != 0) return errno == ENOENT ? 0 : -(long)errno;
+    if (!S_ISDIR(directory_status.st_mode) || S_ISLNK(directory_status.st_mode) ||
+        directory_status.st_uid != geteuid() || (directory_status.st_mode & 077) != 0)
+        return -EPERM;
+
+    if (unlink(request_path) != 0 && errno != ENOENT) return -(long)errno;
+    if (unlink(reply_path) != 0 && errno != ENOENT) return -(long)errno;
+    return rmdir(directory) == 0 || errno == ENOENT ? 0 : -(long)errno;
+}
+
 /* FNV-1a is used here as a bounded corruption/cross-frame identity check, not
  * as an authentication primitive. The two 32-bit words keep the wire values
  * inside the shell's checked signed-decimal parser. */
@@ -585,11 +683,10 @@ long designer_png_decode_rgba32(const char* path, unsigned char* output,
         goto cleanup_source;
     }
 
-    /* Core Graphics contexts use a lower-left user-space origin. Flip the
-     * drawing transform so the caller receives the usual top-down image rows. */
+    /* ImageIO's CGImage-to-bitmap drawing already places the PNG's first row
+     * at row zero in this context's byte buffer. Preserve that top-down order;
+     * applying another y-flip reverses the preview before Skia uploads it. */
     CGContextSetBlendMode(context, kCGBlendModeCopy);
-    CGContextTranslateCTM(context, 0.0, (CGFloat)image_height);
-    CGContextScaleCTM(context, 1.0, -1.0);
     CGContextDrawImage(context, CGRectMake(0.0, 0.0, (CGFloat)image_width,
                                            (CGFloat)image_height), image);
     CGContextRelease(context);

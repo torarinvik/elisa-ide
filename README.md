@@ -49,25 +49,37 @@ optimization level alongside the Skia build identity.
 `build/provenance-preview-worker.json` records its compiler and optimization
 level.
 The ignored `compiler` symlink points at the newest available stage1 checkout,
-`../Elisa-compiler`, revision `d8b5d305ec99a9d2238e035b871d9fd4e9835603` on
-`main`, three commits ahead of `origin/main`. Its compiler product, runtime,
-and current source fingerprint pass the toolchain freshness check. The verified
-source fingerprint is
-`3cc391e9af957026132334bbacb90321a6b1285a720bb45c16cc2b583ecd2248`, stage1
-SHA256 `c9120725bde202e70ea9ff94c9b87ab2026770eb5b29e95bfc1bc285f76eb9cf`,
-and runtime SHA256 `4a25cda85e118d59355bc437cb4e6ca15cbd96212d861198dc003bb3a3d733cb`.
+`../Elisa-compiler`, revision
+`b903bd1e700aa2acda4925b59efd1ee60389431a` on `main`, verified against the
+upstream `origin/main`. Its compiler product, runtime, and current source
+fingerprint pass the toolchain freshness check. The latest upstream commit only
+changes the differential-corpus timeout scaling; the compiler-source
+fingerprint is unchanged. The verified source fingerprint is
+`f085098e24fbf4f94f67a07afb124bc74eee45b1551f14f71c18628a27ed3335`, stage1
+SHA256 `734fad7984b0c6de3b50e6d57585e3c8573f975c33e4560f647a1209f9ed828d`,
+and runtime SHA256 `0db509f791ec1b075049dadc51a44f6e51e93e7c8fa9e6db4acbc336b7de022e`.
 The current AppKit + Skia bundle builds and signs with that compiler at `-O0`.
-Focused document-host, source-editor, and shell-frame tests pass. The full core
-and UI suites were last verified with the previous stage1 revision; the updated
-shell integration still needs its generated-source pointer-selection assertion
-resolved before the suite can be reported green. Live Skia preview image
-binding has been verified; native-canvas selection still needs its live-product
-acceptance pass. The SDL3 integration harness waits for the isolated preview
-worker, decodes its PNG, checks snapshot-correlated stable-ID geometry, and
-selects the rendered button through the canvas fit mapping before verifying
-the hierarchy and inspector. That harness uses a validating headless image
-adapter, so it does not verify the native window's canvas-selection route.
+The core and Skia doctor checks pass; the Skia check reports that the sibling
+`elisa-ui` checkout is dirty, so its build evidence is not fully reproducible.
+The generated-project shell integration passes all 163 assertions, including
+Build/Run job handling and source-map selection; focused command and codec tests
+also pass. Live Skia preview image binding has been verified. In the running
+macOS app, inserting a Button from the component palette reached `Preview
+ready`, and the preview displayed the Button upright at the top of its Column.
+Clicking that rendered Button after selecting the root changed hierarchy
+selection and refreshed the Button inspector in the native window. The app now
+launches from the repository root without `ELISA_IDE_RUNTIME_ROOT`; the
+document host uses a private temporary request/reply directory, avoiding stale
+or cross-instance `build/` IPC files. `scripts/test_host_ipc_paths.sh` verifies
+session-path uniqueness, owner-only permissions, mismatch rejection, and
+scoped cleanup. The PNG decoder's row orientation is
+covered by `scripts/test_png_decode_orientation.sh`. The SDL3 integration
+harness also covers selection through a validating headless image adapter.
 An untouched form explains that a change is needed to start its live preview.
+The native app also handles Cocoa's `NSApplicationWillTerminate` notification,
+so the host is stopped and its private IPC directory is removed when the user
+chooses Quit from the application menu; the observer is covered by
+`scripts/test_ide_termination_observer.sh`.
 
 SDL3 remains available for headless and UI-test harnesses and for generated-app
 profiles that explicitly select it. It is not the IDE's default desktop host.
@@ -87,7 +99,40 @@ in `src/lsp/lsp_client.py` handles strict Content-Length framing, UTF-8 JSON,
 subprocess deadlines, lifecycle messages, document versions, and version-gated
 diagnostics; `DiagnosticStore.typed()` preserves version, severity, source, code,
 ranges, related information, and raw payloads for future Problems/source views.
-Interactive source panes and the debugger/profiler adapters remain
+`worker/lsp/ide_lsp_host.py` now exposes a bounded host-side protocol for
+unsaved source buffers, server lifecycle, asynchronous diagnostic polling, and
+versioned diagnostic groups. The native source pane launches the sidecar,
+sends the unsaved buffer and edits, and shows server state, document version,
+server generation, and current diagnostic count. Versioned LSP messages appear in the shared
+Problems panel with severity, source, code, and source location; selecting a
+ranged row maps its negotiated UTF-8/16/32 position to the exact source caret.
+Editable source rows underline exact diagnostic character ranges in severity
+colors and receive matching line rings, while row help shows the exact
+start/end range and up to four related-information locations; if the server
+reports more, the help text gives the omitted count. **Restart
+LSP** restarts the server and replays the current in-memory source buffer.
+Select an Elisa-LSP row in Problems and use **Related 1/4** (the button advances
+through the retained locations) to open its local `.elisa` file at the reported
+line and character. Related navigation decodes percent-escaped file URIs and
+keeps the current buffer open when it has unsaved edits. Ordinary Open and Open
+Handlers actions also refuse to replace a modified source buffer. In an open
+handwritten source file, click the Elisa-LSP status control or press F12 from a
+source row to ask Elisa-LSP for the symbol at the caret. It follows standard
+Location and LocationLink replies and opens a local `.elisa` target at the
+negotiated source position. Cross-file navigation keeps the dirty-source and
+form-save guards in place. Linking
+LSP diagnostics to generated forms and shared native Problems-model adapters
+remain in progress.
+
+When the path field opens a standalone `.elisa` source file, **Build** compiles
+that saved file with the resolved Elisa compiler/runtime profile, without
+requiring SDL or a RAD project manifest. **Run** is available only for the last
+successful build of the same source path and content fingerprint. Unsaved
+buffer edits and detected external file changes block Build or Run until the
+source is saved or reconciled. The Run process is supervised like a build, and
+its stdout/stderr are appended once to the bounded Build Output log.
+
+Advanced source editing and debugger/profiler connections remain
 planned; the DAP transport and profiler artifact reader now provide the bounded
 process/data foundations. `src/lsp/server_resolution.py` selects and hashes the
 configured server, trusted nearby build, `ELISA_LSP`, or `PATH` executable in
@@ -97,8 +142,12 @@ tool interfaces and capability limits are recorded in
 [`docs/product-vision.md`](docs/product-vision.md); unsupported functionality
 is never treated as available merely because it appears in a protocol spec.
 `src/build/build_diagnostics.py` provides a bounded typed projection for
-compiler-wrapper and `elisapkg` lines while preserving the raw Build Output;
-source-buffer and generated-form mapping remains planned.
+compiler-wrapper and `elisapkg` lines while preserving the raw Build Output.
+Clicking a colon-form or parenthesized-location diagnostic navigates to its
+line and column when its path exactly matches the open handwritten source
+buffer. A generated-source diagnostic selects its owning form node only when
+both generated bytes and the source-map sidecar exactly match the current form;
+stale or unrelated generated artifacts remain explicitly unmapped.
 The shell's Source view displays the generated Elisa view read-only beside the
 RAD canvas; generated ownership remains explicit and edits continue to target
 the form or handwritten handler source.
@@ -112,7 +161,9 @@ header displays the relative owning form path and states that the generated
 view is read-only with a bounded visible-row count.
 Handwritten `.elisa` files open in a paged line editor. Visible lines up to
 768 bytes can be edited and saved atomically from the Source pane; longer
-lines stay locked so clipped text cannot replace hidden bytes. Save checks
+lines stay locked so clipped text cannot replace hidden bytes. The toolbar's
+Save action becomes available when the source buffer is dirty and the opened
+file has no unresolved external change. Save checks
 that the on-disk file still matches the version opened by the IDE. When the
 file changes, the Source pane offers **Compare**, **Keep Buffer**, and
 **Discard + Reload**. Keep Buffer explicitly selects the local version for the
@@ -149,7 +200,10 @@ active line.
 Command/Ctrl+A selects the current source row's code text and leaves its visible
 line-number prefix out of the selection.
 Select a Problems row and choose **Copy** to place its displayed
-diagnostic text on the system clipboard.
+diagnostic text on the system clipboard. For an Elisa-LSP diagnostic with
+related locations, **Related** opens the next retained local source location;
+the button cycles through the four retained entries and reports the selected
+line in the status area.
 
 ## Dependencies
 

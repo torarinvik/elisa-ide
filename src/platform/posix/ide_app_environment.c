@@ -1,12 +1,13 @@
-/* Establish the checked-out IDE root for development app bundles.
+/* Establish the IDE's runtime working directory for development app bundles.
  *
  * Host protocol files, workspace recovery, project templates and build
- * scripts are rooted in the current source checkout. LaunchServices starts
- * applications with an unrelated working directory, so the product build
- * supplies this root as a quoted compile-time string and we change directory
- * before initializing the shell. */
+ * scripts are relative to this directory. LaunchServices starts applications
+ * with an unrelated working directory, so the product build supplies the
+ * checked-out source root as a quoted compile-time default. ELISA_IDE_RUNTIME_ROOT
+ * can select a local scratch workspace for isolated live runs and tests. */
 
 #include <errno.h>
+#include <stdlib.h>
 #include <unistd.h>
 
 #ifndef ELISA_IDE_SOURCE_ROOT
@@ -14,6 +15,8 @@
 #endif
 
 long designer_ide_prepare_working_directory(void) {
-    if (chdir(ELISA_IDE_SOURCE_ROOT) == 0) return 0;
+    const char* runtime_root = getenv("ELISA_IDE_RUNTIME_ROOT");
+    if (runtime_root == NULL || runtime_root[0] == '\0') runtime_root = ELISA_IDE_SOURCE_ROOT;
+    if (chdir(runtime_root) == 0) return 0;
     return -(long)errno;
 }

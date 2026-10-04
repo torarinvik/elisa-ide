@@ -23,6 +23,12 @@ module BuildJobTest:
             TestSupport::check("cancel request is recorded", BuildJob::request_cancel(&job) and job.cancel_requested)
             TestSupport::check("cancelled completion is terminal", BuildJob::finish(&job, 8, 0) and job.state == BuildJob::State.Cancelled)
             TestSupport::check("failure records a nonzero exit", BuildJob::begin(&job, 9) and BuildJob::finish(&job, 9, 17) and job.state == BuildJob::State.Failed and job.exit_code == 17)
+            chunked: mutable BuildJob::Job = BuildJob::empty()
+            BuildJob::begin(&chunked, 11)
+            for _ in 0..<1000:
+                BuildJob::append_output(&chunked, "0123456789")
+            chunked_output: sview = BuildJob::output_view(chunked)
+            TestSupport::check("separate output chunks retain stable backing storage", chunked_output.len == 10000 and chunked_output[0] == 48 and chunked_output[9999] == 57)
             huge: mutable darray[u8] = []
             for index in 0..<BuildJob::MAX_OUTPUT_BYTES.i64() + 32:
                 huge.push(120)

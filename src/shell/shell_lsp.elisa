@@ -1,0 +1,839 @@
+# Native shell bridge to the bounded Elisa-LSP sidecar.
+
+module ShellLsp:
+    private:
+        const LSP_PATH_CAPACITY: usize = 4096
+        const LSP_OUTPUT_CAPACITY: usize = 65536
+        const LSP_POLL_INTERVAL_MS: i64 = 100
+        const LSP_CODE_STRIDE: i64 = 64
+        const LSP_SOURCE_STRIDE: i64 = 64
+        const LSP_MESSAGE_STRIDE: i64 = 512
+        const LSP_RELATED_URI_STRIDE: i64 = 256
+        const LSP_RELATED_MESSAGE_STRIDE: i64 = 512
+
+        def append_ascii(out: mutable darray[u8]&, text: sview) -> void:
+            for index in 0..<text.len:
+                out.push(text[index].u8())
+
+        def append_hex(out: mutable darray[u8]&, text: sview) -> void:
+            for index in 0..<text.len:
+                byte: i64 = text[index].i32().i64()
+                high: i64 = (byte >> 4) & 15
+                low: i64 = byte & 15
+                out.push((48 + high).u8() if high < 10 else (87 + high).u8())
+                out.push((48 + low).u8() if low < 10 else (87 + low).u8())
+
+        def send_record(shell: mutable Shell&, command: sview, path: sview, text: sview, include_text: bool) -> bool:
+            can Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast:
+                return false if not shell.source_lsp_started or not PosixProcess::valid(shell.source_lsp_process)
+                request: mutable darray[u8] = []
+                append_ascii(&request, command)
+                if path.len > 0:
+                    request.push(32)
+                    append_hex(&request, path)
+                if include_text:
+                    request.push(32)
+                    append_hex(&request, text)
+                request.push(10)
+                return PosixProcess::write_stdin(&shell.source_lsp_process, ShellBytes::view_of(&request)) == request.count.i64()
+
+        def active_path_view(shell: mutable Shell&) -> sview:
+            return UiText::fixed_bytes_view_range[4096](shell.source_lsp_active_path, 0, shell.source_lsp_active_path_length.usize())
+
+        def path_matches(shell: mutable Shell&, path: sview) -> bool:
+            return false if path.len != shell.source_lsp_active_path_length
+            for index in 0..<path.len:
+                return false if path[index].u8() != shell.source_lsp_active_path[index.usize()]
+            return true
+
+        def clear_active_path(shell: mutable Shell&) -> void:
+            shell.source_lsp_active_path_length <- 0
+            shell.source_lsp_fingerprint_valid <- false
+            shell.source_lsp_poll_deadline_ms <- 0
+
+        def clear_diagnostics(shell: mutable Shell&) -> void:
+            shell.source_lsp_diagnostics <- 0
+            shell.source_lsp_version <- 0
+            shell.source_lsp_version_valid <- false
+            shell.source_lsp_problems_dirty <- true
+
+        def close_active_document(shell: mutable Shell&) -> void:
+            if shell.source_lsp_active_path_length > 0:
+                _ = send_record(shell, "CLOSE", active_path_view(shell), "", false)
+                clear_diagnostics(shell)
+            clear_active_path(shell)
+
+        def start(shell: mutable Shell&) -> bool:
+            can Blocking.IO, Memory.Allocate, Memory.Release:
+                return true if shell.source_lsp_started and PosixProcess::valid(shell.source_lsp_process)
+                arguments: mutable darray[cstr] = []
+                arguments.push("python3")
+                arguments.push("-u")
+                arguments.push("worker/lsp/ide_lsp_host.py")
+                shell.source_lsp_process <- PosixProcess::start(&arguments)
+                shell.source_lsp_started <- PosixProcess::valid(shell.source_lsp_process)
+                shell.source_lsp_line_start <- true
+                shell.source_lsp_record_type <- 0
+                shell.source_lsp_state <- 0 if shell.source_lsp_started else 3
+                return shell.source_lsp_started
+
+        def render_status(shell: mutable Shell&) -> void:
+            status: mutable darray[u8] = []
+            if shell.source_lsp_state == 1:
+                append_ascii(&status, "Elisa-LSP running")
+                if shell.source_lsp_version_valid:
+                    append_ascii(&status, " | v")
+                    append_number(&status, shell.source_lsp_version)
+                if shell.source_lsp_generation > 0:
+                    append_ascii(&status, " | server gen ")
+                    append_number(&status, shell.source_lsp_generation)
+                append_ascii(&status, " | ")
+                append_number(&status, shell.source_lsp_diagnostics.i64())
+                append_ascii(&status, " diagnostic")
+                if shell.source_lsp_diagnostics != 1:
+                    status.push(115)
+            elif shell.source_lsp_state == 2:
+                append_ascii(&status, "Elisa-LSP unavailable | set ELISA_LSP or install Elisa-LSP")
+            elif shell.source_lsp_state == 3:
+                append_ascii(&status, "Elisa-LSP failed; check the process log")
+            elif shell.source_lsp_started:
+                append_ascii(&status, "Starting Elisa-LSP")
+            else:
+                append_ascii(&status, "Elisa-LSP idle")
+            UiHandles::set_text(shell.source_lsp_status, ShellBytes::view_of(&status), 10.0, shell_color(148, 158, 180))
+            UiHandles::set_enabled(shell.source_lsp_definition_button,
+                shell.source_lsp_state == 1 and shell.source_lsp_active_path_length > 0
+                and not shell.source_lsp_definition_requested)
+            UiHandles::set_enabled(shell.source_symbol_search_button,
+                shell.source_lsp_state == 1 and shell.source_lsp_workspace_symbols_supported
+                and shell.source_lsp_active_path_length > 0 and not shell.source_lsp_symbol_query_pending)
+            UiHandles::set_enabled(shell.source_symbol_next_button,
+                shell.source_lsp_symbol_result_count > 0 and not shell.source_lsp_symbol_query_pending)
+            symbol_status: mutable darray[u8] = []
+            if not shell.source_lsp_workspace_symbols_supported:
+                append_ascii(&symbol_status, "Workspace symbols unavailable")
+            elif shell.source_lsp_symbol_query_pending:
+                append_ascii(&symbol_status, "Searching workspace symbols...")
+            elif shell.source_lsp_symbol_result_count == 0:
+                append_ascii(&symbol_status, "Enter a symbol query")
+            else:
+                selected: mutable i32 = shell.source_lsp_symbol_selected
+                selected <- 0 if selected < 0 or selected >= shell.source_lsp_symbol_result_count
+                append_ascii(&symbol_status, "Result ")
+                append_number(&symbol_status, selected.i64() + 1)
+                append_ascii(&symbol_status, "/")
+                append_number(&symbol_status, shell.source_lsp_symbol_result_count.i64())
+                append_ascii(&symbol_status, ": ")
+                append_ascii(&symbol_status, workspace_symbol_name(shell, selected))
+            UiHandles::set_text(shell.source_symbol_status, ShellBytes::view_of(&symbol_status), 10.0, shell_color(148, 158, 180))
+
+        def append_number(out: mutable darray[u8]&, value: i64) -> void:
+            if value == 0:
+                out.push(48)
+                return
+            digits: mutable u8[24] = zeroed
+            count: mutable i32 = 0
+            remaining: mutable i64 = value
+            while remaining > 0 and count < 24:
+                digits[count.usize()] <- (48 + (remaining % 10)).u8()
+                remaining <- remaining / 10
+                count <- count + 1
+            index: mutable i32 = count - 1
+            while index >= 0:
+                out.push(digits[index.usize()])
+                index <- index - 1
+
+        def finish_batch(shell: mutable Shell&) -> void:
+            shell.source_lsp_state <- 3 if shell.source_lsp_batch_error else shell.source_lsp_batch_state
+            if shell.source_lsp_batch_has_group:
+                if (shell.source_lsp_batch_version != shell.source_lsp_version
+                    or shell.source_lsp_batch_diagnostics != shell.source_lsp_diagnostics):
+                    shell.source_lsp_problems_dirty <- true
+                shell.source_lsp_diagnostics <- shell.source_lsp_batch_diagnostics
+                if shell.source_lsp_batch_version > 0:
+                    shell.source_lsp_version <- shell.source_lsp_batch_version
+                    shell.source_lsp_version_valid <- true
+            if shell.source_lsp_batch_generation > 0 and shell.source_lsp_batch_generation != shell.source_lsp_generation:
+                shell.source_lsp_generation <- shell.source_lsp_batch_generation
+                shell.source_lsp_problems_dirty <- true
+            render_status(shell)
+            shell.source_lsp_batch_state <- 0
+            shell.source_lsp_batch_version <- 0
+            shell.source_lsp_batch_generation <- 0
+            shell.source_lsp_batch_diagnostics <- 0
+            shell.source_lsp_batch_error <- false
+            shell.source_lsp_batch_has_group <- false
+
+        def hex_value(byte: u8) -> i32:
+            return byte.i32() - 48 if byte >= 48 and byte <= 57
+            return byte.i32() - 65 + 10 if byte >= 65 and byte <= 70
+            return byte.i32() - 97 + 10 if byte >= 97 and byte <= 102
+            return -1
+
+        def store_diagnostic_byte(shell: mutable Shell&, field: i32, byte: u8) -> void:
+            slot: i32 = shell.source_lsp_diagnostic_index
+            return if slot < 0 or slot >= MAX_LSP_DIAGNOSTICS
+            if field == 6:
+                length: i32 = shell.source_lsp_diagnostic_code_lengths[slot.usize()]
+                return if length >= LSP_CODE_STRIDE.i32()
+                shell.source_lsp_diagnostic_code_storage[(slot.i64() * LSP_CODE_STRIDE + length.i64()).usize()] <- byte
+                shell.source_lsp_diagnostic_code_lengths[slot.usize()] <- length + 1
+            elif field == 7:
+                length: i32 = shell.source_lsp_diagnostic_source_lengths[slot.usize()]
+                return if length >= LSP_SOURCE_STRIDE.i32()
+                shell.source_lsp_diagnostic_source_storage[(slot.i64() * LSP_SOURCE_STRIDE + length.i64()).usize()] <- byte
+                shell.source_lsp_diagnostic_source_lengths[slot.usize()] <- length + 1
+            elif field == 8:
+                length: i32 = shell.source_lsp_diagnostic_message_lengths[slot.usize()]
+                return if length >= LSP_MESSAGE_STRIDE.i32()
+                shell.source_lsp_diagnostic_message_storage[(slot.i64() * LSP_MESSAGE_STRIDE + length.i64()).usize()] <- byte
+                shell.source_lsp_diagnostic_message_lengths[slot.usize()] <- length + 1
+
+        def store_symbol_byte(shell: mutable Shell&, field: i32, byte: u8) -> void:
+            slot: i32 = shell.source_lsp_symbol_index
+            return if slot < 0 or slot >= MAX_LSP_WORKSPACE_SYMBOLS
+            if field == 4:
+                length: i32 = shell.source_lsp_symbol_name_lengths[slot.usize()]
+                return if length >= LSP_SYMBOL_NAME_STRIDE.i32()
+                shell.source_lsp_symbol_name_storage[(slot.i64() * LSP_SYMBOL_NAME_STRIDE.i64() + length.i64()).usize()] <- byte
+                shell.source_lsp_symbol_name_lengths[slot.usize()] <- length + 1
+            elif field == 6:
+                length: i32 = shell.source_lsp_symbol_uri_lengths[slot.usize()]
+                return if length >= LSP_SYMBOL_URI_STRIDE.i32()
+                shell.source_lsp_symbol_uri_storage[(slot.i64() * LSP_SYMBOL_URI_STRIDE.i64() + length.i64()).usize()] <- byte
+                shell.source_lsp_symbol_uri_lengths[slot.usize()] <- length + 1
+
+        def store_related_byte(shell: mutable Shell&, field: i32, byte: u8) -> void:
+            slot: i32 = shell.source_lsp_diagnostic_index
+            relation: i32 = shell.source_lsp_related_record_index
+            return if slot < 0 or slot >= MAX_LSP_DIAGNOSTICS or relation < 0 or relation >= MAX_LSP_RELATED
+            flat: i64 = slot.i64() * MAX_LSP_RELATED.i64() + relation.i64()
+            if field == 1:
+                length: i32 = shell.source_lsp_diagnostic_related_uri_lengths[flat.usize()]
+                return if length >= LSP_RELATED_URI_STRIDE.i32()
+                shell.source_lsp_diagnostic_related_uri_storage[(flat * LSP_RELATED_URI_STRIDE + length.i64()).usize()] <- byte
+                shell.source_lsp_diagnostic_related_uri_lengths[flat.usize()] <- length + 1
+            elif field == 6:
+                length: i32 = shell.source_lsp_diagnostic_related_message_lengths[flat.usize()]
+                return if length >= LSP_RELATED_MESSAGE_STRIDE.i32()
+                shell.source_lsp_diagnostic_related_message_storage[(flat * LSP_RELATED_MESSAGE_STRIDE + length.i64()).usize()] <- byte
+                shell.source_lsp_diagnostic_related_message_lengths[flat.usize()] <- length + 1
+
+        def consume_byte(shell: mutable Shell&, byte: u8) -> void:
+            if byte == 10:
+                if shell.source_lsp_record_type == 87 and shell.source_lsp_symbol_index >= 0 and shell.source_lsp_symbol_name_lengths[shell.source_lsp_symbol_index.usize()] > 0 and shell.source_lsp_symbol_uri_lengths[shell.source_lsp_symbol_index.usize()] > 0 and shell.source_lsp_symbol_lines[shell.source_lsp_symbol_index.usize()] >= 0 and shell.source_lsp_symbol_characters[shell.source_lsp_symbol_index.usize()] >= 0:
+                    shell.source_lsp_symbol_result_count <- shell.source_lsp_symbol_result_count + 1
+                if shell.source_lsp_record_type == 81:
+                    shell.source_lsp_symbol_query_pending <- false
+                    shell.source_lsp_symbol_results_ready <- true
+                if shell.source_lsp_record_type == 80 and shell.source_lsp_tabs == 9 and shell.source_lsp_diagnostic_index >= 0:
+                    slot: usize = shell.source_lsp_diagnostic_index.usize()
+                    shell.source_lsp_diagnostic_related_counts[slot] <- -shell.source_lsp_number.i32() if shell.source_lsp_number_negative else shell.source_lsp_number.i32()
+                if shell.source_lsp_record_type == 82 and shell.source_lsp_related_accept_record:
+                    slot: i32 = shell.source_lsp_diagnostic_index
+                    if slot >= 0 and slot < MAX_LSP_DIAGNOSTICS:
+                        shell.source_lsp_diagnostic_related_stored_counts[slot.usize()] <- shell.source_lsp_diagnostic_related_stored_counts[slot.usize()] + 1 if shell.source_lsp_diagnostic_related_stored_counts[slot.usize()] < MAX_LSP_RELATED
+                if shell.source_lsp_record_type == 68 and shell.source_lsp_tabs == 3 and shell.source_lsp_definition_requested:
+                    if shell.source_lsp_definition_uri_length > 0 and shell.source_lsp_definition_line >= 0 and shell.source_lsp_definition_character >= 0:
+                        shell.source_lsp_definition_pending <- true
+                    shell.source_lsp_definition_complete <- true
+                    shell.source_lsp_definition_requested <- false
+                if shell.source_lsp_record_type == 78 and shell.source_lsp_definition_requested:
+                    shell.source_lsp_definition_pending <- false
+                    shell.source_lsp_definition_complete <- true
+                    shell.source_lsp_definition_requested <- false
+                finish_batch(shell) if shell.source_lsp_record_type == 90
+                shell.source_lsp_line_start <- true
+                shell.source_lsp_record_type <- 0
+                shell.source_lsp_tabs <- 0
+                shell.source_lsp_state_candidate <- 0
+                shell.source_lsp_state_length <- 0
+                shell.source_lsp_number <- 0
+                shell.source_lsp_number_negative <- false
+                return
+            if shell.source_lsp_line_start:
+                shell.source_lsp_line_start <- false
+                shell.source_lsp_record_type <- byte
+                shell.source_lsp_tabs <- 0
+                shell.source_lsp_state_candidate <- 0
+                shell.source_lsp_state_length <- 0
+                shell.source_lsp_number <- 0
+                shell.source_lsp_number_negative <- false
+                shell.source_lsp_encoding_candidate <- 0
+                shell.source_lsp_encoding_length <- 0
+                if byte == 71:
+                    shell.source_lsp_batch_has_group <- true
+                    shell.source_lsp_batch_version <- 0
+                    shell.source_lsp_batch_diagnostics <- 0
+                if byte == 83:
+                    shell.source_lsp_batch_generation <- 0
+                    shell.source_lsp_workspace_symbols_supported <- false
+                if byte == 68:
+                    shell.source_lsp_definition_uri_length <- 0
+                    shell.source_lsp_definition_line <- -1
+                    shell.source_lsp_definition_character <- -1
+                    shell.source_lsp_hex_high <- -1
+                if byte == 87:
+                    shell.source_lsp_symbol_index <- shell.source_lsp_symbol_result_count if shell.source_lsp_symbol_result_count < MAX_LSP_WORKSPACE_SYMBOLS else -1
+                    if shell.source_lsp_symbol_index >= 0:
+                        slot: usize = shell.source_lsp_symbol_index.usize()
+                        shell.source_lsp_symbol_kind[slot] <- 0
+                        shell.source_lsp_symbol_lines[slot] <- -1
+                        shell.source_lsp_symbol_characters[slot] <- -1
+                        shell.source_lsp_symbol_name_lengths[slot] <- 0
+                        shell.source_lsp_symbol_uri_lengths[slot] <- 0
+                if byte == 80:
+                    shell.source_lsp_diagnostic_index <- shell.source_lsp_batch_diagnostics if shell.source_lsp_batch_diagnostics < MAX_LSP_DIAGNOSTICS else -1
+                    shell.source_lsp_diagnostic_field <- 0
+                    shell.source_lsp_hex_high <- -1
+                    if shell.source_lsp_diagnostic_index >= 0:
+                        slot: usize = shell.source_lsp_diagnostic_index.usize()
+                        shell.source_lsp_diagnostic_lines[slot] <- -1
+                        shell.source_lsp_diagnostic_characters[slot] <- -1
+                        shell.source_lsp_diagnostic_end_lines[slot] <- -1
+                        shell.source_lsp_diagnostic_end_characters[slot] <- -1
+                        shell.source_lsp_diagnostic_severities[slot] <- 3
+                        shell.source_lsp_diagnostic_code_lengths[slot] <- 0
+                        shell.source_lsp_diagnostic_source_lengths[slot] <- 0
+                        shell.source_lsp_diagnostic_message_lengths[slot] <- 0
+                        shell.source_lsp_diagnostic_related_counts[slot] <- 0
+                        shell.source_lsp_diagnostic_related_stored_counts[slot] <- 0
+                        related_index: mutable i32 = 0
+                        while related_index < MAX_LSP_RELATED:
+                            flat: usize = (shell.source_lsp_diagnostic_index.i64() * MAX_LSP_RELATED.i64() + related_index.i64()).usize()
+                            shell.source_lsp_diagnostic_related_lines[flat] <- -1
+                            shell.source_lsp_diagnostic_related_characters[flat] <- -1
+                            shell.source_lsp_diagnostic_related_uri_lengths[flat] <- 0
+                            shell.source_lsp_diagnostic_related_message_lengths[flat] <- 0
+                            related_index <- related_index + 1
+                        shell.source_lsp_related_accept_record <- false
+                        shell.source_lsp_related_record_index <- -1
+                if byte == 80:
+                    shell.source_lsp_batch_diagnostics <- shell.source_lsp_batch_diagnostics + 1
+                if byte == 82:
+                    shell.source_lsp_diagnostic_field <- 0
+                    shell.source_lsp_hex_high <- -1
+                    slot: i32 = shell.source_lsp_diagnostic_index
+                    shell.source_lsp_related_accept_record <- false
+                    shell.source_lsp_related_record_index <- -1
+                    if slot >= 0 and slot < MAX_LSP_DIAGNOSTICS:
+                        relation: i32 = shell.source_lsp_diagnostic_related_stored_counts[slot.usize()]
+                        if relation < MAX_LSP_RELATED:
+                            shell.source_lsp_related_accept_record <- true
+                            shell.source_lsp_related_record_index <- relation
+                if byte == 69:
+                    shell.source_lsp_batch_error <- true
+                    if shell.source_lsp_definition_requested:
+                        shell.source_lsp_definition_requested <- false
+                        shell.source_lsp_definition_complete <- true
+                        shell.source_lsp_definition_pending <- false
+                return
+            if byte == 9:
+                if shell.source_lsp_record_type == 83 and shell.source_lsp_tabs == 3:
+                    shell.source_lsp_batch_generation <- shell.source_lsp_number
+                    shell.source_lsp_number <- 0
+                if shell.source_lsp_record_type == 80:
+                    slot: i32 = shell.source_lsp_diagnostic_index
+                    field: i32 = shell.source_lsp_tabs
+                    if slot >= 0 and field == 1:
+                        shell.source_lsp_diagnostic_severities[slot.usize()] <- -shell.source_lsp_number.i32() if shell.source_lsp_number_negative else shell.source_lsp_number.i32()
+                    elif slot >= 0 and field == 2:
+                        shell.source_lsp_diagnostic_lines[slot.usize()] <- -shell.source_lsp_number.i32() if shell.source_lsp_number_negative else shell.source_lsp_number.i32()
+                    elif slot >= 0 and field == 3:
+                        shell.source_lsp_diagnostic_characters[slot.usize()] <- -shell.source_lsp_number.i32() if shell.source_lsp_number_negative else shell.source_lsp_number.i32()
+                    elif slot >= 0 and field == 4:
+                        shell.source_lsp_diagnostic_end_lines[slot.usize()] <- -shell.source_lsp_number.i32() if shell.source_lsp_number_negative else shell.source_lsp_number.i32()
+                    elif slot >= 0 and field == 5:
+                        shell.source_lsp_diagnostic_end_characters[slot.usize()] <- -shell.source_lsp_number.i32() if shell.source_lsp_number_negative else shell.source_lsp_number.i32()
+                    elif slot >= 0 and field == 9:
+                        shell.source_lsp_diagnostic_related_counts[slot.usize()] <- -shell.source_lsp_number.i32() if shell.source_lsp_number_negative else shell.source_lsp_number.i32()
+                    shell.source_lsp_number <- 0
+                    shell.source_lsp_number_negative <- false
+                elif shell.source_lsp_record_type == 68:
+                    if shell.source_lsp_tabs == 1:
+                        shell.source_lsp_definition_line <- -shell.source_lsp_number if shell.source_lsp_number_negative else shell.source_lsp_number
+                    elif shell.source_lsp_tabs == 2:
+                        shell.source_lsp_definition_character <- (-shell.source_lsp_number if shell.source_lsp_number_negative else shell.source_lsp_number).i32()
+                    shell.source_lsp_number <- 0
+                    shell.source_lsp_number_negative <- false
+                elif shell.source_lsp_record_type == 82:
+                    slot: i32 = shell.source_lsp_diagnostic_index
+                    field: i32 = shell.source_lsp_tabs
+                    relation: i32 = shell.source_lsp_related_record_index
+                    flat: i64 = slot.i64() * MAX_LSP_RELATED.i64() + relation.i64()
+                    if slot >= 0 and relation >= 0 and relation < MAX_LSP_RELATED and field == 2:
+                        shell.source_lsp_diagnostic_related_lines[flat.usize()] <- -shell.source_lsp_number.i32() if shell.source_lsp_number_negative else shell.source_lsp_number.i32()
+                    elif slot >= 0 and relation >= 0 and relation < MAX_LSP_RELATED and field == 3:
+                        shell.source_lsp_diagnostic_related_characters[flat.usize()] <- -shell.source_lsp_number.i32() if shell.source_lsp_number_negative else shell.source_lsp_number.i32()
+                    shell.source_lsp_number <- 0
+                    shell.source_lsp_number_negative <- false
+                elif shell.source_lsp_record_type == 87:
+                    slot: i32 = shell.source_lsp_symbol_index
+                    field: i32 = shell.source_lsp_tabs
+                    if slot >= 0 and field == 1:
+                        shell.source_lsp_symbol_kind[slot.usize()] <- shell.source_lsp_number.i32()
+                    elif slot >= 0 and field == 2:
+                        shell.source_lsp_symbol_lines[slot.usize()] <- shell.source_lsp_number.i32()
+                    elif slot >= 0 and field == 3:
+                        shell.source_lsp_symbol_characters[slot.usize()] <- shell.source_lsp_number.i32()
+                    shell.source_lsp_number <- 0
+                shell.source_lsp_tabs <- shell.source_lsp_tabs + 1
+                if shell.source_lsp_record_type == 83 and shell.source_lsp_tabs == 3:
+                    shell.source_lsp_batch_state <- shell.source_lsp_state_candidate
+                if shell.source_lsp_record_type == 71 and shell.source_lsp_tabs == 3:
+                    shell.source_lsp_batch_version <- shell.source_lsp_number
+                if shell.source_lsp_record_type == 83 and shell.source_lsp_tabs == 6:
+                    shell.source_lsp_hex_high <- -1
+                    shell.source_lsp_encoding_candidate <- 0
+                    shell.source_lsp_encoding_length <- 0
+                if shell.source_lsp_record_type == 83 and shell.source_lsp_tabs == 7:
+                    if ((shell.source_lsp_encoding_length == 5 and shell.source_lsp_encoding_candidate == 8)
+                        or (shell.source_lsp_encoding_length == 6 and (shell.source_lsp_encoding_candidate == 16 or shell.source_lsp_encoding_candidate == 32))):
+                        shell.source_lsp_position_encoding <- shell.source_lsp_encoding_candidate
+                if shell.source_lsp_record_type == 80 and (shell.source_lsp_tabs == 6 or shell.source_lsp_tabs == 7 or shell.source_lsp_tabs == 8):
+                    shell.source_lsp_hex_high <- -1
+                    shell.source_lsp_diagnostic_field <- shell.source_lsp_tabs
+                if shell.source_lsp_record_type == 82 and (shell.source_lsp_tabs == 1 or shell.source_lsp_tabs == 6):
+                    shell.source_lsp_hex_high <- -1
+                    shell.source_lsp_diagnostic_field <- shell.source_lsp_tabs
+                if shell.source_lsp_record_type == 87 and (shell.source_lsp_tabs == 4 or shell.source_lsp_tabs == 5 or shell.source_lsp_tabs == 6):
+                    shell.source_lsp_hex_high <- -1
+                return
+            if shell.source_lsp_record_type == 83 and shell.source_lsp_tabs == 2:
+                if shell.source_lsp_state_length == 0:
+                    shell.source_lsp_state_candidate <- 1 if byte == 114 else (2 if byte == 117 else (3 if byte == 102 else 0))
+                shell.source_lsp_state_length <- shell.source_lsp_state_length + 1
+            if shell.source_lsp_record_type == 71 and shell.source_lsp_tabs == 2 and byte >= 48 and byte <= 57:
+                shell.source_lsp_number <- shell.source_lsp_number * 10 + (byte.i32().i64() - 48)
+            if shell.source_lsp_record_type == 68 and (shell.source_lsp_tabs == 1 or shell.source_lsp_tabs == 2):
+                if byte == 45 and shell.source_lsp_number == 0:
+                    shell.source_lsp_number_negative <- true
+                elif byte >= 48 and byte <= 57:
+                    shell.source_lsp_number <- shell.source_lsp_number * 10 + (byte.i32().i64() - 48)
+            if shell.source_lsp_record_type == 83 and shell.source_lsp_tabs == 3 and byte >= 48 and byte <= 57:
+                shell.source_lsp_number <- shell.source_lsp_number * 10 + (byte.i32().i64() - 48)
+            if shell.source_lsp_record_type == 83 and shell.source_lsp_tabs == 8:
+                shell.source_lsp_workspace_symbols_supported <- byte == 49
+            if shell.source_lsp_record_type == 87 and shell.source_lsp_tabs >= 1 and shell.source_lsp_tabs <= 3 and byte >= 48 and byte <= 57:
+                shell.source_lsp_number <- shell.source_lsp_number * 10 + (byte.i32().i64() - 48)
+            if shell.source_lsp_record_type == 83 and shell.source_lsp_tabs == 6:
+                digit: i32 = hex_value(byte)
+                if digit >= 0:
+                    if shell.source_lsp_hex_high < 0:
+                        shell.source_lsp_hex_high <- digit
+                    else:
+                        decoded: i32 = shell.source_lsp_hex_high * 16 + digit
+                        index: i32 = shell.source_lsp_encoding_length
+                        if index < 4:
+                            expected: i32 = 117 if index == 0 else (116 if index == 1 else (102 if index == 2 else 45))
+                            if decoded != expected:
+                                shell.source_lsp_encoding_candidate <- -1
+                        elif index == 4:
+                            shell.source_lsp_encoding_candidate <- 8 if decoded == 56 else (1 if decoded == 49 else -1)
+                        elif index == 5:
+                            if shell.source_lsp_encoding_candidate == 1:
+                                shell.source_lsp_encoding_candidate <- 16 if decoded == 54 else (32 if decoded == 50 else -1)
+                            else:
+                                shell.source_lsp_encoding_candidate <- -1
+                        else:
+                            shell.source_lsp_encoding_candidate <- -1
+                        shell.source_lsp_encoding_length <- shell.source_lsp_encoding_length + 1
+                        shell.source_lsp_hex_high <- -1
+            if shell.source_lsp_record_type == 80:
+                if (shell.source_lsp_tabs >= 1 and shell.source_lsp_tabs <= 5) or shell.source_lsp_tabs == 9:
+                    if byte == 45 and shell.source_lsp_number == 0:
+                        shell.source_lsp_number_negative <- true
+                    elif byte >= 48 and byte <= 57:
+                        shell.source_lsp_number <- shell.source_lsp_number * 10 + (byte.i32().i64() - 48)
+                elif shell.source_lsp_tabs >= 6 and shell.source_lsp_tabs <= 8:
+                    digit: i32 = hex_value(byte)
+                    if digit >= 0:
+                        if shell.source_lsp_hex_high < 0:
+                            shell.source_lsp_hex_high <- digit
+                        else:
+                            decoded: u8 = (shell.source_lsp_hex_high * 16 + digit).u8()
+                            store_diagnostic_byte(shell, shell.source_lsp_diagnostic_field, decoded)
+                            shell.source_lsp_hex_high <- -1
+            elif shell.source_lsp_record_type == 82:
+                if shell.source_lsp_tabs >= 2 and shell.source_lsp_tabs <= 5:
+                    if byte == 45 and shell.source_lsp_number == 0:
+                        shell.source_lsp_number_negative <- true
+                    elif byte >= 48 and byte <= 57:
+                        shell.source_lsp_number <- shell.source_lsp_number * 10 + (byte.i32().i64() - 48)
+                elif shell.source_lsp_tabs == 1 or shell.source_lsp_tabs == 6:
+                    digit: i32 = hex_value(byte)
+                    if digit >= 0:
+                        if shell.source_lsp_hex_high < 0:
+                            shell.source_lsp_hex_high <- digit
+                        else:
+                            decoded: u8 = (shell.source_lsp_hex_high * 16 + digit).u8()
+                            store_related_byte(shell, shell.source_lsp_diagnostic_field, decoded)
+                            shell.source_lsp_hex_high <- -1
+            elif shell.source_lsp_record_type == 68 and shell.source_lsp_tabs == 3:
+                digit: i32 = hex_value(byte)
+                if digit >= 0:
+                    if shell.source_lsp_hex_high < 0:
+                        shell.source_lsp_hex_high <- digit
+                    else:
+                        index: i32 = shell.source_lsp_definition_uri_length
+                        if index >= 0 and index < 4096:
+                            shell.source_lsp_definition_uri_storage[index.usize()] <- (shell.source_lsp_hex_high * 16 + digit).u8()
+                        shell.source_lsp_definition_uri_length <- index + 1
+                        shell.source_lsp_hex_high <- -1
+            elif shell.source_lsp_record_type == 87 and (shell.source_lsp_tabs == 4 or shell.source_lsp_tabs == 6):
+                digit: i32 = hex_value(byte)
+                if digit >= 0:
+                    if shell.source_lsp_hex_high < 0:
+                        shell.source_lsp_hex_high <- digit
+                    else:
+                        decoded: u8 = (shell.source_lsp_hex_high * 16 + digit).u8()
+                        store_symbol_byte(shell, shell.source_lsp_tabs, decoded)
+                        shell.source_lsp_hex_high <- -1
+
+        def drain_stdout(shell: mutable Shell&) -> void:
+            can Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast:
+                output: mutable darray[u8] = []
+                amount: usize = PosixProcess::read_stdout(&shell.source_lsp_process, &output, LSP_OUTPUT_CAPACITY)
+                index: mutable usize = 0
+                while index < amount:
+                    consume_byte(shell, output[index])
+                    index <- index + 1
+
+    public:
+        def refresh_status(shell: mutable Shell&) -> void:
+            render_status(shell)
+
+        def active_path(shell: mutable Shell&) -> sview:
+            return active_path_view(shell)
+
+        def restart(shell: mutable Shell&, document_host: mutable PosixProcess::Process&) -> void:
+            can Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast:
+                if not start(shell):
+                    shell.source_lsp_state <- 3
+                    render_status(shell)
+                    return
+                if shell.source_lsp_active_path_length == 0:
+                    sync_active(shell, document_host)
+                    return
+                if not send_record(shell, "RESTART", "", "", false):
+                    shell.source_lsp_state <- 3
+                    render_status(shell)
+                    return
+                shell.source_lsp_poll_deadline_ms <- 0
+                shell.source_lsp_problems_dirty <- true
+                UiHandles::set_text(shell.source_lsp_status, "Restarting Elisa-LSP with the current source buffer", 10.0, shell_color(226, 194, 132))
+
+        def sync_active(shell: mutable Shell&, document_host: mutable PosixProcess::Process&) -> void:
+            can Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast:
+                open: HostClient::HostReply = HostClient::request(document_host, 113, 0, 0)
+                if open.result != 1:
+                    close_active_document(shell)
+                    shell.source_lsp_state <- 0 if shell.source_lsp_started else 0
+                    render_status(shell)
+                    return
+                path_reply: HostClient::HostReply = HostClient::request(document_host, 114, 0, 0)
+                if path_reply.result != 1 or path_reply.text.count == 0 or path_reply.text.count >= LSP_PATH_CAPACITY:
+                    close_active_document(shell)
+                    shell.source_lsp_state <- 3
+                    render_status(shell)
+                    return
+                path: sview = ShellBytes::view_of(&path_reply.text)
+                fingerprint: HostClient::HostReply = HostClient::request(document_host, 152, 0, 0)
+                if fingerprint.result == 0:
+                    close_active_document(shell)
+                    shell.source_lsp_state <- 3
+                    render_status(shell)
+                    return
+                changed_path: bool = shell.source_lsp_active_path_length > 0 and not path_matches(shell, path)
+                if changed_path:
+                    close_active_document(shell)
+                if not start(shell):
+                    shell.source_lsp_state <- 3
+                    render_status(shell)
+                    return
+                if shell.source_lsp_active_path_length == 0:
+                    snapshot: HostClient::HostReply = HostClient::request(document_host, 151, 0, 0)
+                    if snapshot.result != 1 or not send_record(shell, "OPEN", path, ShellBytes::view_of(&snapshot.text), true):
+                        shell.source_lsp_state <- 3
+                        render_status(shell)
+                        return
+                    index: mutable i64 = 0
+                    while index < path.len:
+                        shell.source_lsp_active_path[index.usize()] <- path[index].u8()
+                        index <- index + 1
+                    shell.source_lsp_active_path_length <- path.len
+                    shell.source_lsp_fingerprint <- fingerprint.result
+                    shell.source_lsp_fingerprint_valid <- true
+                    shell.source_lsp_version_valid <- false
+                    shell.source_lsp_diagnostics <- 0
+                    shell.source_lsp_state <- 0
+                    shell.source_lsp_poll_deadline_ms <- 0
+                    render_status(shell)
+                    return
+                if not shell.source_lsp_fingerprint_valid or shell.source_lsp_fingerprint != fingerprint.result:
+                    snapshot: HostClient::HostReply = HostClient::request(document_host, 151, 0, 0)
+                    if snapshot.result != 1 or not send_record(shell, "CHANGE", path, ShellBytes::view_of(&snapshot.text), true):
+                        shell.source_lsp_state <- 3
+                        render_status(shell)
+                        return
+                    shell.source_lsp_fingerprint <- fingerprint.result
+                    shell.source_lsp_fingerprint_valid <- true
+
+        def poll(shell: mutable Shell&) -> void:
+            can Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast:
+                return if not shell.source_lsp_started or not PosixProcess::valid(shell.source_lsp_process)
+                finished: bool = PosixProcess::poll(&shell.source_lsp_process, 0)
+                if finished:
+                    shell.source_lsp_state <- 3
+                else:
+                    now: i64 = PosixProcess::monotonic_ms()
+                    if shell.source_lsp_active_path_length > 0 and now >= shell.source_lsp_poll_deadline_ms:
+                        if PosixProcess::write_stdin(&shell.source_lsp_process, "POLL\n") > 0:
+                            shell.source_lsp_poll_deadline_ms <- now + LSP_POLL_INTERVAL_MS
+                drain_stdout(shell)
+                render_status(shell)
+
+        def stop(shell: mutable Shell&) -> void:
+            can Blocking.IO, Memory.Release:
+                if shell.source_lsp_started and PosixProcess::valid(shell.source_lsp_process):
+                    _ = PosixProcess::write_stdin(&shell.source_lsp_process, "SHUTDOWN\n")
+                    _ = PosixProcess::close_stdin(&shell.source_lsp_process)
+                    stopped: bool = PosixProcess::poll(&shell.source_lsp_process, 1000)
+                    if not stopped:
+                        _ = PosixProcess::cancel(&shell.source_lsp_process)
+                    PosixProcess::dispose(&shell.source_lsp_process)
+                shell.source_lsp_started <- false
+                clear_active_path(shell)
+
+        def diagnostic_message(shell: mutable Shell&, index: i32) -> sview:
+            return "" if index < 0 or index >= shell.source_lsp_diagnostics or index >= MAX_LSP_DIAGNOSTICS
+            offset: usize = (index.i64() * LSP_MESSAGE_STRIDE).usize()
+            length: usize = shell.source_lsp_diagnostic_message_lengths[index.usize()].usize()
+            value: sview = UiText::fixed_bytes_view_range[65536](shell.source_lsp_diagnostic_message_storage, offset, length)
+            return string_view_slice(value, 0, UiText::valid_utf8_prefix(value, length).i64())
+
+        def diagnostic_code(shell: mutable Shell&, index: i32) -> sview:
+            return "" if index < 0 or index >= shell.source_lsp_diagnostics or index >= MAX_LSP_DIAGNOSTICS
+            offset: usize = (index.i64() * LSP_CODE_STRIDE).usize()
+            length: usize = shell.source_lsp_diagnostic_code_lengths[index.usize()].usize()
+            value: sview = UiText::fixed_bytes_view_range[8192](shell.source_lsp_diagnostic_code_storage, offset, length)
+            return string_view_slice(value, 0, UiText::valid_utf8_prefix(value, length).i64())
+
+        def diagnostic_source(shell: mutable Shell&, index: i32) -> sview:
+            return "" if index < 0 or index >= shell.source_lsp_diagnostics or index >= MAX_LSP_DIAGNOSTICS
+            offset: usize = (index.i64() * LSP_SOURCE_STRIDE).usize()
+            length: usize = shell.source_lsp_diagnostic_source_lengths[index.usize()].usize()
+            value: sview = UiText::fixed_bytes_view_range[8192](shell.source_lsp_diagnostic_source_storage, offset, length)
+            return string_view_slice(value, 0, UiText::valid_utf8_prefix(value, length).i64())
+
+        def diagnostic_line(shell: mutable Shell&, index: i32) -> i32:
+            return -1 if index < 0 or index >= shell.source_lsp_diagnostics or index >= MAX_LSP_DIAGNOSTICS
+            return shell.source_lsp_diagnostic_lines[index.usize()]
+
+        def diagnostic_character(shell: mutable Shell&, index: i32) -> i32:
+            return -1 if index < 0 or index >= shell.source_lsp_diagnostics or index >= MAX_LSP_DIAGNOSTICS
+            return shell.source_lsp_diagnostic_characters[index.usize()]
+
+        def diagnostic_severity(shell: mutable Shell&, index: i32) -> i32:
+            return 3 if index < 0 or index >= shell.source_lsp_diagnostics or index >= MAX_LSP_DIAGNOSTICS
+            return shell.source_lsp_diagnostic_severities[index.usize()]
+
+        def diagnostic_end_line(shell: mutable Shell&, index: i32) -> i32:
+            return -1 if index < 0 or index >= shell.source_lsp_diagnostics or index >= MAX_LSP_DIAGNOSTICS
+            return shell.source_lsp_diagnostic_end_lines[index.usize()]
+
+        def diagnostic_end_character(shell: mutable Shell&, index: i32) -> i32:
+            return -1 if index < 0 or index >= shell.source_lsp_diagnostics or index >= MAX_LSP_DIAGNOSTICS
+            return shell.source_lsp_diagnostic_end_characters[index.usize()]
+
+        def diagnostic_related_count(shell: mutable Shell&, index: i32) -> i32:
+            return 0 if index < 0 or index >= shell.source_lsp_diagnostics or index >= MAX_LSP_DIAGNOSTICS
+            return shell.source_lsp_diagnostic_related_counts[index.usize()]
+
+        def diagnostic_related_stored_count(shell: mutable Shell&, index: i32) -> i32:
+            return 0 if index < 0 or index >= shell.source_lsp_diagnostics or index >= MAX_LSP_DIAGNOSTICS
+            return shell.source_lsp_diagnostic_related_stored_counts[index.usize()]
+
+        def diagnostic_related_line(shell: mutable Shell&, index: i32) -> i32:
+            return diagnostic_related_line_at(shell, index, 0)
+
+        def diagnostic_related_line_at(shell: mutable Shell&, index: i32, related_index: i32) -> i32:
+            return -1 if index < 0 or index >= shell.source_lsp_diagnostics or index >= MAX_LSP_DIAGNOSTICS
+            return -1 if related_index < 0 or related_index >= diagnostic_related_stored_count(shell, index)
+            flat: usize = (index.i64() * MAX_LSP_RELATED.i64() + related_index.i64()).usize()
+            return shell.source_lsp_diagnostic_related_lines[flat]
+
+        def diagnostic_related_character(shell: mutable Shell&, index: i32) -> i32:
+            return diagnostic_related_character_at(shell, index, 0)
+
+        def diagnostic_related_character_at(shell: mutable Shell&, index: i32, related_index: i32) -> i32:
+            return -1 if index < 0 or index >= shell.source_lsp_diagnostics or index >= MAX_LSP_DIAGNOSTICS
+            return -1 if related_index < 0 or related_index >= diagnostic_related_stored_count(shell, index)
+            flat: usize = (index.i64() * MAX_LSP_RELATED.i64() + related_index.i64()).usize()
+            return shell.source_lsp_diagnostic_related_characters[flat]
+
+        def diagnostic_related_uri(shell: mutable Shell&, index: i32) -> sview:
+            return diagnostic_related_uri_at(shell, index, 0)
+
+        def diagnostic_related_uri_at(shell: mutable Shell&, index: i32, related_index: i32) -> sview:
+            return "" if index < 0 or index >= shell.source_lsp_diagnostics or index >= MAX_LSP_DIAGNOSTICS
+            return "" if related_index < 0 or related_index >= diagnostic_related_stored_count(shell, index)
+            flat: usize = (index.i64() * MAX_LSP_RELATED.i64() + related_index.i64()).usize()
+            offset: usize = (flat.i64() * LSP_RELATED_URI_STRIDE).usize()
+            length: usize = shell.source_lsp_diagnostic_related_uri_lengths[flat].usize()
+            value: sview = UiText::fixed_bytes_view_range[131072](shell.source_lsp_diagnostic_related_uri_storage, offset, length)
+            return string_view_slice(value, 0, UiText::valid_utf8_prefix(value, length).i64())
+
+        def diagnostic_related_message(shell: mutable Shell&, index: i32) -> sview:
+            return diagnostic_related_message_at(shell, index, 0)
+
+        def diagnostic_related_message_at(shell: mutable Shell&, index: i32, related_index: i32) -> sview:
+            return "" if index < 0 or index >= shell.source_lsp_diagnostics or index >= MAX_LSP_DIAGNOSTICS
+            return "" if related_index < 0 or related_index >= diagnostic_related_stored_count(shell, index)
+            flat: usize = (index.i64() * MAX_LSP_RELATED.i64() + related_index.i64()).usize()
+            offset: usize = (flat.i64() * LSP_RELATED_MESSAGE_STRIDE).usize()
+            length: usize = shell.source_lsp_diagnostic_related_message_lengths[flat].usize()
+            value: sview = UiText::fixed_bytes_view_range[262144](shell.source_lsp_diagnostic_related_message_storage, offset, length)
+            return string_view_slice(value, 0, UiText::valid_utf8_prefix(value, length).i64())
+
+        def line_severity(shell: mutable Shell&, zero_based_line: i64) -> i32:
+            severity: mutable i32 = 0
+            index: mutable i32 = 0
+            while index < shell.source_lsp_diagnostics and index < MAX_LSP_DIAGNOSTICS:
+                start: i32 = diagnostic_line(shell, index)
+                finish: i32 = diagnostic_end_line(shell, index)
+                if start >= 0 and zero_based_line >= start.i64() and zero_based_line <= (finish if finish >= start else start).i64():
+                    current: i32 = diagnostic_severity(shell, index)
+                    severity <- current if severity == 0 or current < severity
+                index <- index + 1
+            return severity
+
+        def position_encoding(shell: mutable Shell&) -> i32:
+            return shell.source_lsp_position_encoding
+
+        def request_definition(shell: mutable Shell&, line: i64, character: i32) -> bool:
+            can Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast:
+                return false if line < 0 or character < 0 or shell.source_lsp_definition_requested
+                return false if shell.source_lsp_active_path_length <= 0 or shell.source_lsp_state != 1
+                position: mutable darray[u8] = []
+                append_number(&position, line)
+                position.push(58)
+                append_number(&position, character.i64())
+                if not send_record(shell, "DEFINITION", active_path_view(shell), ShellBytes::view_of(&position), true):
+                    return false
+                shell.source_lsp_definition_requested <- true
+                shell.source_lsp_definition_complete <- false
+                shell.source_lsp_definition_pending <- false
+                shell.source_lsp_definition_uri_length <- 0
+                return true
+
+        def request_workspace_symbols(shell: mutable Shell&, query: sview) -> bool:
+            can Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast:
+                return false if query.len <= 0 or query.len > 256
+                return false if shell.source_lsp_state != 1 or not shell.source_lsp_workspace_symbols_supported
+                return false if shell.source_lsp_symbol_query_pending
+                request_path: sview = active_path_view(shell)
+                if request_path.len <= 0 or request_path.len >= 4096 or not shell.source_lsp_fingerprint_valid:
+                    return false
+                if not send_record(shell, "SYMBOLS", request_path, query, true):
+                    return false
+                path_index: mutable i64 = 0
+                while path_index < request_path.len:
+                    shell.source_lsp_symbol_request_path_storage[path_index.usize()] <- request_path[path_index].u8()
+                    path_index <- path_index + 1
+                shell.source_lsp_symbol_request_path_storage[path_index.usize()] <- 0
+                shell.source_lsp_symbol_request_path_length <- path_index.i32()
+                shell.source_lsp_symbol_request_fingerprint <- shell.source_lsp_fingerprint
+                shell.source_lsp_symbol_request_identity_valid <- true
+                shell.source_lsp_symbol_result_count <- 0
+                shell.source_lsp_symbol_selected <- -1
+                shell.source_lsp_symbol_query_pending <- true
+                shell.source_lsp_symbol_results_ready <- false
+                render_status(shell)
+                return true
+
+        def workspace_symbol_request_path(shell: Shell&) -> sview:
+            return UiText::fixed_bytes_view_range[4096](shell.source_lsp_symbol_request_path_storage, 0,
+                shell.source_lsp_symbol_request_path_length.usize())
+
+        def workspace_symbol_request_fingerprint(shell: Shell&) -> i64:
+            return shell.source_lsp_symbol_request_fingerprint
+
+        def workspace_symbol_request_identity_valid(shell: Shell&) -> bool:
+            return shell.source_lsp_symbol_request_identity_valid
+
+        def workspace_symbol_count(shell: Shell&) -> i32:
+            return shell.source_lsp_symbol_result_count
+
+        def workspace_symbol_name(shell: Shell&, index: i32) -> sview:
+            return "" if index < 0 or index >= shell.source_lsp_symbol_result_count or index >= MAX_LSP_WORKSPACE_SYMBOLS
+            offset: usize = index.usize() * LSP_SYMBOL_NAME_STRIDE
+            length: usize = shell.source_lsp_symbol_name_lengths[index.usize()].usize()
+            value: sview = UiText::fixed_bytes_view_range[2048](shell.source_lsp_symbol_name_storage, offset, length)
+            return string_view_slice(value, 0, UiText::valid_utf8_prefix(value, length).i64())
+
+        def workspace_symbol_uri(shell: Shell&, index: i32) -> sview:
+            return "" if index < 0 or index >= shell.source_lsp_symbol_result_count or index >= MAX_LSP_WORKSPACE_SYMBOLS
+            offset: usize = index.usize() * LSP_SYMBOL_URI_STRIDE
+            length: usize = shell.source_lsp_symbol_uri_lengths[index.usize()].usize()
+            value: sview = UiText::fixed_bytes_view_range[65536](shell.source_lsp_symbol_uri_storage, offset, length)
+            return string_view_slice(value, 0, UiText::valid_utf8_prefix(value, length).i64())
+
+        def workspace_symbol_line(shell: Shell&, index: i32) -> i32:
+            return -1 if index < 0 or index >= shell.source_lsp_symbol_result_count or index >= MAX_LSP_WORKSPACE_SYMBOLS
+            return shell.source_lsp_symbol_lines[index.usize()]
+
+        def workspace_symbol_character(shell: Shell&, index: i32) -> i32:
+            return -1 if index < 0 or index >= shell.source_lsp_symbol_result_count or index >= MAX_LSP_WORKSPACE_SYMBOLS
+            return shell.source_lsp_symbol_characters[index.usize()]
+
+        def workspace_symbol_kind(shell: Shell&, index: i32) -> i32:
+            return 0 if index < 0 or index >= shell.source_lsp_symbol_result_count or index >= MAX_LSP_WORKSPACE_SYMBOLS
+            return shell.source_lsp_symbol_kind[index.usize()]
+
+        def definition_uri(shell: mutable Shell&) -> sview:
+            return UiText::fixed_bytes_view_range[4096](shell.source_lsp_definition_uri_storage, 0,
+                shell.source_lsp_definition_uri_length.usize())
+
+        def definition_line(shell: mutable Shell&) -> i64:
+            return shell.source_lsp_definition_line
+
+        def definition_character(shell: mutable Shell&) -> i32:
+            return shell.source_lsp_definition_character
+
+        def utf16_to_character(text: sview, encoding: i32, requested_units: usize) -> usize:
+            source_encoding: i32 = 16 if encoding != 8 and encoding != 16 and encoding != 32 else encoding
+            byte_offset: mutable usize = 0
+            server_units: mutable usize = 0
+            utf16_units: mutable usize = 0
+            while byte_offset < text.len.usize() and utf16_units < requested_units:
+                scalar_bytes: usize = UiText::utf8_scalar_bytes(text, byte_offset)
+                return server_units if scalar_bytes == 0
+                scalar_utf16_units: usize = 2 if scalar_bytes == 4 else 1
+                return server_units if utf16_units + scalar_utf16_units > requested_units
+                scalar_server_units: mutable usize = 1
+                scalar_server_units <- scalar_bytes if source_encoding == 8
+                scalar_server_units <- scalar_utf16_units if source_encoding == 16
+                server_units <- server_units + scalar_server_units
+                utf16_units <- utf16_units + scalar_utf16_units
+                byte_offset <- byte_offset + scalar_bytes
+            return server_units
+
+        def character_to_utf16(text: sview, encoding: i32, requested_units: i32) -> usize:
+            return 0 if requested_units <= 0
+            source_encoding: i32 = 16 if encoding != 8 and encoding != 16 and encoding != 32 else encoding
+            byte_offset: mutable usize = 0
+            server_units: mutable usize = 0
+            utf16_units: mutable usize = 0
+            target: usize = requested_units.usize()
+            while byte_offset < text.len.usize() and server_units < target:
+                scalar_bytes: usize = UiText::utf8_scalar_bytes(text, byte_offset)
+                return utf16_units if scalar_bytes == 0
+                scalar_server_units: mutable usize = 1
+                scalar_server_units <- scalar_bytes if source_encoding == 8
+                scalar_server_units <- 2 if source_encoding == 16 and scalar_bytes == 4
+                return utf16_units if server_units + scalar_server_units > target
+                server_units <- server_units + scalar_server_units
+                utf16_units <- utf16_units + (2 if scalar_bytes == 4 else 1)
+                byte_offset <- byte_offset + scalar_bytes
+            return utf16_units

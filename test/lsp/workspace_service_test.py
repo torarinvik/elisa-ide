@@ -50,7 +50,8 @@ SERVER = textwrap.dedent(
         method = message.get("method")
         if method == "initialize":
             send({"jsonrpc":"2.0", "id":message["id"], "result":{
-                "capabilities":{"positionEncoding":"utf-16", "textDocumentSync":1}
+                "capabilities":{"positionEncoding":"utf-16", "textDocumentSync":1,
+                    "workspaceSymbolProvider":True}
             }})
         elif method in ("textDocument/didOpen", "textDocument/didChange"):
             document = message["params"]["textDocument"]
@@ -67,6 +68,13 @@ SERVER = textwrap.dedent(
                     "location":{"uri":document["uri"], "range":{"start":{"line":0,"character":0},
                     "end":{"line":0,"character":3}}}, "message":"related declaration"}]}]
             }})
+        elif method == "workspace/symbol":
+            send({"jsonrpc":"2.0", "id":message["id"], "result":[{
+                "name":"entry π", "kind":12, "containerName":"module",
+                "location":{"uri":os.environ["LSP_WORKSPACE_SYMBOL_URI"],
+                    "range":{"start":{"line":2,"character":4},
+                             "end":{"line":2,"character":9}}}
+            }]})
         elif method == "shutdown":
             send({"jsonrpc":"2.0", "id":message["id"], "result":None})
         elif method == "exit":
@@ -80,6 +88,8 @@ def test_workspace_sync_diagnostics_edits_and_restart() -> None:
         log_path = Path(temporary) / "opened.jsonl"
         env = dict(os.environ)
         env["LSP_WORKSPACE_OPEN_LOG"] = str(log_path)
+        symbol_path = Path(temporary) / "symbol target.elisa"
+        env["LSP_WORKSPACE_SYMBOL_URI"] = path_to_uri(symbol_path)
         supervisor = LspSupervisor(
             [sys.executable, "-u", "-c", SERVER],
             env=env,
@@ -104,6 +114,13 @@ def test_workspace_sync_diagnostics_edits_and_restart() -> None:
             assert (first.start_byte, first.end_byte) == (13, 17)
             assert first.related_information[0].message == "related declaration"
             assert first.related_information[0].uri == uri
+            symbols = workspace.workspace_symbols(uri, "entry")
+            assert symbols == [{
+                "name":"entry π", "kind":12, "containerName":"module",
+                "location":{"uri":path_to_uri(symbol_path),
+                    "range":{"start":{"line":2,"character":4},
+                             "end":{"line":2,"character":9}}}
+            }]
 
             workspace.apply_edit(uri, SourceEdit.text(13, 17, "🚀"))
             assert buffer.document.text == 'let value = "🚀"\nreturn 0\n'

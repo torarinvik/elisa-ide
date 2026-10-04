@@ -267,8 +267,15 @@ module DesignerSession:
             pending_depths.push(0)
             while pending.count > 0:
                 last_index: usize = pending.count - 1.usize()
-                current: mutable DesignIds::DesignId = DesignIds::empty()
-                DesignIds::copy_into(&current, &pending[last_index])
+                # Copy the compact identity field-by-field before changing the
+                # pending stack. This keeps no view into its backing array alive
+                # across the next push/reallocation.
+                current: DesignIds::DesignId = DesignIds::DesignId{
+                    word0: pending[last_index].word0,
+                    word1: pending[last_index].word1,
+                    word2: pending[last_index].word2,
+                    length: pending[last_index].length,
+                }
                 depth: i32 = pending_depths[last_index]
                 pending.resize(last_index)
                 pending_depths.resize(last_index)
@@ -1508,6 +1515,10 @@ module DesignerSession:
         def is_dirty() -> bool:
             return DesignHistory::is_dirty(state.form, state.history)
 
+        @link_name("designer_session_form_revision")
+        def form_revision() -> i64:
+            return state.form.revision.i64()
+
         # Return the current generated Elisa view without writing it. This is
         # a read-only source projection: generated ownership remains with the
         # form/code generator, and the shell must route edits to the form or
@@ -1909,6 +1920,16 @@ module DesignerSession:
         def source_view_byte_count() -> i64:
             return 0 if not state.source_view_ready
             return state.source_view_contents.count.i64()
+
+        @link_name("designer_session_source_view_fingerprint")
+        def source_view_fingerprint() -> i64:
+            return 0 if not state.source_view_ready
+            return Fingerprint::fnv1a64(DesignText::view_of(state.source_view_contents)).i64()
+
+        @link_name("designer_session_source_view_contents")
+        def source_view_contents() -> sview:
+            return "" if not state.source_view_ready
+            return DesignText::view_of(state.source_view_contents)
 
         @link_name("designer_session_source_view_line_for_byte")
         def source_view_line_for_byte(offset: i64) -> i64:

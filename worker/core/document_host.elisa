@@ -352,6 +352,16 @@ def host_dispatch(opcode: i64, arg0: i64, arg1: i64, running: mutable bool&) -> 
             return DesignerSession::source_view_byte_count()
         if opcode == 149:
             return DesignerSession::source_view_line_for_byte(arg0)
+        if opcode == 151:
+            return set_text(DesignerSession::source_view_contents())
+        if opcode == 152:
+            return DesignerSession::source_view_fingerprint()
+        if opcode == 153:
+            return DesignerSession::form_revision()
+        if opcode == 154:
+            if DesignerSession::external_change():
+                return 1
+            return 0
         if opcode == 117:
             if DesignerSession::open_or_create_handlers():
                 return 1
@@ -581,14 +591,11 @@ def run_stream() -> i64:
 
 
 
-# Signal mode: a long-lived host for the shell. The shell writes
-# build/host_request.txt, then writes one byte to this process's stdin. The
-# request line has three decimal fields plus a strict hex-encoded UTF-8 fourth
-# field for text-bearing operations. The host executes the request against its
-# in-memory session and rewrites build/host_reply.bin. One process keeps the
-# document, history, and selection alive across shell actions; file-based
-# replies avoid the framework unit's unreliable pipe read (see stage1-notes.md).
-def run_signal_mode() -> i64:
+# Signal mode: a long-lived host for the shell. Each IDE session supplies
+# private request/reply paths; the no-argument form retains the build/ paths
+# for protocol tools and older local callers. A one-byte stdin signal wakes
+# this process after the complete request file has been published.
+def run_signal_mode(request_path: cstr, reply_path: cstr) -> i64:
     can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
         DesignerSession::init()
         request: mutable darray[u8] = []
@@ -599,7 +606,7 @@ def run_signal_mode() -> i64:
             if signal_byte < 0:
                 break
             request.resize(0)
-            read_request_file("build/host_request.txt", &request)
+            read_request_file(request_path, &request)
             line: sview = DesignText::view_of(request)
             opcode: mutable i64 = -1
             arg0: mutable i64 = 0
@@ -617,7 +624,7 @@ def run_signal_mode() -> i64:
             append_i32(&reply, result)
             append_i32(&reply, host_text.buf.count.i64())
             append_range(&reply, host_text.buf)
-            write_bytes_file("build/host_reply.bin", &reply)
+            write_bytes_file(reply_path, &reply)
         return 0
 
 # Text mode: `document_host --text request.txt reply.txt`. The request file
@@ -805,7 +812,9 @@ def main(argc: i64, argv: mutable void&) -> i64:
         if argc >= 2:
             slots: mutable cstr&& = argv.cast[mutable cstr&&]
             if DesignText::equal(sview(slots[1.usize()].cast[cstr], 0, -1), "--signal"):
-                return run_signal_mode()
+                if argc >= 4:
+                    return run_signal_mode(slots[2.usize()].cast[cstr], slots[3.usize()].cast[cstr])
+                return run_signal_mode("build/host_request.txt", "build/host_reply.bin")
         if argc >= 3:
             slots: mutable cstr&& = argv.cast[mutable cstr&&]
             if DesignText::equal(sview(slots[1.usize()].cast[cstr], 0, -1), "--text"):

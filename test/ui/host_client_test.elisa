@@ -47,6 +47,8 @@ def main() -> i64:
         failures <- failures + 1
 
     HostClient::stop(&process)
+    if PosixProcess::valid(process):
+        failures <- failures + 1
     if failures == 0:
         report_i64("ok ui_host_client failures=", 0)
         return 0

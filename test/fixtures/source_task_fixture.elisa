@@ -1,0 +1,5 @@
+include "../../compiler/elisacore_std/elisacore_runtime.elisa"
+
+def main() -> i64:
+    print("source-task-ran\n")
+    return 0

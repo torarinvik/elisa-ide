@@ -13,6 +13,9 @@ bash scripts/smoke_generated_settings.sh
 bash scripts/smoke_counter_generation.sh
 bash scripts/smoke_primitives_generation.sh
 bash scripts/test_external_editor_launch.sh
+bash scripts/test_png_decode_orientation.sh
+bash scripts/test_host_ipc_paths.sh
+bash scripts/test_ide_termination_observer.sh
 
 bash scripts/build_core.sh worker/core/document_host.elisa document_host >/dev/null
 bash scripts/build_native.sh test/ui/shell_inspector_test.elisa shell_inspector_test >/dev/null

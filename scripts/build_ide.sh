@@ -110,6 +110,9 @@ bash "$ROOT/scripts/build_preview_worker.sh"
 # incompatible Skia shim object files for this product to consume.
 clang -c -fobjc-arc -Wall -Wextra -Werror -DELISA_UI_USE_SKIA \
     -o "$SKIA_BUILD_DIR/appkit_canvas_skia_shim.o" "$APPKIT_SHIM"
+clang -c -fobjc-arc -Wall -Wextra -Werror \
+    -o "$SKIA_BUILD_DIR/ide_termination_observer.o" \
+    "$ROOT/src/platform/appkit/ide_termination_observer.m"
 ide_root_define="-DELISA_IDE_SOURCE_ROOT=\"$ROOT\""
 clang -std=c11 -Wall -Wextra -Werror "$ide_root_define" \
     -c "$ROOT/src/platform/posix/ide_app_environment.c" \
@@ -132,6 +135,7 @@ clang++ -std=c++17 -fPIC -I"$SKIA_ROOT" -c \
 link_inputs=(
     "$SKIA_BUILD_DIR/${IDE_NAME}.o"
     "$SKIA_BUILD_DIR/appkit_canvas_skia_shim.o"
+    "$SKIA_BUILD_DIR/ide_termination_observer.o"
     "$SKIA_BUILD_DIR/appkit_skia_host.o"
     "$SKIA_BUILD_DIR/skia_canvas_shim.o"
     "$SKIA_BUILD_DIR/skia_text_shim.o"
@@ -148,6 +152,7 @@ done
 
 clang++ -Wl,-dead_strip -o "$BUILD_DIR/$IDE_NAME" "${link_inputs[@]}" \
     -framework Cocoa \
+    -framework QuartzCore \
     -framework CoreText \
     -framework CoreGraphics \
     -framework ImageIO \

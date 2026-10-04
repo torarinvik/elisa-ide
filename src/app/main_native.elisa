@@ -8,6 +8,32 @@ include "../shell/shell_app.elisa"
 
 @link_name("designer_ide_prepare_working_directory")
 extern ide_prepare_working_directory() -> i64 can[Blocking.IO]
+@link_name("designer_ide_register_termination_observer")
+extern ide_register_termination_observer() -> void
+
+global mutable app_shutdown_started: bool = false
+global mutable shutdown_preferences_saved: bool = false
+
+def save_shutdown_preferences() -> void can[Blocking.IO]:
+    return if shutdown_preferences_saved
+    _ = save_pane_preferences(shell)
+    shutdown_preferences_saved <- true
+
+def stop_runtime() -> void can[Blocking.IO, Memory.Release, Unsafe.PointerCast]:
+    return if app_shutdown_started
+    app_shutdown_started <- true
+    stop_build_run(shell)
+    ShellLsp::stop(shell)
+    ShellPreview::stop(shell)
+    if shell.host_running:
+        HostClient::stop(&host_process)
+        shell.host_running <- false
+
+def app_will_terminate() -> void can[Blocking.IO, Memory.Release, Unsafe.PointerCast]:
+    save_shutdown_preferences()
+    stop_runtime()
+
+export fn designer_ide_app_will_terminate() -> void = app_will_terminate
 
 def main() -> i64 can[Blocking.IO, Memory.Release, Ui.Draw, Ui.Text, Ui.Input, Ui.Window, Unsafe.PointerCast]:
     return 1 if ide_prepare_working_directory() != 0
@@ -15,21 +41,14 @@ def main() -> i64 can[Blocking.IO, Memory.Release, Ui.Draw, Ui.Text, Ui.Input, U
     # If the application exits during an active drag, persist its latest
     # clamped ratios as part of a clean native shutdown.
     if result == 0:
-        _ = save_pane_preferences(shell)
-    stop_build_run(shell)
-    ShellPreview::stop(shell)
-    if shell.host_running:
-        HostClient::stop(&host_process)
-        stopped: bool = PosixProcess::poll(&host_process, 1000)
-        if not stopped:
-            _ = PosixProcess::cancel(&host_process)
-        PosixProcess::dispose(&host_process)
-        shell.host_running <- false
+        save_shutdown_preferences()
+    stop_runtime()
     return result
 
 def app_init() -> void:
     shell <- new_shell()
     init(shell)
+    ide_register_termination_observer()
 
 def app_widget_event(widget: usize, event: i32) -> void:
     widget_event(shell, widget, event)

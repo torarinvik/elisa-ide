@@ -128,15 +128,11 @@ module DesignCommand:
             prepare_reparent_into(&prepared, form, registry, ids, parent, index, sink)
             return prepared
 
-        def prepare_duplicate_into(prepared: mutable Prepared&, form: DesignForms::Form&, ids: darray[DesignIds::DesignId], allocator: mutable DesignIds::Allocator&, sink: mutable DesignDiagnostics::Sink&) -> void:
+        def prepare_duplicate_into[@r](prepared: mutable Prepared& @r, form: DesignForms::Form&, ids: darray[DesignIds::DesignId], allocator: mutable DesignIds::Allocator&, sink: mutable DesignDiagnostics::Sink&) -> void:
             reset_prepared(prepared, form)
-            created: darray[DesignIds::DesignId] = DesignOps::duplicate(&prepared.after, ids, allocator, sink)
-            if created.count > 0:
-                created_snapshot: mutable darray[DesignIds::DesignId] = []
-                DesignClone::clone_ids_into(&created_snapshot, created)
+            if DesignOps::duplicate_into(&prepared.after, ids, allocator, &prepared.created, sink) and prepared.created.count > 0:
                 prepared.valid <- true
                 set_description(prepared, "Duplicate selection")
-                DesignClone::clone_ids_into(&prepared.created, created_snapshot)
 
         def prepare_duplicate(form: DesignForms::Form&, ids: darray[DesignIds::DesignId], allocator: mutable DesignIds::Allocator&, sink: mutable DesignDiagnostics::Sink&) -> Prepared:
             prepared: mutable Prepared = empty_prepared()
@@ -146,13 +142,9 @@ module DesignCommand:
         def prepare_paste(form: DesignForms::Form&, registry: DesignRegistry::Registry&, source: DesignForms::Form&, roots: darray[DesignIds::DesignId], parent: DesignIds::DesignId, index: i64, allocator: mutable DesignIds::Allocator&, sink: mutable DesignDiagnostics::Sink&) -> Prepared:
             prepared: mutable Prepared = empty_prepared()
             reset_prepared(&prepared, form)
-            created: darray[DesignIds::DesignId] = DesignOps::paste(&prepared.after, registry, source, roots, parent, index, allocator, sink)
-            if created.count > 0:
-                created_snapshot: mutable darray[DesignIds::DesignId] = []
-                DesignClone::clone_ids_into(&created_snapshot, created)
+            if DesignOps::paste_into(&prepared.after, registry, source, roots, parent, index, allocator, &prepared.created, sink) and prepared.created.count > 0:
                 prepared.valid <- true
                 set_description(&prepared, "Paste")
-                DesignClone::clone_ids_into(&prepared.created, created_snapshot)
             return prepared
 
         def prepare_wrap(form: DesignForms::Form&, registry: DesignRegistry::Registry&, ids: darray[DesignIds::DesignId], type_key: sview, allocator: mutable DesignIds::Allocator&, sink: mutable DesignDiagnostics::Sink&) -> Prepared:

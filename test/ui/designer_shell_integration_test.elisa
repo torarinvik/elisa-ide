@@ -13,9 +13,11 @@ include "../../src/shell/shell_app.elisa"
 const SAVE_PATH: cstr = "build/shell-integration-main.elisaform.json"
 const SOURCE_VIEW_PATH: cstr = "test/fixtures/source_view.elisa"
 const SOURCE_EDIT_PATH: cstr = "build/shell-source-edit.elisa"
+const SOURCE_RELATED_PATH: cstr = "build/Related Elisa Source.elisa"
 const PROJECT_ROOT_PATH: cstr = "build/New Elisa Project"
 const PROJECT_FORM_PATH: cstr = "build/New Elisa Project/forms/main.elisaform.json"
 const PROJECT_MANIFEST_PATH: cstr = "build/New Elisa Project/New Elisa Project.elisaproject.json"
+const PROJECT_HANDLERS_PATH: cstr = "build/New Elisa Project/src/main_handlers.elisa"
 const PROJECT_GENERATED_ROOT_PATH: cstr = "build/New Elisa Project/generated"
 const PROJECT_GENERATED_README_PATH: cstr = "build/New Elisa Project/generated/README.md"
 const PROJECT_GENERATED_APP_PATH: cstr = "build/New Elisa Project/generated/App_app.elisa"
@@ -241,6 +243,24 @@ def test_build_diagnostic_projection() -> void:
     expect_integration(same_text(first, "forms/main.elisa:4:2: error: bad property")
         and same_text(second, "warning: local package graph"), 149)
     expect_integration(build_diagnostic_at(text, 2).len == 0, 150)
+    expect_integration(safe_build_source_path("src/main_handlers.elisa")
+        and safe_build_source_path("/workspace/project/src/main.elisa")
+        and not safe_build_source_path("../outside/main.elisa")
+        and not safe_build_source_path("build/project/generated/View.elisa"), 262)
+
+def test_lsp_coordinate_conversion() -> void:
+    source: sview = "a😀b"
+    expect_integration(ShellLsp::character_to_utf16(source, 8, 5) == 3
+        and ShellLsp::character_to_utf16(source, 16, 3) == 3
+        and ShellLsp::character_to_utf16(source, 32, 2) == 3, 207)
+    expect_integration(ShellLsp::character_to_utf16(source, 16, 2) == 1
+        and ShellLsp::character_to_utf16(source, 8, 2) == 1, 208)
+    expect_integration(ShellLsp::utf16_to_character(source, 8, 3) == 5
+        and ShellLsp::utf16_to_character(source, 16, 3) == 3
+        and ShellLsp::utf16_to_character(source, 32, 3) == 2, 263)
+    expect_integration(ShellLsp::utf16_to_character(source, 8, 2) == 1
+        and ShellLsp::utf16_to_character(source, 16, 2) == 1
+        and ShellLsp::utf16_to_character(source, 32, 2) == 1, 264)
 
 def test_preview_path_isolation() -> void:
     first_input: mutable u8[1024] = zeroed
@@ -398,6 +418,15 @@ def clean_generated_project() -> void:
     _ = PosixFile::remove(PROJECT_GENERATED_MANIFEST_PATH)
     _ = PosixFile::remove_directory_if_empty(PROJECT_GENERATED_ROOT_PATH)
 
+def clean_compact_generated_project() -> void:
+    _ = PosixFile::remove("build/Compact Elisa Project/generated/README.md")
+    _ = PosixFile::remove("build/Compact Elisa Project/generated/App_app.elisa")
+    _ = PosixFile::remove("build/Compact Elisa Project/generated/App_handlers.elisa")
+    _ = PosixFile::remove("build/Compact Elisa Project/generated/App_view.elisa")
+    _ = PosixFile::remove("build/Compact Elisa Project/generated/App_view.elisa.map.json")
+    _ = PosixFile::remove("build/Compact Elisa Project/generated/.elisa-ide-generation.json")
+    _ = PosixFile::remove_directory_if_empty("build/Compact Elisa Project/generated")
+
 def dispatch_reorder_shortcut(key: UiCore::Key) -> void:
     UiHarness::dispatch(UiCore::KeyEvent.Down(UiCore::Key.LeftSuper))
     UiHarness::dispatch(UiCore::KeyEvent.Down(UiCore::Key.LeftShift))
@@ -544,8 +573,8 @@ def test_hierarchy_multi_selection() -> void:
     refresh_all(shell, host_process)
 
 def test_deep_hierarchy_breadcrumb() -> void:
-    # The breadcrumb keeps a bounded number of visible segments and maps its
-    # leading ellipsis to the hidden ancestor immediately before them.
+    # The breadcrumb keeps a bounded number of visible segments and lets the
+    # leading ellipsis jump back to the end of the first fully visible chunk.
     _ = HostClient::request(host_process, 10, 0, 0)
     for depth in 0..<7:
         _ = HostClient::request(host_process, 30, 0, 0)
@@ -554,7 +583,7 @@ def test_deep_hierarchy_breadcrumb() -> void:
         and shell.hierarchy_breadcrumb_truncated
         and shell.hierarchy_breadcrumb_count == MAX_HIERARCHY_BREADCRUMB_SEGMENTS
         and same_text(UiFlat::widget(shell.hierarchy_breadcrumb_segments[0.usize()].widget_id.usize()).text, "..."), 117)
-    ellipsis_ancestor_row: HostClient::HostReply = HostClient::request(host_process, 65, shell.hierarchy_breadcrumb_first - 1, 0)
+    ellipsis_ancestor_row: HostClient::HostReply = HostClient::request(host_process, 65, MAX_HIERARCHY_BREADCRUMB_SEGMENTS - 1, 0)
     expect_integration(ellipsis_ancestor_row.result == 2, 123)
     ellipsis_widget: UiFlat::Widget = UiFlat::widget(shell.hierarchy_breadcrumb_segments[0.usize()].widget_id.usize())
     ellipsis_hit: usize = UiFlat::hit(ellipsis_widget.x + ellipsis_widget.width * 0.5, ellipsis_widget.y + ellipsis_widget.height * 0.5)
@@ -629,7 +658,10 @@ def test_keyboard_reorder_shortcuts() -> void:
 def app_init() -> void:
     _ = PosixFile::remove(SAVE_PATH)
     clean_generated_project()
+    _ = PosixFile::remove(PROJECT_HANDLERS_PATH)
+    _ = PosixFile::remove_directory_if_empty("build/New Elisa Project/src")
     clean_test_project(PROJECT_FORM_PATH, PROJECT_MANIFEST_PATH, "build/New Elisa Project/forms", PROJECT_ROOT_PATH)
+    clean_compact_generated_project()
     clean_test_project(COMPACT_PROJECT_FORM_PATH, COMPACT_PROJECT_MANIFEST_PATH, "build/Compact Elisa Project/forms", COMPACT_PROJECT_ROOT_PATH)
     _ = PosixFile::remove("build/shell-integration-preferences.json")
     _ = integration_setenv("ELISA_IDE_CONFIG", "build/shell-integration-preferences.json")
@@ -650,6 +682,63 @@ def app_text_editing(text: sview, selected_start: i32, selected_length: i32) -> 
 def app_frame() -> void:
     frame(shell)
 
+def test_related_dirty_guard() -> void:
+    expect_integration(widget_event_rows(shell, shell.problem_rows[0.usize()].widget_id.usize())
+        and UiHandles::is_enabled(shell.problem_related_button), 232)
+    related_button_label: sview = UiFlat::widget(shell.problem_related_button.widget_id.usize()).text
+    expect_integration(same_text(related_button_label, "Related 1/4"), 233)
+    open_document(shell)
+    open_guard_title: sview = UiFlat::widget(shell.source_title.widget_id.usize()).text
+    expect_integration(shell.source_mode and same_text(open_guard_title, "Elisa source (modified)")
+        and bytes_contain(geometry_bytes(status_view(shell)), "Save this source file before opening another"), 246)
+    _ = widget_event_rows(shell, shell.problem_related_button.widget_id.usize())
+    blocked_title: sview = UiFlat::widget(shell.source_title.widget_id.usize()).text
+    expect_integration(shell.source_mode and same_text(blocked_title, "Elisa source (modified)")
+        and bytes_contain(geometry_bytes(status_view(shell)), "Save this source file before opening"), 234)
+    UiHandles::set_text(shell.build_output, "build/shell-source-edit.elisa:4:5: error: source fixture error", 11.0, shell_color(172, 184, 204))
+    shell.build_problem_count <- build_diagnostic_count(UiFlat::widget(shell.build_output.widget_id.usize()).text)
+    refresh_problems(shell, host_process)
+    _ = widget_event_rows(shell, shell.problem_rows[1.usize()].widget_id.usize())
+    build_mapped_line: sview = UiHandles::text_value(shell.source_line_rows[3.usize()])
+    expect_integration(shell.build_problem_count == 1 and shell.source_selected_line == 4
+        and bytes_contain(geometry_bytes(build_mapped_line), "Source editor paging fixture, line 4.")
+        and UiFlat::selection_utf16_location(shell.source_line_rows[3.usize()].widget_id.usize()) == 7
+        and bytes_contain(geometry_bytes(status_view(shell)), "Selected build diagnostic at source line 4"), 247)
+    UiHandles::set_text(shell.build_output, "build/shell-source-edit.elisa(3,2): error: parenthesized fixture error", 11.0, shell_color(172, 184, 204))
+    shell.build_problem_count <- build_diagnostic_count(UiFlat::widget(shell.build_output.widget_id.usize()).text)
+    refresh_problems(shell, host_process)
+    _ = widget_event_rows(shell, shell.problem_rows[1.usize()].widget_id.usize())
+    parenthesized_mapped_line: sview = UiHandles::text_value(shell.source_line_rows[2.usize()])
+    expect_integration(shell.build_problem_count == 1 and shell.source_selected_line == 3
+        and bytes_contain(geometry_bytes(parenthesized_mapped_line), "Source editor paging fixture, line 3.")
+        and UiFlat::selection_utf16_location(shell.source_line_rows[2.usize()].widget_id.usize()) == 4
+        and bytes_contain(geometry_bytes(status_view(shell)), "Selected build diagnostic at source line 3"), 248)
+    UiHandles::set_text(shell.build_output, "build/shell-source-edit.elisa(3,): error: malformed fixture column", 11.0, shell_color(172, 184, 204))
+    shell.build_problem_count <- build_diagnostic_count(UiFlat::widget(shell.build_output.widget_id.usize()).text)
+    refresh_problems(shell, host_process)
+    _ = widget_event_rows(shell, shell.problem_rows[1.usize()].widget_id.usize())
+    expect_integration(shell.build_problem_count == 1 and shell.source_selected_line == 3
+        and bytes_contain(geometry_bytes(status_view(shell)), "Build diagnostic source mapping is unavailable"), 249)
+
+def test_related_cycle() -> void:
+    related_target_uri: sview = selected_related_uri(shell, 0)
+    expect_integration(bytes_contain(geometry_bytes(related_target_uri), "Related%20Elisa%20Source.elisa"), 241)
+    decoded_related_target: darray[u8] = decode_local_file_uri(related_target_uri)
+    expect_integration(bytes_contain(decoded_related_target, "Related Elisa Source.elisa"), 242)
+    _ = widget_event_rows(shell, shell.problem_related_button.widget_id.usize())
+    related_first_line: sview = UiHandles::text_value(shell.source_line_rows[0.usize()])
+    expect_integration(shell.source_mode, 235)
+    expect_integration(bytes_contain(geometry_bytes(status_view(shell)), "Opened related Elisa-LSP location 1 of 4 at line 1"), 240)
+    expect_integration(bytes_contain(geometry_bytes(related_first_line), "module related_fixture:"), 237)
+    expect_integration(shell.source_selected_line == 1, 238)
+    expect_integration(UiFlat::selection_utf16_location(shell.source_line_rows[0.usize()].widget_id.usize()) == 5, 239)
+    _ = widget_event_rows(shell, shell.problem_related_button.widget_id.usize())
+    next_related_line: sview = UiHandles::text_value(shell.source_line_rows[3.usize()])
+    expect_integration(shell.source_selected_line == 4
+        and bytes_contain(geometry_bytes(next_related_line), "Source editor paging fixture, line 4.")
+        and UiFlat::selection_utf16_location(shell.source_line_rows[3.usize()].widget_id.usize()) == 7
+        and bytes_contain(geometry_bytes(status_view(shell)), "Opened related Elisa-LSP location 2 of 4 at line 4"), 236)
+
 def main() -> i64:
     UiHarness::start(1180.0, 760.0)
     UiHarness::focus_gained()
@@ -657,6 +746,7 @@ def main() -> i64:
     test_preview_path_isolation()
     test_frame_identity_acceptance()
     test_build_diagnostic_projection()
+    test_lsp_coordinate_conversion()
 
     # Cold launch owns a clean untitled form: New/Open remain usable and Save
     # is disabled until this document has a destination.
@@ -766,6 +856,7 @@ def main() -> i64:
         and UiHandles::is_visible(shell.source_line_rows[0.usize()]), 136)
     expect_integration(bytes_contain(source_bytes, "module main_view:"), 133)
     expect_integration(bytes_contain(source_bytes, "def build() -> bool"), 134)
+    expect_integration(HostClient::request(host_process, 113, 0, 0).result != 1, 192)
     source_owner_line: mutable i32 = -1
     button_byte_offset: i64 = byte_index_of(source_bytes, "UiHandles::button")
     source_scan: mutable i32 = 0
@@ -791,11 +882,12 @@ def main() -> i64:
             UiHarness::dispatch(UiCore::PointerEvent.Up(at: UiCore::Vec2(center_x, center_y), button: UiCore::PointerButton.Primary.i32()))
         selected_name: HostClient::HostReply = HostClient::request(host_process, 54, 0, 0)
         source_owner_result <- selected_name.result == 1
-        source_owner_name <- same_text(ShellBytes::view_of(&selected_name.text), "Button")
+        source_owner_name <- same_text(ShellBytes::view_of(&selected_name.text), "Save action")
     expect_integration(source_owner_line >= 0, 138)
     expect_integration(source_owner_activation, 139)
     expect_integration(source_owner_result, 140)
     expect_integration(source_owner_name, 141)
+    expect_integration(same_text(status_view(shell), "Selected form owner from generated source"), 193)
     expect_integration(UiHandles::activate(shell.source_button), 130)
     expect_integration(not shell.source_mode and UiHandles::is_visible(shell.surface_pane), 129)
 
@@ -806,6 +898,19 @@ def main() -> i64:
     _ = PosixFile::remove(SOURCE_EDIT_PATH)
     source_copy_length: i64 = PosixFile::write_plain(SOURCE_EDIT_PATH, ShellBytes::view_of(&source_fixture))
     expect_integration(source_fixture_length > 0 and source_copy_length == source_fixture_length.i64(), 153)
+    _ = PosixFile::remove(SOURCE_RELATED_PATH)
+    related_fixture_text: sview = "module related_fixture:\n    def related_entry() -> i64:\n        return 7\n"
+    related_fixture_length: i64 = PosixFile::write_plain(SOURCE_RELATED_PATH, related_fixture_text)
+    expect_integration(related_fixture_length == related_fixture_text.len.i64(), 229)
+    expect_integration(integration_setenv("ELISA_LSP", "../test/fixtures/fake_elisa_lsp.py") == 0, 201)
+    expect_integration(integration_setenv("ELISA_LSP_RELATED_PATH", SOURCE_RELATED_PATH) == 0, 230)
+    expect_integration(integration_setenv("ELISA_LSP_DEFINITION_PATH", SOURCE_RELATED_PATH) == 0, 265)
+    expect_integration(integration_setenv("ELISA_LSP_SYMBOL_PATH", SOURCE_RELATED_PATH) == 0, 287)
+    decoded_uri_path: darray[u8] = decode_local_file_uri("file:///tmp/Related%20Elisa%20Source.elisa")
+    expect_integration(bytes_contain(decoded_uri_path, "Related Elisa Source.elisa")
+        and decode_local_file_uri("https://example.invalid/source.elisa").count == 0
+        and decode_local_file_uri("file:///tmp/bad%00.elisa").count == 0
+        and decode_local_file_uri("file:///tmp/bad%2.elisa").count == 0, 231)
     UiHandles::replace_text(shell.open_path_field, sview(SOURCE_EDIT_PATH, 0, -1))
     click(shell.open_button)
     source_first_line: sview = UiHandles::text_value(shell.source_line_rows[0.usize()])
@@ -818,6 +923,96 @@ def main() -> i64:
         and UiHandles::is_enabled(shell.source_reveal_button), 164)
     expect_integration(shell.source_line_count == 32
         and bytes_contain(geometry_bytes(source_first_line), "1: module source_view:"), 155)
+    lsp_open_wait: mutable i64 = 0
+    while (shell.source_lsp_version < 1 or shell.source_lsp_diagnostics != 1) and lsp_open_wait < 300:
+        _ = PosixProcess::poll(&shell.source_lsp_process, 10)
+        app_frame()
+        lsp_open_wait <- lsp_open_wait + 1
+    lsp_status_text: sview = UiFlat::widget(shell.source_lsp_status.widget_id.usize()).text
+    expect_integration(lsp_open_wait < 300 and shell.source_lsp_state == 1
+        and shell.source_lsp_version == 1 and shell.source_lsp_diagnostics == 1
+        and bytes_contain(geometry_bytes(lsp_status_text), "1 diagnostic"), 202)
+    expect_integration(shell.source_lsp_generation >= 1, 224)
+    expect_integration(shell.source_lsp_workspace_symbols_supported
+        and UiHandles::is_visible(shell.source_symbol_query)
+        and UiHandles::is_enabled(shell.source_symbol_search_button), 288)
+    UiHandles::replace_text(shell.source_symbol_query, "related")
+    click(shell.source_symbol_search_button)
+    symbol_navigation_wait: mutable i64 = 0
+    while not bytes_contain(geometry_bytes(status_view(shell)), "Opened workspace symbol related_entry") and symbol_navigation_wait < 400:
+        _ = PosixProcess::poll(&shell.source_lsp_process, 10)
+        app_frame()
+        symbol_navigation_wait <- symbol_navigation_wait + 1
+    symbol_target_path: HostClient::HostReply = HostClient::request(host_process, 114, 0, 0)
+    symbol_target_line: sview = UiHandles::text_value(shell.source_line_rows[1.usize()])
+    symbol_target_prefix: darray[u8] = source_line_prefix(2)
+    expect_integration(symbol_navigation_wait < 400 and ShellLsp::workspace_symbol_count(shell) == 1
+        and shell.source_lsp_symbol_selected == 0
+        and bytes_contain(geometry_bytes(status_view(shell)), "Opened workspace symbol related_entry"), 289)
+    expect_integration(symbol_target_path.result == 1
+        and bytes_contain(symbol_target_path.text, "Related Elisa Source.elisa")
+        and shell.source_selected_line == 2
+        and bytes_contain(geometry_bytes(symbol_target_line), "def related_entry()"), 290)
+    expect_integration(UiFlat::selection_utf16_location(shell.source_line_rows[1.usize()].widget_id.usize())
+        == symbol_target_prefix.count + 8, 291)
+    restored_symbol_source: HostClient::HostReply = HostClient::request_text(host_process, 112, 0, 0, SOURCE_EDIT_PATH)
+    expect_integration(restored_symbol_source.result == 1, 292)
+    shell.source_mode <- true
+    shell.standalone_source <- true
+    shell.source_page_start <- 0
+    apply_shell_layout(shell)
+    ShellLsp::sync_active(shell, host_process)
+    refresh_all(shell, host_process)
+    symbol_restore_wait: mutable i64 = 0
+    while (shell.source_lsp_state != 1 or shell.source_lsp_diagnostics != 1) and symbol_restore_wait < 400:
+        _ = PosixProcess::poll(&shell.source_lsp_process, 10)
+        app_frame()
+        symbol_restore_wait <- symbol_restore_wait + 1
+    expect_integration(symbol_restore_wait < 400 and shell.source_lsp_state == 1
+        and shell.source_lsp_diagnostics == 1, 293)
+    expect_integration(ShellLsp::diagnostic_end_line(shell, 0) == 3
+        and ShellLsp::diagnostic_end_character(shell, 0) == 4, 211)
+    expect_integration(ShellLsp::diagnostic_related_count(shell, 0) == 6
+        and ShellLsp::diagnostic_related_stored_count(shell, 0) == 4
+        and same_text(ShellLsp::diagnostic_related_message(shell, 0), "fixture related location")
+        and ShellLsp::diagnostic_related_line(shell, 0) == 0
+        and ShellLsp::diagnostic_related_character(shell, 0) == 2, 212)
+    expect_integration(same_text(ShellLsp::diagnostic_related_message_at(shell, 0, 1), "fixture second related location")
+        and ShellLsp::diagnostic_related_line_at(shell, 0, 1) == 3
+        and ShellLsp::diagnostic_related_character_at(shell, 0, 1) == 4
+        and same_text(ShellLsp::diagnostic_related_message_at(shell, 0, 3), "fixture related location 4")
+        and ShellLsp::diagnostic_related_message_at(shell, 0, 4).len == 0, 225)
+    source_diag_widget: UiFlat::Widget = UiFlat::widget(shell.source_line_rows[0.usize()].widget_id.usize())
+    expect_integration(source_diag_widget.ring_color.r == 126 and source_diag_widget.ring_color.a > 0
+        and bytes_contain(geometry_bytes(source_diag_widget.help), "fixture related location")
+        and bytes_contain(geometry_bytes(source_diag_widget.help), "fixture second related location")
+        and bytes_contain(geometry_bytes(source_diag_widget.help), "Additional related locations omitted: 2"), 213)
+    source_diag_widget_index: usize = shell.source_line_rows[0.usize()].widget_id.usize()
+    expect_integration(UiFlat::text_underline_start_utf16(source_diag_widget_index, 0) == 10
+        and UiFlat::text_underline_stop_utf16(source_diag_widget_index, 0) == UiFlat::text_utf16_length(source_diag_widget_index)
+        and UiFlat::text_underline_color(source_diag_widget_index, 0).r == 126, 226)
+    source_diag_middle_widget: usize = shell.source_line_rows[1.usize()].widget_id.usize()
+    source_diag_end_widget: usize = shell.source_line_rows[3.usize()].widget_id.usize()
+    expect_integration(UiFlat::text_underline_start_utf16(source_diag_middle_widget, 0) == 3
+        and UiFlat::text_underline_stop_utf16(source_diag_middle_widget, 0) == UiFlat::text_utf16_length(source_diag_middle_widget), 227)
+    expect_integration(UiFlat::text_underline_start_utf16(source_diag_end_widget, 0) == 3
+        and UiFlat::text_underline_stop_utf16(source_diag_end_widget, 0) == 7, 228)
+    expect_integration(ShellLsp::position_encoding(shell) == 16, 210)
+    lsp_problem_text: sview = UiFlat::widget(shell.problem_rows[0.usize()].widget_id.usize()).text
+    expect_integration(UiHandles::is_visible(shell.problem_rows[0.usize()])
+        and bytes_contain(geometry_bytes(lsp_problem_text), "fixture diagnostic v1"), 204)
+    lsp_problem_help: sview = UiFlat::widget(shell.problem_rows[0.usize()].widget_id.usize()).help
+    expect_integration(bytes_contain(geometry_bytes(lsp_problem_help), "range 4:5")
+        and bytes_contain(geometry_bytes(lsp_problem_help), "fixture related location")
+        and bytes_contain(geometry_bytes(lsp_problem_help), "fixture second related location")
+        and bytes_contain(geometry_bytes(lsp_problem_help), "Additional related locations omitted: 2"), 214)
+    expect_integration(widget_event_rows(shell, shell.problem_rows[0.usize()].widget_id.usize())
+        and shell.source_selected_line == 1
+        and bytes_contain(geometry_bytes(status_view(shell)), "Selected Elisa-LSP diagnostic"), 205)
+    lsp_version_before_edit: i64 = shell.source_lsp_version
+    prefix_before_diagnostic: darray[u8] = source_line_prefix(1)
+    expect_integration(UiFlat::selection_utf16_location(shell.source_line_rows[0.usize()].widget_id.usize())
+        == prefix_before_diagnostic.count + 7, 209)
     source_editor: UiHandles::Handle = shell.source_line_rows[0.usize()]
     source_editor_original: sview = UiHandles::text_value(source_editor)
     source_editor_focused: bool = UiHandles::request_focus(source_editor)
@@ -829,12 +1024,46 @@ def main() -> i64:
         and same_text(ShellBytes::view_of(&edited_source_line.text), "module source_view_edited:")
         and HostClient::request(host_process, 130, 0, 0).result == 1
         and same_text(UiFlat::widget(shell.source_title.widget_id.usize()).text, "Elisa source (modified)"), 165)
+    lsp_change_wait: mutable i64 = 0
+    while (shell.source_lsp_version <= lsp_version_before_edit or shell.source_lsp_diagnostics != 1) and lsp_change_wait < 300:
+        _ = PosixProcess::poll(&shell.source_lsp_process, 10)
+        app_frame()
+        lsp_change_wait <- lsp_change_wait + 1
+    lsp_changed_status: sview = UiFlat::widget(shell.source_lsp_status.widget_id.usize()).text
+    integration_report_i64("lsp_change_wait=", lsp_change_wait)
+    integration_report_i64("lsp_state=", shell.source_lsp_state.i64())
+    integration_report_i64("lsp_version_before=", lsp_version_before_edit)
+    integration_report_i64("lsp_version_after=", shell.source_lsp_version)
+    integration_report_i64("lsp_version_valid=", 1 if shell.source_lsp_version_valid else 0)
+    integration_report_i64("lsp_diagnostics=", shell.source_lsp_diagnostics.i64())
+    expect_integration(lsp_change_wait < 300 and shell.source_lsp_state == 1
+        and shell.source_lsp_version > lsp_version_before_edit and shell.source_lsp_diagnostics == 1
+        and bytes_contain(geometry_bytes(lsp_changed_status), "v"), 203)
+    lsp_changed_problem_text: sview = UiFlat::widget(shell.problem_rows[0.usize()].widget_id.usize()).text
+    expect_integration(bytes_contain(geometry_bytes(lsp_changed_problem_text), "fixture diagnostic v"), 206)
+    expect_integration(UiHandles::is_visible(shell.source_lsp_restart_button)
+        and UiHandles::is_enabled(shell.source_lsp_restart_button), 221)
+    lsp_restart_generation: i64 = shell.source_lsp_generation
+    click(shell.source_lsp_restart_button)
+    restart_status: sview = UiFlat::widget(shell.source_lsp_status.widget_id.usize()).text
+    expect_integration(bytes_contain(geometry_bytes(restart_status), "Restarting Elisa-LSP"), 222)
+    lsp_restart_wait: mutable i64 = 0
+    while shell.source_lsp_generation <= lsp_restart_generation and lsp_restart_wait < 300:
+        _ = PosixProcess::poll(&shell.source_lsp_process, 10)
+        app_frame()
+        lsp_restart_wait <- lsp_restart_wait + 1
+    expect_integration(lsp_restart_wait < 300 and shell.source_lsp_state == 1
+        and shell.source_lsp_generation > lsp_restart_generation
+        and shell.source_lsp_version >= 2 and shell.source_lsp_diagnostics == 1, 223)
+    test_related_dirty_guard()
+    expect_integration(UiHandles::is_enabled(shell.save_button), 197)
     click(shell.save_button)
     saved_source_bytes: mutable darray[u8] = []
     saved_source_length: usize = PosixFile::read_bytes(&saved_source_bytes, SOURCE_EDIT_PATH, 1048576)
-    expect_integration(HostClient::request(host_process, 130, 0, 0).result == 0
-        and saved_source_length > 0 and bytes_contain(saved_source_bytes, "module source_view_edited:")
-        and same_text(UiFlat::widget(shell.source_title.widget_id.usize()).text, "Elisa source"), 166)
+    expect_integration(HostClient::request(host_process, 130, 0, 0).result == 0, 194)
+    expect_integration(saved_source_length > 0 and bytes_contain(saved_source_bytes, "module source_view_edited:"), 195)
+    expect_integration(same_text(UiFlat::widget(shell.source_title.widget_id.usize()).text, "Elisa source"), 196)
+    expect_integration(not UiHandles::is_enabled(shell.save_button), 198)
     expect_integration(UiHandles::is_enabled(shell.source_next_button), 156)
     expect_integration(UiHandles::activate(shell.source_next_button), 157)
     source_second_page: sview = UiHandles::text_value(shell.source_line_rows[0.usize()])
@@ -844,6 +1073,58 @@ def main() -> i64:
     expect_integration(shell.source_selected_line == 33
         and bytes_contain(geometry_bytes(status_view(shell)), "Selected source line 33"), 160)
     expect_integration(UiHandles::activate(shell.source_previous_button) and shell.source_page_start == 0, 161)
+    test_related_cycle()
+    definition_ready_wait: mutable i64 = 0
+    while (shell.source_lsp_state != 1 or not UiHandles::is_visible(shell.source_lsp_definition_button)
+        or not UiHandles::is_enabled(shell.source_lsp_definition_button)) and definition_ready_wait < 300:
+        _ = PosixProcess::poll(&shell.source_lsp_process, 10)
+        app_frame()
+        definition_ready_wait <- definition_ready_wait + 1
+    expect_integration(UiHandles::is_visible(shell.source_lsp_definition_button)
+        and UiHandles::is_enabled(shell.source_lsp_definition_button), 266)
+    definition_source_row: UiHandles::Handle = shell.source_line_rows[0.usize()]
+    definition_source_prefix: darray[u8] = source_line_prefix(1)
+    expect_integration(UiHandles::request_focus(definition_source_row), 267)
+    UiHandles::set_selection_utf16(definition_source_row, definition_source_prefix.count + 10, 0)
+    click(shell.source_lsp_definition_button)
+    definition_wait: mutable i64 = 0
+    while (shell.source_lsp_definition_requested
+        or not bytes_contain(geometry_bytes(status_view(shell)), "Opened Elisa-LSP definition")) and definition_wait < 300:
+        _ = PosixProcess::poll(&shell.source_lsp_process, 10)
+        app_frame()
+        definition_wait <- definition_wait + 1
+    definition_path_reply: HostClient::HostReply = HostClient::request(host_process, 114, 0, 0)
+    definition_line_text: sview = UiHandles::text_value(shell.source_line_rows[1.usize()])
+    definition_prefix: darray[u8] = source_line_prefix(2)
+    expect_integration(definition_wait < 300 and not shell.source_lsp_definition_requested
+        and bytes_contain(geometry_bytes(status_view(shell)), "Opened Elisa-LSP definition"), 268)
+    expect_integration(definition_path_reply.result == 1
+        and bytes_contain(definition_path_reply.text, "Related Elisa Source.elisa"), 270)
+    expect_integration(shell.source_selected_line == 2, 271)
+    expect_integration(bytes_contain(geometry_bytes(definition_line_text), "def related_entry()"), 272)
+    expect_integration(UiFlat::selection_utf16_location(shell.source_line_rows[1.usize()].widget_id.usize())
+        == definition_prefix.count + 8, 273)
+    definition_f12_ready_wait: mutable i64 = 0
+    while ((shell.source_lsp_state != 1 or not UiHandles::is_enabled(shell.source_lsp_definition_button))
+        and definition_f12_ready_wait < 300):
+        _ = PosixProcess::poll(&shell.source_lsp_process, 10)
+        app_frame()
+        definition_f12_ready_wait <- definition_f12_ready_wait + 1
+    expect_integration(definition_f12_ready_wait < 300 and UiHandles::request_focus(shell.source_line_rows[1.usize()]), 274)
+    app_event(UiCore::KeyEvent.Down(UiCore::Key.F12))
+    definition_f12_wait: mutable i64 = 0
+    while (shell.source_lsp_definition_requested
+        or not bytes_contain(geometry_bytes(status_view(shell)), "Opened Elisa-LSP definition")) and definition_f12_wait < 300:
+        _ = PosixProcess::poll(&shell.source_lsp_process, 10)
+        app_frame()
+        definition_f12_wait <- definition_f12_wait + 1
+    expect_integration(definition_f12_wait < 300 and shell.source_selected_line == 2
+        and UiFlat::selection_utf16_location(shell.source_line_rows[1.usize()].widget_id.usize()) == definition_prefix.count + 8, 275)
+    restored_definition_source: HostClient::HostReply = HostClient::request_text(host_process, 112, 0, 0, SOURCE_EDIT_PATH)
+    expect_integration(restored_definition_source.result == 1, 269)
+    shell.source_mode <- true
+    shell.source_page_start <- 0
+    refresh_all(shell, host_process)
 
     # Create a project under a folder path containing spaces, edit its form,
     # save through the project-relative destination, and reopen the manifest.
@@ -869,8 +1150,27 @@ def main() -> i64:
     click(shell.hierarchy_rows[1.usize()])
     type_editor_value(shell.inspector_editors[0.usize()], "Project saved")
     expect_integration(UiHandles::is_enabled(shell.save_button), 50)
+    expect_integration(shell.event_count > 0, 254)
+    click(shell.event_editors[0.usize()])
+    UiHandles::replace_text(shell.event_editors[0.usize()], "Handlers::temporary_handler")
+    app_widget_event(shell.event_editors[0.usize()].widget_id.usize(), UiConst::WidgetEvent.Change.i32())
+    expect_integration(shell.selected_event_index == 0 and shell.event_edit_dirty[0.usize()], 255)
+    app_widget_event(shell.event_editors[0.usize()].widget_id.usize(), UiConst::WidgetEvent.Submit.i32())
+    submitted_handler_value: HostClient::HostReply = HostClient::request(host_process, 92, 0, 0)
+    expect_integration(same_text(ShellBytes::view_of(&submitted_handler_value.text), "Handlers::temporary_handler")
+        and shell.projection.dirty, 256)
+    UiHandles::replace_text(shell.event_editors[0.usize()], "Handlers::project_saved")
+    app_widget_event(shell.event_editors[0.usize()].widget_id.usize(), UiConst::WidgetEvent.Change.i32())
+    click(shell.event_handler_source_button)
+    project_handler_value: HostClient::HostReply = HostClient::request(host_process, 92, 0, 0)
+    expect_integration(same_text(ShellBytes::view_of(&project_handler_value.text), "Handlers::project_saved")
+        and shell.projection.dirty and not shell.event_edit_dirty[0.usize()]
+        and bytes_contain(geometry_bytes(status_view(shell)), "Save this document before opening handlers"), 261)
     click(shell.save_button)
     expect_integration(not shell.projection.dirty, 45)
+    saved_event_form_bytes: mutable darray[u8] = []
+    saved_event_form_length: usize = PosixFile::read_bytes(&saved_event_form_bytes, PROJECT_FORM_PATH, 1048576)
+    expect_integration(saved_event_form_length > 0 and bytes_contain(saved_event_form_bytes, "Handlers::project_saved"), 257)
     UiHandles::replace_text(shell.open_path_field, sview(PROJECT_MANIFEST_PATH, 0, -1))
     click(shell.open_button)
     expect_integration(not shell.projection.dirty and shell.projection.node_count == 2, 46)
@@ -884,6 +1184,18 @@ def main() -> i64:
     expect_integration(UiHandles::activate(shell.source_button) and not shell.source_mode, 147)
     click(shell.hierarchy_rows[1.usize()])
     expect_integration(same_text(UiHandles::text_value(shell.inspector_editors[0.usize()]), "Project saved"), 47)
+    click(shell.event_editors[0.usize()])
+    expect_integration(shell.selected_event_index == 0, 258)
+    click(shell.event_handler_source_button)
+    opened_handler_bytes: mutable darray[u8] = []
+    opened_handler_length: usize = PosixFile::read_bytes(&opened_handler_bytes, PROJECT_HANDLERS_PATH, 1048576)
+    handler_line_index: i32 = (shell.source_selected_line - shell.source_page_start - 1).i32()
+    handler_line_text: sview = UiHandles::text_value(shell.source_line_rows[handler_line_index.usize()]) if handler_line_index >= 0 and handler_line_index < shell.source_line_count else ""
+    expect_integration(opened_handler_length > 0 and bytes_contain(opened_handler_bytes, "module Handlers:")
+        and bytes_contain(opened_handler_bytes, "def project_saved(")
+        and shell.source_mode and bytes_contain(geometry_bytes(handler_line_text), "def project_saved(")
+        and bytes_contain(geometry_bytes(status_view(shell)), "Opened handler declaration at line"), 259)
+    expect_integration(UiHandles::activate(shell.source_button) and not shell.source_mode, 260)
 
     # Build the saved project through the shell's supervised job path. The
     # generated project remains independent of the designer process and must
@@ -902,15 +1214,132 @@ def main() -> i64:
     expect_integration(UiHandles::is_visible(shell.build_output), 142)
     expect_integration(bytes_contain(geometry_bytes(build_output_view), "built project application"), 143)
     expect_integration(bytes_contain(geometry_bytes(build_output_text), "built project application"), 144)
-    UiHandles::set_text(shell.build_output, "generated/main_view.elisa:3:5: error: invalid handler\n", 11.0, shell_color(172, 184, 204))
+    type_editor_value(shell.inspector_editors[0.usize()], "12")
+    expect_integration(HostClient::request(host_process, 40, 0, 0).result == 1, 283)
+    click(shell.save_button)
+    expect_integration(HostClient::request(host_process, 40, 0, 0).result == 0, 284)
+    run_project(shell)
+    expect_integration(not run_active
+        and bytes_contain(geometry_bytes(status_view(shell)), "Project changed since its build"), 285)
+    command(shell, 13, 0)
+    click(shell.save_button)
+    expect_integration(HostClient::request(host_process, 40, 0, 0).result == 0, 286)
+    # A compiler problem for a different handwritten file opens that file and
+    # selects its exact UTF-8 byte location, even when another source document
+    # is currently displayed in the Source pane.
+    UiHandles::replace_text(shell.open_path_field, sview(SOURCE_VIEW_PATH, 0, -1))
+    open_document(shell)
+    prior_build_source_path: HostClient::HostReply = HostClient::request(host_process, 114, 0, 0)
+    handler_declaration_offset: i64 = byte_index_of(opened_handler_bytes, "def project_saved(")
+    handler_diagnostic_line: mutable i64 = 0
+    handler_diagnostic_column: mutable i64 = 0
+    handler_diagnostic_scan: mutable i64 = 0
+    while handler_diagnostic_scan < handler_declaration_offset:
+        if opened_handler_bytes[handler_diagnostic_scan.usize()] == 10:
+            handler_diagnostic_line <- handler_diagnostic_line + 1
+            handler_diagnostic_column <- 0
+        else:
+            handler_diagnostic_column <- handler_diagnostic_column + 1
+        handler_diagnostic_scan <- handler_diagnostic_scan + 1
+    cross_file_diagnostic: mutable darray[u8] = []
+    append_panel_text(&cross_file_diagnostic, sview(PROJECT_HANDLERS_PATH, 0, -1))
+    append_panel_text(&cross_file_diagnostic, ":")
+    append_nonnegative(&cross_file_diagnostic, handler_diagnostic_line + 1)
+    append_panel_text(&cross_file_diagnostic, ":")
+    append_nonnegative(&cross_file_diagnostic, handler_diagnostic_column + 1)
+    append_panel_text(&cross_file_diagnostic, ": error: cross-file handler fixture")
+    UiHandles::set_text(shell.build_output, ShellBytes::view_of(&cross_file_diagnostic), 11.0, shell_color(172, 184, 204))
     shell.build_problem_count <- build_diagnostic_count(UiFlat::widget(shell.build_output.widget_id.usize()).text)
     refresh_problems(shell, host_process)
-    build_problem_text: sview = UiFlat::widget(shell.problem_rows[0.usize()].widget_id.usize()).text
-    expect_integration(shell.build_problem_count == 1 and UiHandles::is_visible(shell.problem_rows[0.usize()])
-        and bytes_contain(geometry_bytes(build_problem_text), "invalid handler"), 151)
-    _ = widget_event_rows(shell, shell.problem_rows[0.usize()].widget_id.usize())
-    expect_integration(UiHandles::is_visible(shell.problem_rows[0.usize()]), 152)
-    expect_integration(bytes_contain(geometry_bytes(status_view(shell)), "source mapping is unavailable"), 153)
+    cross_file_row_index: mutable i32 = -1
+    cross_file_problem_scan: mutable i32 = 0
+    while cross_file_problem_scan < MAX_PROBLEM_ROWS:
+        candidate_text: sview = UiFlat::widget(shell.problem_rows[cross_file_problem_scan.usize()].widget_id.usize()).text
+        if UiHandles::is_visible(shell.problem_rows[cross_file_problem_scan.usize()]) and bytes_contain(geometry_bytes(candidate_text), "cross-file handler fixture"):
+            cross_file_row_index <- cross_file_problem_scan
+        cross_file_problem_scan <- cross_file_problem_scan + 1
+    if cross_file_row_index >= 0:
+        _ = widget_event_rows(shell, shell.problem_rows[cross_file_row_index.usize()].widget_id.usize())
+    opened_build_source_path: HostClient::HostReply = HostClient::request(host_process, 114, 0, 0)
+    cross_file_line_index: i32 = (shell.source_selected_line - shell.source_page_start - 1).i32()
+    cross_file_line_text: sview = UiHandles::text_value(shell.source_line_rows[cross_file_line_index.usize()]) if cross_file_line_index >= 0 and cross_file_line_index < shell.source_line_count else ""
+    expect_integration(prior_build_source_path.result == 1
+        and same_text(ShellBytes::view_of(&prior_build_source_path.text), sview(SOURCE_VIEW_PATH, 0, -1))
+        and same_text(ShellBytes::view_of(&opened_build_source_path.text), sview(PROJECT_HANDLERS_PATH, 0, -1))
+        and cross_file_row_index >= 0 and shell.source_mode
+        and shell.source_selected_line == handler_diagnostic_line + 1
+        and bytes_contain(geometry_bytes(cross_file_line_text), "def project_saved(")
+        and bytes_contain(geometry_bytes(status_view(shell)), "Opened build diagnostic source at line"), 263)
+    generated_file_bytes: mutable darray[u8] = []
+    generated_file_length: usize = PosixFile::read_bytes(&generated_file_bytes, PROJECT_GENERATED_VIEW_PATH, 1048577)
+    generated_map_file_bytes: mutable darray[u8] = []
+    generated_map_file_length: usize = PosixFile::read_bytes(&generated_map_file_bytes, PROJECT_GENERATED_MAP_PATH, 8388609)
+    live_generated_source: HostClient::HostReply = HostClient::request(host_process, 106, 0, 0)
+    live_generated_map: HostClient::HostReply = HostClient::request(host_process, 107, 0, 0)
+    generated_button_offset: i64 = byte_index_of(generated_file_bytes, "UiHandles::button")
+    expect_integration(generated_file_length > 0 and generated_map_file_length > 0
+        and live_generated_source.result == 1 and live_generated_map.result == 1
+        and ShellBytes::equal(ShellBytes::view_of(&generated_file_bytes), ShellBytes::view_of(&live_generated_source.text))
+        and ShellBytes::equal(ShellBytes::view_of(&generated_map_file_bytes), ShellBytes::view_of(&live_generated_map.text))
+        and generated_button_offset >= 0, 250)
+    generated_line: mutable i64 = 0
+    generated_column: mutable i64 = 0
+    generated_scan: mutable i64 = 0
+    while generated_scan < generated_button_offset:
+        if generated_file_bytes[generated_scan.usize()] == 10:
+            generated_line <- generated_line + 1
+            generated_column <- 0
+        else:
+            generated_column <- generated_column + 1
+        generated_scan <- generated_scan + 1
+    generated_diagnostic: mutable darray[u8] = []
+    append_panel_text(&generated_diagnostic, sview(PROJECT_GENERATED_VIEW_PATH, 0, -1))
+    append_panel_text(&generated_diagnostic, ":")
+    append_nonnegative(&generated_diagnostic, generated_line + 1)
+    append_panel_text(&generated_diagnostic, ":")
+    append_nonnegative(&generated_diagnostic, generated_column + 1)
+    append_panel_text(&generated_diagnostic, ": error: invalid handler")
+    UiHandles::set_text(shell.build_output, ShellBytes::view_of(&generated_diagnostic), 11.0, shell_color(172, 184, 204))
+    shell.build_problem_count <- build_diagnostic_count(UiFlat::widget(shell.build_output.widget_id.usize()).text)
+    refresh_problems(shell, host_process)
+    expect_integration(shell.build_problem_count == 1, 215)
+    build_row_index: mutable i32 = -1
+    problem_scan: mutable i32 = 0
+    while problem_scan < MAX_PROBLEM_ROWS:
+        candidate_text: sview = UiFlat::widget(shell.problem_rows[problem_scan.usize()].widget_id.usize()).text
+        if UiHandles::is_visible(shell.problem_rows[problem_scan.usize()]) and bytes_contain(geometry_bytes(candidate_text), "invalid handler"):
+            build_row_index <- problem_scan
+        problem_scan <- problem_scan + 1
+    expect_integration(build_row_index >= 0, 151)
+    click(shell.hierarchy_rows[0.usize()])
+    diagnostic_root_name: HostClient::HostReply = HostClient::request(host_process, 54, 0, 0)
+    expect_integration(diagnostic_root_name.result == 1
+        and same_text(ShellBytes::view_of(&diagnostic_root_name.text), "Column"), 253)
+    build_row_visible: mutable bool = false
+    if build_row_index >= 0:
+        build_row_visible <- UiHandles::is_visible(shell.problem_rows[build_row_index.usize()])
+        _ = widget_event_rows(shell, shell.problem_rows[build_row_index.usize()].widget_id.usize())
+    expect_integration(build_row_visible, 152)
+    generated_selected_name: HostClient::HostReply = HostClient::request(host_process, 54, 0, 0)
+    expect_integration(bytes_contain(geometry_bytes(status_view(shell)), "Selected generated build diagnostic")
+        and generated_selected_name.result == 1
+        and same_text(ShellBytes::view_of(&generated_selected_name.text), "Button"), 251)
+    _ = PosixFile::remove("build/unmapped-diagnostic-source.elisa")
+    _ = PosixFile::remove("build/unmapped-diagnostic-source.elisa.map.json")
+    UiHandles::set_text(shell.build_output, "build/unmapped-diagnostic-source.elisa:3:5: error: unmapped generated diagnostic", 11.0, shell_color(172, 184, 204))
+    shell.build_problem_count <- build_diagnostic_count(UiFlat::widget(shell.build_output.widget_id.usize()).text)
+    refresh_problems(shell, host_process)
+    unmapped_row_index: mutable i32 = -1
+    problem_scan <- 0
+    while problem_scan < MAX_PROBLEM_ROWS:
+        candidate_text: sview = UiFlat::widget(shell.problem_rows[problem_scan.usize()].widget_id.usize()).text
+        if UiHandles::is_visible(shell.problem_rows[problem_scan.usize()]) and bytes_contain(geometry_bytes(candidate_text), "unmapped generated diagnostic"):
+            unmapped_row_index <- problem_scan
+        problem_scan <- problem_scan + 1
+    if unmapped_row_index >= 0:
+        _ = widget_event_rows(shell, shell.problem_rows[unmapped_row_index.usize()].widget_id.usize())
+    expect_integration(unmapped_row_index >= 0
+        and bytes_contain(geometry_bytes(status_view(shell)), "Cannot read Elisa source file"), 252)
     expect_integration(shell.problem_copy_length > 0 and UiHandles::is_enabled(shell.problem_copy_button), 165)
     expect_integration(widget_event_rows(shell, shell.problem_copy_button.widget_id.usize())
         and same_text(status_view(shell), "The system clipboard is unavailable"), 166)
@@ -932,10 +1361,60 @@ def main() -> i64:
     expect_integration(compact_manifest_length > 0 and not shell.projection.dirty and shell.projection.node_count == 1, 49)
 
     test_keyboard_reorder_shortcuts()
+
+    # A source-only Elisa entry builds against the compiler/runtime without
+    # SDL, runs as its own supervised process, and becomes stale as soon as
+    # the open source buffer changes.
+    _ = PosixFile::remove("build/source-task-preserved.elisa")
+    if HostClient::request(host_process, 130, 0, 0).result == 1:
+        preserved_source: HostClient::HostReply = HostClient::request_text(host_process, 146, 0, 0, "build/source-task-preserved.elisa")
+        expect_integration(preserved_source.result == 1, 281)
+    if HostClient::request(host_process, 40, 0, 0).result == 1:
+        preserved_form: HostClient::HostReply = HostClient::request(host_process, 15, 0, 0)
+        expect_integration(preserved_form.result == 1, 282)
+    source_task_path: sview = "test/fixtures/source_task_fixture.elisa"
+    if shell.compact_mode:
+        UiHandles::replace_text(shell.compact_open_path_field, source_task_path)
+    else:
+        UiHandles::replace_text(shell.open_path_field, source_task_path)
+    open_document(shell)
+    expect_integration(shell.standalone_source and shell.source_mode
+        and HostClient::request(host_process, 113, 0, 0).result == 1, 276)
+    click(shell.build_button)
+    source_build_wait: mutable i64 = 0
+    while BuildJob::is_running(&build_job) and source_build_wait < 120000:
+        app_frame()
+        source_build_wait <- source_build_wait + 1
+    source_artifact_bytes: mutable darray[u8] = []
+    source_artifact_length: usize = PosixFile::read_bytes(&source_artifact_bytes, "build/elisa_ide_source_app", 8)
+    expect_integration(source_build_wait < 120000 and build_job.state == BuildJob::State.Succeeded
+        and shell.source_artifact_valid and source_artifact_length > 0
+        and bytes_contain(geometry_bytes(BuildJob::output_view(&build_job)), "elisa_ide_source_app"), 277)
+    run_project(shell)
+    source_run_wait: mutable i64 = 0
+    while run_active and source_run_wait < 30000:
+        app_frame()
+        source_run_wait <- source_run_wait + 1
+    expect_integration(source_run_wait < 30000 and not run_active
+        and bytes_contain(geometry_bytes(BuildJob::output_view(&build_job)), "source-task-ran")
+        and same_text(status_view(shell), "Application finished"), 278)
+    source_dirty_row: UiHandles::Handle = shell.source_line_rows[2.usize()]
+    source_dirty_focused: bool = UiHandles::request_focus(source_dirty_row)
+    UiHandles::set_selection_utf16(source_dirty_row, 0, UiFlat::text_utf16_length(source_dirty_row.widget_id.usize()))
+    app_text_input("3: def main() -> i64: # unsaved source edit")
+    app_widget_event(source_dirty_row.widget_id.usize(), UiConst::WidgetEvent.Change.i32())
+    expect_integration(source_dirty_focused
+        and HostClient::request(host_process, 130, 0, 0).result == 1, 279)
+    run_project(shell)
+    expect_integration(not run_active
+        and bytes_contain(geometry_bytes(status_view(shell)), "Save the source file and rebuild"), 280)
+    _ = PosixFile::remove("build/source-task-preserved.elisa")
+
     UiHarness::frame()
     return finish()
 
 def finish() -> i64:
+    ShellLsp::stop(shell)
     ShellPreview::stop(shell)
     clean_host()
     UiHarness::stop()

@@ -13,6 +13,13 @@ const MAX_INSPECTOR_ROWS: i32 = 16
 const MAX_EVENT_ROWS: i32 = 4
 const MAX_PROBLEM_ROWS: i32 = 6
 const MAX_BUILD_PROBLEMS: i32 = 64
+const MAX_LSP_DIAGNOSTICS: i32 = 128
+const MAX_LSP_RELATED: i32 = 4
+const MAX_LSP_WORKSPACE_SYMBOLS: i32 = 16
+const LSP_SYMBOL_NAME_STRIDE: usize = 128
+const LSP_SYMBOL_URI_STRIDE: usize = 4096
+const MAX_SELECTED_RELATED: i32 = 4
+const SELECTED_RELATED_URI_STRIDE: usize = 256
 const MAX_SOURCE_LINES: i32 = 32
 const MAX_PREVIEW_REGIONS: usize = 256
 const STATUS_CAPACITY: usize = 256
@@ -59,6 +66,11 @@ struct Shell:
     center_pane: mutable UiHandles::Handle
     source_pane: mutable UiHandles::Handle
     source_title: mutable UiHandles::Handle
+    source_lsp_status: mutable UiHandles::Handle
+    source_symbol_query: mutable UiHandles::Handle
+    source_symbol_search_button: mutable UiHandles::Handle
+    source_symbol_next_button: mutable UiHandles::Handle
+    source_symbol_status: mutable UiHandles::Handle
     source_scroll: mutable UiHandles::Handle
     source_find_field: mutable UiHandles::Handle
     source_find_previous_button: mutable UiHandles::Handle
@@ -102,6 +114,7 @@ struct Shell:
     hierarchy_page_label: mutable UiHandles::Handle
     problem_previous_button: mutable UiHandles::Handle
     problem_next_button: mutable UiHandles::Handle
+    problem_related_button: mutable UiHandles::Handle
     problem_page_label: mutable UiHandles::Handle
     status_line: mutable UiHandles::Handle
     title_label: mutable UiHandles::Handle
@@ -142,6 +155,7 @@ struct Shell:
     event_editors: mutable UiHandles::Handle[4]
     event_clear_buttons: mutable UiHandles::Handle[4]
     event_edit_dirty: mutable bool[4]
+    selected_event_index: mutable i32
     refreshing_events: mutable bool
     refreshing_source: mutable bool
     source_line_rows: mutable UiHandles::Handle[32]
@@ -149,6 +163,7 @@ struct Shell:
     source_line_count: mutable i32
     source_page_start: mutable i64
     source_selected_line: mutable i64
+    source_selected_character: mutable i32
     source_compare_mode: mutable bool
     problem_copy_button: mutable UiHandles::Handle
     problem_copy_bytes: mutable u8[16384]
@@ -167,6 +182,8 @@ struct Shell:
     hierarchy_breadcrumb_first: mutable i64
     hierarchy_breadcrumb_truncated: mutable bool
     problem_page: mutable i32
+    selected_lsp_diagnostic_index: mutable i32
+    selected_related_location_index: mutable i32
     projection: mutable ShellProjection
     status_storage: mutable u8[256]
     status_length: mutable i64
@@ -197,8 +214,93 @@ struct Shell:
     compact_mode: mutable bool
     compact_panel: mutable i32
     source_mode: mutable bool
+    standalone_source: mutable bool
     dark: mutable bool
     host_running: mutable bool
+    source_lsp_process: mutable PosixProcess::Process
+    source_lsp_started: mutable bool
+    source_lsp_restart_button: mutable UiHandles::Handle
+    source_lsp_workspace_symbols_supported: mutable bool
+    source_lsp_symbol_query_pending: mutable bool
+    source_lsp_symbol_results_ready: mutable bool
+    source_lsp_symbol_request_path_storage: mutable u8[4096]
+    source_lsp_symbol_request_path_length: mutable i32
+    source_lsp_symbol_request_fingerprint: mutable i64
+    source_lsp_symbol_request_identity_valid: mutable bool
+    source_lsp_symbol_result_count: mutable i32
+    source_lsp_symbol_selected: mutable i32
+    source_lsp_symbol_index: mutable i32
+    source_lsp_symbol_kind: mutable i32[16]
+    source_lsp_symbol_lines: mutable i32[16]
+    source_lsp_symbol_characters: mutable i32[16]
+    source_lsp_symbol_name_storage: mutable u8[2048]
+    source_lsp_symbol_name_lengths: mutable i32[16]
+    source_lsp_symbol_uri_storage: mutable u8[65536]
+    source_lsp_symbol_uri_lengths: mutable i32[16]
+    source_lsp_active_path: mutable u8[4096]
+    source_lsp_active_path_length: mutable i64
+    source_lsp_fingerprint: mutable i64
+    source_lsp_fingerprint_valid: mutable bool
+    source_lsp_poll_deadline_ms: mutable i64
+    source_lsp_line_start: mutable bool
+    source_lsp_record_type: mutable u8
+    source_lsp_tabs: mutable i32
+    source_lsp_state_candidate: mutable i32
+    source_lsp_state_length: mutable i32
+    source_lsp_number: mutable i64
+    source_lsp_number_negative: mutable bool
+    source_lsp_encoding_candidate: mutable i32
+    source_lsp_encoding_length: mutable i32
+    source_lsp_position_encoding: mutable i32
+    source_lsp_diagnostic_index: mutable i32
+    source_lsp_diagnostic_field: mutable i32
+    source_lsp_hex_high: mutable i32
+    source_lsp_related_accept_record: mutable bool
+    source_lsp_related_record_index: mutable i32
+    source_lsp_diagnostic_lines: mutable i32[128]
+    source_lsp_diagnostic_characters: mutable i32[128]
+    source_lsp_diagnostic_end_lines: mutable i32[128]
+    source_lsp_diagnostic_end_characters: mutable i32[128]
+    source_lsp_diagnostic_severities: mutable i32[128]
+    source_lsp_diagnostic_code_storage: mutable u8[8192]
+    source_lsp_diagnostic_code_lengths: mutable i32[128]
+    source_lsp_diagnostic_source_storage: mutable u8[8192]
+    source_lsp_diagnostic_source_lengths: mutable i32[128]
+    source_lsp_diagnostic_message_storage: mutable u8[65536]
+    source_lsp_diagnostic_message_lengths: mutable i32[128]
+    source_lsp_diagnostic_related_counts: mutable i32[128]
+    source_lsp_diagnostic_related_stored_counts: mutable i32[128]
+    source_lsp_diagnostic_related_lines: mutable i32[512]
+    source_lsp_diagnostic_related_characters: mutable i32[512]
+    source_lsp_diagnostic_related_uri_storage: mutable u8[131072]
+    source_lsp_diagnostic_related_uri_lengths: mutable i32[512]
+    source_lsp_diagnostic_related_message_storage: mutable u8[262144]
+    source_lsp_diagnostic_related_message_lengths: mutable i32[512]
+    source_lsp_batch_state: mutable i32
+    source_lsp_batch_version: mutable i64
+    source_lsp_batch_generation: mutable i64
+    source_lsp_batch_diagnostics: mutable i32
+    source_lsp_batch_error: mutable bool
+    source_lsp_batch_has_group: mutable bool
+    source_lsp_state: mutable i32
+    source_lsp_generation: mutable i64
+    source_lsp_version: mutable i64
+    source_lsp_version_valid: mutable bool
+    source_lsp_diagnostics: mutable i32
+    source_lsp_problems_dirty: mutable bool
+    source_lsp_definition_button: mutable UiHandles::Handle
+    source_lsp_definition_requested: mutable bool
+    source_lsp_definition_complete: mutable bool
+    source_lsp_definition_pending: mutable bool
+    source_lsp_definition_uri_storage: mutable u8[4096]
+    source_lsp_definition_uri_length: mutable i32
+    source_lsp_definition_line: mutable i64
+    source_lsp_definition_character: mutable i32
+    selected_related_count: mutable i32
+    selected_related_lines: mutable i32[4]
+    selected_related_characters: mutable i32[4]
+    selected_related_uri_storage: mutable u8[1024]
+    selected_related_uri_lengths: mutable i32[4]
     preview_resource: mutable UiResources::ResourceHandle
     preview_image: mutable UiCore::ImageRef
     preview_native_image: mutable usize
@@ -219,6 +321,15 @@ struct Shell:
     preview_frame_path: mutable u8[1024]
     build_project_path_storage: mutable u8[1024]
     build_project_path_length: mutable i64
+    building_source: mutable bool
+    building_form_revision: mutable i64
+    building_source_fingerprint: mutable i64
+    building_source_path_storage: mutable u8[4096]
+    building_source_path_length: mutable i64
+    source_artifact_valid: mutable bool
+    source_artifact_fingerprint: mutable i64
+    source_artifact_path_storage: mutable u8[4096]
+    source_artifact_path_length: mutable i64
 
 def empty_handle() -> UiHandles::Handle:
     return UiHandles::Handle{widget_id: UiFlat::NONE.u32(), tree_id: 0}
@@ -228,13 +339,13 @@ def new_shell() -> Shell:
         root: empty_handle(), menu_bar: empty_handle(), toolbar: empty_handle(), compact_navigation: empty_handle(), compact_path_row: empty_handle(),
         compact_open_path_field: empty_handle(), compact_open_button: empty_handle(), compact_save_as_button: empty_handle(), compact_new_project_button: empty_handle(),
         compact_palette_button: empty_handle(), compact_canvas_button: empty_handle(), compact_inspector_button: empty_handle(),
-        body: empty_handle(), left_pane: empty_handle(), file_list: empty_handle(), left_splitter: empty_handle(), center_pane: empty_handle(), source_pane: empty_handle(), source_title: empty_handle(), source_scroll: empty_handle(), source_find_field: empty_handle(), source_find_previous_button: empty_handle(), source_find_next_button: empty_handle(), source_replace_field: empty_handle(), source_replace_next_button: empty_handle(), source_replace_all_button: empty_handle(), source_find_match_start: 0, source_find_match_valid: false, source_goto_field: empty_handle(), source_goto_button: empty_handle(), source_conflict_bar: empty_handle(), source_conflict_message: empty_handle(), source_compare_button: empty_handle(), source_keep_buffer_button: empty_handle(), source_reload_external_button: empty_handle(), source_text: empty_handle(), source_ownership: empty_handle(), source_open_editor_button: empty_handle(), source_reveal_button: empty_handle(), source_previous_button: empty_handle(), source_next_button: empty_handle(),
+        body: empty_handle(), left_pane: empty_handle(), file_list: empty_handle(), left_splitter: empty_handle(), center_pane: empty_handle(), source_pane: empty_handle(), source_title: empty_handle(), source_lsp_status: empty_handle(), source_symbol_query: empty_handle(), source_symbol_search_button: empty_handle(), source_symbol_next_button: empty_handle(), source_symbol_status: empty_handle(), source_scroll: empty_handle(), source_find_field: empty_handle(), source_find_previous_button: empty_handle(), source_find_next_button: empty_handle(), source_replace_field: empty_handle(), source_replace_next_button: empty_handle(), source_replace_all_button: empty_handle(), source_find_match_start: 0, source_find_match_valid: false, source_goto_field: empty_handle(), source_goto_button: empty_handle(), source_conflict_bar: empty_handle(), source_conflict_message: empty_handle(), source_compare_button: empty_handle(), source_keep_buffer_button: empty_handle(), source_reload_external_button: empty_handle(), source_text: empty_handle(), source_ownership: empty_handle(), source_open_editor_button: empty_handle(), source_reveal_button: empty_handle(), source_previous_button: empty_handle(), source_next_button: empty_handle(),
         right_splitter: empty_handle(), right_pane: empty_handle(), surface_pane: empty_handle(), preview_status: empty_handle(), preview_retry_button: empty_handle(),
         preview_canvas: empty_handle(), bottom_splitter: empty_handle(),
         bottom_pane: empty_handle(), build_output: empty_handle(), inspector_list: empty_handle(), events_list: empty_handle(), event_handler_source_button: empty_handle(), palette_list: empty_handle(),
         hierarchy_list: empty_handle(), hierarchy_breadcrumb: empty_handle(), problem_list: empty_handle(), status_line: empty_handle(),
         hierarchy_previous_button: empty_handle(), hierarchy_next_button: empty_handle(), hierarchy_page_label: empty_handle(),
-        problem_previous_button: empty_handle(), problem_next_button: empty_handle(), problem_page_label: empty_handle(),
+        problem_previous_button: empty_handle(), problem_next_button: empty_handle(), problem_related_button: empty_handle(), problem_page_label: empty_handle(),
         title_label: empty_handle(), palette_search: empty_handle(), new_button: empty_handle(), new_project_button: empty_handle(),
         build_button: empty_handle(), run_button: empty_handle(), stop_button: empty_handle(), save_button: empty_handle(), source_button: empty_handle(), reload_button: empty_handle(),
         recovery_restore_button: empty_handle(), recovery_discard_button: empty_handle(),
@@ -243,11 +354,12 @@ def new_shell() -> Shell:
         hierarchy_rows: zeroed, file_rows: zeroed, hierarchy_breadcrumb_segments: zeroed, hierarchy_breadcrumb_separators: zeroed,
         palette_rows: zeroed, palette_source_indices: zeroed, inspector_rows: zeroed, inspector_editors: zeroed,
         inspector_action_buttons: zeroed, inspector_tags: zeroed, inspector_edit_dirty: zeroed,
-        refreshing_inspector: false, event_rows: zeroed, event_editors: zeroed, event_clear_buttons: zeroed, event_edit_dirty: zeroed,
-        refreshing_events: false, refreshing_source: false, source_line_rows: zeroed, source_line_offsets: zeroed, source_line_count: 0, source_page_start: 0, source_selected_line: 1, source_compare_mode: false, problem_copy_button: empty_handle(), problem_copy_bytes: zeroed, problem_copy_length: 0, problem_copy_truncated: false, file_count: 0, problem_rows: zeroed,
+        refreshing_inspector: false, event_rows: zeroed, event_editors: zeroed, event_clear_buttons: zeroed, event_edit_dirty: zeroed, selected_event_index: -1,
+        refreshing_events: false, refreshing_source: false, source_line_rows: zeroed, source_line_offsets: zeroed, source_line_count: 0, source_page_start: 0, source_selected_line: 1, source_selected_character: 0, source_compare_mode: false, problem_copy_button: empty_handle(), problem_copy_bytes: zeroed, problem_copy_length: 0, problem_copy_truncated: false, file_count: 0, problem_rows: zeroed,
         palette_count: 0, hierarchy_count: 0, inspector_count: 0, event_count: 0, problem_count: 0, build_problem_count: 0,
         hierarchy_page: 0, hierarchy_breadcrumb_count: 0, hierarchy_breadcrumb_first: 0,
         hierarchy_breadcrumb_truncated: false, problem_page: 0,
+        selected_lsp_diagnostic_index: -1, selected_related_location_index: -1,
         projection: ShellProjection{hierarchy_count: -1, palette_count: -1, inspector_count: -1, event_count: -1, problem_count: -1, node_count: -1, selection_count: -1, dirty: false},
         status_storage: zeroed, status_length: 0,
         form_title_storage: zeroed, form_title_length: 0,
@@ -260,8 +372,49 @@ def new_shell() -> Shell:
         canvas_marquee_active: false, canvas_marquee_moved: false,
         canvas_marquee_start_x: 0.0, canvas_marquee_start_y: 0.0,
         canvas_marquee_end_x: 0.0, canvas_marquee_end_y: 0.0,
-        compact_mode: false, compact_panel: 0, source_mode: false,
+        compact_mode: false, compact_panel: 0, source_mode: false, standalone_source: false,
         dark: true, host_running: false,
+        source_lsp_process: PosixProcess::Process{handle: null}, source_lsp_started: false,
+        source_lsp_restart_button: empty_handle(),
+        source_lsp_workspace_symbols_supported: false, source_lsp_symbol_query_pending: false, source_lsp_symbol_results_ready: false,
+        source_lsp_symbol_request_path_storage: zeroed, source_lsp_symbol_request_path_length: 0,
+        source_lsp_symbol_request_fingerprint: 0, source_lsp_symbol_request_identity_valid: false,
+        source_lsp_symbol_result_count: 0, source_lsp_symbol_selected: -1, source_lsp_symbol_index: -1,
+        source_lsp_symbol_kind: zeroed, source_lsp_symbol_lines: zeroed, source_lsp_symbol_characters: zeroed,
+        source_lsp_symbol_name_storage: zeroed, source_lsp_symbol_name_lengths: zeroed,
+        source_lsp_symbol_uri_storage: zeroed, source_lsp_symbol_uri_lengths: zeroed,
+        source_lsp_active_path: zeroed, source_lsp_active_path_length: 0,
+        source_lsp_fingerprint: 0, source_lsp_fingerprint_valid: false, source_lsp_poll_deadline_ms: 0,
+        source_lsp_line_start: true, source_lsp_record_type: 0, source_lsp_tabs: 0,
+        source_lsp_state_candidate: 0, source_lsp_state_length: 0, source_lsp_number: 0,
+        source_lsp_number_negative: false, source_lsp_encoding_candidate: 0,
+        source_lsp_encoding_length: 0, source_lsp_position_encoding: 16,
+        source_lsp_diagnostic_index: -1, source_lsp_diagnostic_field: 0, source_lsp_hex_high: -1,
+        source_lsp_related_accept_record: false,
+        source_lsp_related_record_index: -1,
+        source_lsp_diagnostic_lines: zeroed, source_lsp_diagnostic_characters: zeroed,
+        source_lsp_diagnostic_end_lines: zeroed, source_lsp_diagnostic_end_characters: zeroed,
+        source_lsp_diagnostic_severities: zeroed, source_lsp_diagnostic_code_storage: zeroed,
+        source_lsp_diagnostic_code_lengths: zeroed, source_lsp_diagnostic_source_storage: zeroed,
+        source_lsp_diagnostic_source_lengths: zeroed, source_lsp_diagnostic_message_storage: zeroed,
+        source_lsp_diagnostic_message_lengths: zeroed,
+        source_lsp_diagnostic_related_counts: zeroed, source_lsp_diagnostic_related_stored_counts: zeroed,
+        source_lsp_diagnostic_related_lines: zeroed,
+        source_lsp_diagnostic_related_characters: zeroed, source_lsp_diagnostic_related_uri_storage: zeroed,
+        source_lsp_diagnostic_related_uri_lengths: zeroed,
+        source_lsp_diagnostic_related_message_storage: zeroed,
+        source_lsp_diagnostic_related_message_lengths: zeroed,
+        source_lsp_batch_state: 0, source_lsp_batch_version: 0, source_lsp_batch_generation: 0, source_lsp_batch_diagnostics: 0,
+        source_lsp_batch_error: false, source_lsp_batch_has_group: false,
+        source_lsp_state: 0, source_lsp_generation: 0, source_lsp_version: 0,
+        source_lsp_version_valid: false, source_lsp_diagnostics: 0, source_lsp_problems_dirty: false,
+        source_lsp_definition_button: empty_handle(), source_lsp_definition_requested: false,
+        source_lsp_definition_complete: false,
+        source_lsp_definition_pending: false, source_lsp_definition_uri_storage: zeroed,
+        source_lsp_definition_uri_length: 0, source_lsp_definition_line: 0,
+        source_lsp_definition_character: 0,
+        selected_related_count: 0, selected_related_lines: zeroed, selected_related_characters: zeroed,
+        selected_related_uri_storage: zeroed, selected_related_uri_lengths: zeroed,
         preview_resource: UiResources::ResourceHandle{slot: 0, generation: 0},
         preview_image: UiCore::ImageRef{slot: 0, generation: 0},
         preview_native_image: 0,
@@ -273,6 +426,10 @@ def new_shell() -> Shell:
         preview_width: 0, preview_height: 0, preview_row_stride: 0,
         preview_input_path: zeroed, preview_frame_path: zeroed,
         build_project_path_storage: zeroed, build_project_path_length: 0,
+        building_source: false, building_form_revision: 0, building_source_fingerprint: 0,
+        building_source_path_storage: zeroed, building_source_path_length: 0,
+        source_artifact_valid: false, source_artifact_fingerprint: 0,
+        source_artifact_path_storage: zeroed, source_artifact_path_length: 0,
     }
 
 def shell_color(r: u8, g: u8, b: u8) -> UiCore::Color:

@@ -49,16 +49,29 @@ def decode_reply_raw(data):
         return None
     return result, data[8:]
 
-def start_signal_host(recovery_dir=None):
+def start_signal_host(recovery_dir=None, ipc_directory=None, host_cwd=None):
     environment = os.environ.copy()
     if recovery_dir is not None:
         environment["ELISA_DESIGNER_RECOVERY_DIR"] = recovery_dir
-    host_cwd = tempfile.mkdtemp(prefix="elisa-ide-host-signal-")
+    owns_cwd = host_cwd is None
+    if owns_cwd:
+        host_cwd = tempfile.mkdtemp(prefix="elisa-ide-host-signal-")
     os.makedirs(os.path.join(host_cwd, "build"), exist_ok=True)
-    process = subprocess.Popen([HOST, "--signal"], stdin=subprocess.PIPE,
+    arguments = [HOST, "--signal"]
+    request_path = None
+    reply_path = None
+    if ipc_directory is not None:
+        os.makedirs(ipc_directory, exist_ok=True)
+        request_path = os.path.join(ipc_directory, "request.txt")
+        reply_path = os.path.join(ipc_directory, "reply.bin")
+        arguments.extend([request_path, reply_path])
+    process = subprocess.Popen(arguments, stdin=subprocess.PIPE,
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                env=environment, cwd=host_cwd)
     process.elisa_ide_test_cwd = host_cwd
+    process.elisa_ide_owns_test_cwd = owns_cwd
+    process.elisa_ide_request_path = request_path
+    process.elisa_ide_reply_path = reply_path
     return process
 
 def signal_request(process, op, a0=0, a1=0, text=None, raw_hex=None, binary=False):
@@ -69,8 +82,11 @@ def signal_request(process, op, a0=0, a1=0, text=None, raw_hex=None, binary=Fals
         line += " " + raw_hex
     line += "\n"
     host_cwd = getattr(process, "elisa_ide_test_cwd", os.getcwd())
-    request_path = os.path.join(host_cwd, "build", "host_request.txt")
-    reply_path = os.path.join(host_cwd, "build", "host_reply.bin")
+    request_path = getattr(process, "elisa_ide_request_path", None)
+    reply_path = getattr(process, "elisa_ide_reply_path", None)
+    if request_path is None:
+        request_path = os.path.join(host_cwd, "build", "host_request.txt")
+        reply_path = os.path.join(host_cwd, "build", "host_reply.bin")
     os.makedirs(os.path.dirname(request_path), exist_ok=True)
     try:
         os.unlink(reply_path)
@@ -100,8 +116,29 @@ def stop_signal_host(process):
         raise AssertionError("signal-mode host exited %d: %s" %
                              (process.returncode, process.stderr.read().decode(errors="replace")))
     host_cwd = getattr(process, "elisa_ide_test_cwd", None)
-    if host_cwd is not None:
+    if host_cwd is not None and getattr(process, "elisa_ide_owns_test_cwd", True):
         shutil.rmtree(host_cwd)
+
+def check_signal_instance_isolation(check):
+    with tempfile.TemporaryDirectory(prefix="elisa-ide-host-instances-") as directory:
+        shared_cwd = os.path.join(directory, "shared-runtime")
+        os.makedirs(shared_cwd)
+        first = start_signal_host(
+            ipc_directory=os.path.join(directory, "first-session"), host_cwd=shared_cwd)
+        second = start_signal_host(
+            ipc_directory=os.path.join(directory, "second-session"), host_cwd=shared_cwd)
+        try:
+            check("private-path host instances answer independently",
+                  signal_request(first, 1)[0] == 1 and signal_request(second, 1)[0] == 1)
+            check("private-path host instances retain separate documents",
+                  signal_request(first, 10)[0] == 1
+                  and signal_request(second, 10)[0] == 1
+                  and signal_request(first, 30, 4)[0] >= 0
+                  and signal_request(first, 23)[0] == 2
+                  and signal_request(second, 23)[0] == 1)
+        finally:
+            stop_signal_host(first)
+            stop_signal_host(second)
 
 def check_signal_lifecycle(check):
     with tempfile.TemporaryDirectory(prefix="elisa-ui designer ") as directory:
@@ -775,6 +812,8 @@ def check_source_conflicts(check):
             last_base_offset = initial.rfind(b"base")
             check("source search returns exact UTF-8 byte offsets in both directions",
                   signal_request(process, 148)[0] == len(initial)
+                  and signal_request(process, 151)[1].encode("utf-8") == initial
+                  and signal_request(process, 152)[0] != 0
                   and signal_request(process, 147, 0, 1, text="😀")[0] == emoji_offset
                   and signal_request(process, 147, len(initial), 0, text="base")[0] == last_base_offset
                   and signal_request(process, 149, emoji_offset)[0] == 1
@@ -1232,6 +1271,7 @@ def main():
     check("undo restores the deleted node", after_undo == before)
 
     check_signal_lifecycle(check)
+    check_signal_instance_isolation(check)
     check_project_creation(check)
     check_recovery(check)
     check_external_changes(check)
