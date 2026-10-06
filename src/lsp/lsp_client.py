@@ -19,11 +19,15 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping
 from urllib.parse import quote
 
-if TYPE_CHECKING:
+try:
     from source import SourceDocument
+except ModuleNotFoundError as exc:
+    if exc.name != "source":
+        raise
+    from ..source import SourceDocument
 
 
 class LspError(RuntimeError):
@@ -556,7 +560,10 @@ class LspClient:
                 if len(self._stderr) > self.stderr_limit:
                     del self._stderr[: len(self._stderr) - self.stderr_limit]
                     self._stderr_truncated = True
-        except OSError:
+        except (OSError, ValueError):
+            # Session cleanup may close the buffered pipe while another
+            # thread is blocked in os.read; Python reports that race as
+            # ValueError on some supported runtimes.
             return
 
     def stderr_text(self) -> str:
@@ -1033,22 +1040,18 @@ class LspClient:
         if self.server_capabilities.document_open_close is not False:
             self.notify("textDocument/didOpen", {"textDocument": {"uri": uri, "languageId": language_id, "version": version, "text": text}})
 
-    @staticmethod
-    def _character_units(text: str, encoding: str) -> int:
-        if encoding == "utf-8":
-            return len(text.encode("utf-8"))
-        if encoding == "utf-16":
-            return len(text.encode("utf-16-le")) // 2
-        if encoding == "utf-32":
-            return len(text)
-        raise LspError(f"unsupported LSP position encoding {encoding!r}")
-
     def _end_position(self, text: str) -> dict[str, int]:
         encoding = self.server_capabilities.position_encoding
         if encoding is None:
             raise LspError("LSP server did not negotiate a position encoding")
-        lines = text.split("\n")
-        return {"line": len(lines) - 1, "character": self._character_units(lines[-1], encoding)}
+        try:
+            document = SourceDocument(text)
+            line, character = document.byte_to_position(
+                len(document.data), encoding=encoding
+            )
+        except (UnicodeError, ValueError) as exc:
+            raise LspError(f"cannot map document end to an LSP position: {exc}") from exc
+        return {"line": line, "character": character}
 
     def change_document(self, uri: str, text: str, *, version: int | None = None) -> int:
         current = self.documents.get(uri)

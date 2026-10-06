@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import textwrap
+from dataclasses import replace
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, os.path.join(ROOT, "src"))
@@ -54,7 +55,7 @@ FAKE_SERVER = textwrap.dedent(
         if method == "initialize":
             send({"jsonrpc":"2.0", "id":message["id"], "result":{
                 "serverInfo":{"name":"fake-elisa-lsp","version":"test"},
-                "capabilities":{"positionEncoding":"utf-8","textDocumentSync":1,"hoverProvider":True,
+                "capabilities":{"positionEncoding":"utf-8","textDocumentSync":2,"hoverProvider":True,
                     "definitionProvider":True,
                     "workspace":{"workspaceFolders":{"supported":True,"changeNotifications":True}},
                     "semanticTokensProvider":{"legend":{"tokenTypes":["type"],"tokenModifiers":["readonly"]}}}
@@ -80,6 +81,7 @@ FAKE_SERVER = textwrap.dedent(
             }}, fragmented=True)
         elif method == "textDocument/didChange":
             document = message["params"]["textDocument"]
+            send({"jsonrpc":"2.0", "method":"fake/didChangeSeen", "params":message["params"]})
             # A stale result and the current result share the same stream. The
             # client must retain only the matching document version.
             send({"jsonrpc":"2.0", "method":"textDocument/publishDiagnostics", "params":{
@@ -232,7 +234,7 @@ def test_client() -> None:
         assert initialized["result"]["serverInfo"]["name"] == "fake-elisa-lsp"
         assert client.capabilities["hoverProvider"] is True
         assert client.server_capabilities.position_encoding == "utf-8"
-        assert client.server_capabilities.document_sync_kind == 1
+        assert client.server_capabilities.document_sync_kind == 2
         assert client.server_capabilities.semantic_token_types == ("type",)
         assert client.server_capabilities.workspace_folders_supported is True
         assert client.server_capabilities.workspace_folder_change_notifications is True
@@ -266,7 +268,18 @@ def test_client() -> None:
             assert "workspaceSymbolProvider" in str(exc)
         else:
             raise AssertionError("unsupported workspace symbols were requested")
-        client.open_document(uri, "def main() -> i64:\n    return 0\n")
+        old_text = "a😀e\u0301\r\nnext😀"
+        for encoding, end_character in (("utf-8", 8), ("utf-16", 6), ("utf-32", 5)):
+            client.server_capabilities = replace(
+                client.server_capabilities, position_encoding=encoding
+            )
+            assert client._end_position(old_text) == {
+                "line": 1, "character": end_character
+            }
+        client.server_capabilities = replace(
+            client.server_capabilities, position_encoding="utf-8"
+        )
+        client.open_document(uri, old_text)
         note = client.wait_notification("textDocument/publishDiagnostics")
         assert note["params"]["version"] == 1
         assert client.diagnostics.diagnostics(uri)[0]["message"] == "first"
@@ -276,6 +289,11 @@ def test_client() -> None:
         assert first.end_line == 1 and first.end_character == 8
         assert first.related_information == ({"message": "related"},)
         assert client.change_document(uri, "def main() -> i64:\n    return 1\n") == 2
+        change = client.wait_notification("fake/didChangeSeen")["params"]["contentChanges"][0]
+        assert change["range"] == {
+            "start": {"line": 0, "character": 0},
+            "end": {"line": 1, "character": 8},
+        }
         client.wait_notification("textDocument/publishDiagnostics")
         client.wait_notification("textDocument/publishDiagnostics")
         assert client.diagnostics.diagnostics(uri)[0]["message"] == "current"

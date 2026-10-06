@@ -100,6 +100,21 @@ module ShellLsp:
                 append_ascii(&status, "Starting Elisa-LSP")
             else:
                 append_ascii(&status, "Elisa-LSP idle")
+            if not shell.source_lsp_workspace_symbols_supported:
+                append_ascii(&status, " | symbols unavailable")
+            elif shell.source_lsp_symbol_query_pending:
+                append_ascii(&status, " | searching symbols")
+            elif shell.source_lsp_symbol_result_count == 0:
+                append_ascii(&status, " | symbols ready")
+            else:
+                selected: mutable i32 = shell.source_lsp_symbol_selected
+                selected <- 0 if selected < 0 or selected >= shell.source_lsp_symbol_result_count
+                append_ascii(&status, " | symbols ")
+                append_number(&status, selected.i64() + 1)
+                append_ascii(&status, "/")
+                append_number(&status, shell.source_lsp_symbol_result_count.i64())
+                append_ascii(&status, " ")
+                append_ascii(&status, workspace_symbol_name(shell, selected))
             UiHandles::set_text(shell.source_lsp_status, ShellBytes::view_of(&status), 10.0, shell_color(148, 158, 180))
             UiHandles::set_enabled(shell.source_lsp_definition_button,
                 shell.source_lsp_state == 1 and shell.source_lsp_active_path_length > 0
@@ -109,23 +124,6 @@ module ShellLsp:
                 and shell.source_lsp_active_path_length > 0 and not shell.source_lsp_symbol_query_pending)
             UiHandles::set_enabled(shell.source_symbol_next_button,
                 shell.source_lsp_symbol_result_count > 0 and not shell.source_lsp_symbol_query_pending)
-            symbol_status: mutable darray[u8] = []
-            if not shell.source_lsp_workspace_symbols_supported:
-                append_ascii(&symbol_status, "Workspace symbols unavailable")
-            elif shell.source_lsp_symbol_query_pending:
-                append_ascii(&symbol_status, "Searching workspace symbols...")
-            elif shell.source_lsp_symbol_result_count == 0:
-                append_ascii(&symbol_status, "Enter a symbol query")
-            else:
-                selected: mutable i32 = shell.source_lsp_symbol_selected
-                selected <- 0 if selected < 0 or selected >= shell.source_lsp_symbol_result_count
-                append_ascii(&symbol_status, "Result ")
-                append_number(&symbol_status, selected.i64() + 1)
-                append_ascii(&symbol_status, "/")
-                append_number(&symbol_status, shell.source_lsp_symbol_result_count.i64())
-                append_ascii(&symbol_status, ": ")
-                append_ascii(&symbol_status, workspace_symbol_name(shell, selected))
-            UiHandles::set_text(shell.source_symbol_status, ShellBytes::view_of(&symbol_status), 10.0, shell_color(148, 158, 180))
 
         def append_number(out: mutable darray[u8]&, value: i64) -> void:
             if value == 0:

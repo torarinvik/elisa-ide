@@ -15,6 +15,15 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# Check the complete generated-app toolchain before building the CLI or
+# generating project sources. This keeps stale/missing compiler, runtime,
+# framework, or SDL inputs from starting a longer build that cannot succeed.
+if ! bash "$ROOT/scripts/doctor.sh" --sdl >/dev/null 2>&1; then
+  echo "project build stopped: required compiler/runtime or generated-app dependencies are not ready" >&2
+  bash "$ROOT/scripts/doctor.sh" --sdl >&2 || true
+  exit 2
+fi
+
 # The IDE path field intentionally accepts either a manifest or the project
 # directory created by New Project. Resolve a directory only when it contains
 # one unambiguous manifest; this keeps the process boundary structured while

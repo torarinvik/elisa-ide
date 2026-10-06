@@ -1,0 +1,660 @@
+# Native shell bridge to the bounded Elisa DAP worker.
+
+@link_name("designer_debug_breakpoints_load")
+extern designer_debug_breakpoints_load(path: cstr, fingerprint: i64, lines: mutable i64&, capacity: usize) -> i64 can[Blocking.IO]
+@link_name("designer_debug_breakpoints_save")
+extern designer_debug_breakpoints_save(path: cstr, fingerprint: i64, lines: i64&, count: usize) -> i64 can[Blocking.IO]
+
+module ShellDebug:
+    private:
+        const OUTPUT_CAPACITY: usize = 8192
+        const OUTPUT_CHUNK: usize = 4096
+        const POLL_INTERVAL_MS: i64 = 100
+        const SOURCE_VALIDATION_INTERVAL_MS: i64 = 1000
+
+        def append_ascii(out: mutable darray[u8]&, text: sview) -> void:
+            for index in 0..<text.len:
+                out.push(text[index].u8())
+
+        def append_number(out: mutable darray[u8]&, value: i64) -> void:
+            if value == 0:
+                out.push(48)
+                return
+            digits: mutable u8[24] = zeroed
+            count: mutable i32 = 0
+            remaining: mutable i64 = value
+            while remaining > 0 and count < 24:
+                digits[count.usize()] <- (48 + (remaining % 10)).u8()
+                remaining <- remaining / 10
+                count <- count + 1
+            index: mutable i32 = count - 1
+            while index >= 0:
+                out.push(digits[index.usize()])
+                index <- index - 1
+
+        def append_hex(out: mutable darray[u8]&, text: sview) -> void:
+            for index in 0..<text.len:
+                byte: i64 = text[index].u8().i64()
+                high: i64 = (byte >> 4) & 15
+                low: i64 = byte & 15
+                out.push((48 + high).u8() if high < 10 else (87 + high).u8())
+                out.push((48 + low).u8() if low < 10 else (87 + low).u8())
+
+        def path_cstring(path: sview) -> darray[u8]:
+            result: mutable darray[u8] = []
+            for index in 0..<path.len:
+                result.push(path[index].u8())
+            result.push(0)
+            return result
+
+        def persist_breakpoints(shell: mutable Shell&, source: sview, fingerprint: i64) -> bool:
+            can Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast:
+                path: mutable darray[u8] = path_cstring(source)
+                path_pointer: mutable cstr = ""
+                can Unsafe.PointerCast:
+                    path_pointer <- (&path[0]).cast[cstr] can Unsafe.PointerCast
+                return designer_debug_breakpoints_save(path_pointer, fingerprint,
+                    &shell.debug_breakpoint_lines[0], shell.debug_breakpoint_count.usize()) == 1
+
+        def restore_breakpoints(shell: mutable Shell&, source: sview, fingerprint: i64) -> i64:
+            can Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast:
+                path: mutable darray[u8] = path_cstring(source)
+                path_pointer: mutable cstr = ""
+                can Unsafe.PointerCast:
+                    path_pointer <- (&path[0]).cast[cstr] can Unsafe.PointerCast
+                count: i64 = designer_debug_breakpoints_load(path_pointer, fingerprint,
+                    &shell.debug_breakpoint_lines[0], 256)
+                return count if count < 0
+                shell.debug_breakpoint_count <- count.i32()
+                refresh_breakpoint_markers(shell)
+                return count
+
+        def source_matches(shell: Shell&, source: sview) -> bool:
+            return false if source.len != shell.debug_breakpoint_source_length.i64()
+            index: mutable i64 = 0
+            while index < source.len:
+                return false if source[index] != shell.debug_breakpoint_source_storage[index.usize()]
+                index <- index + 1
+            return true
+
+        def record_problem(shell: mutable Shell&, message: sview) -> void:
+            record_tool_problem(shell, PROBLEM_TOOL_DEBUGGER, 1, shell.debug_task_id, shell.debug_artifact_fingerprint, message)
+
+        def remember_source(shell: mutable Shell&, source: sview) -> bool:
+            return false if source.len <= 0 or source.len >= 4096
+            index: mutable i64 = 0
+            while index < source.len:
+                shell.debug_breakpoint_source_storage[index.usize()] <- source[index].u8()
+                index <- index + 1
+            shell.debug_breakpoint_source_storage[index.usize()] <- 0
+            shell.debug_breakpoint_source_length <- index.i32()
+            return true
+
+        def breakpoint_index(shell: Shell&, line: i64) -> i32:
+            index: mutable i32 = 0
+            while index < shell.debug_breakpoint_count:
+                return index if shell.debug_breakpoint_lines[index.usize()] == line
+                index <- index + 1
+            return -1
+
+        def gutter_prefix_for_state(line: i64, marked: bool) -> darray[u8]:
+            prefix: mutable darray[u8] = []
+            prefix.push(42 if marked else 32)
+            prefix.push(32)
+            digits: darray[u8] = []
+            append_number(&digits, line)
+            padding: mutable i32 = 6 - digits.count.i32()
+            while padding > 0:
+                prefix.push(32)
+                padding <- padding - 1
+            for index in 0..<digits.count:
+                prefix.push(digits[index])
+            append_ascii(&prefix, " | ")
+            return prefix
+
+        def starts_with_bytes(value: sview, prefix: darray[u8]) -> bool:
+            return false if value.len < prefix.count.i64()
+            index: mutable usize = 0
+            while index < prefix.count:
+                return false if value[index.i64()] != prefix[index].u8()
+                index <- index + 1
+            return true
+
+        def gutter_prefix(shell: Shell&, line: i64) -> darray[u8]:
+            return gutter_prefix_for_state(line,
+                shell.standalone_source and breakpoint_index(shell, line) >= 0)
+
+        def line_ring(shell: mutable Shell&, line: i64) -> UiCore::Color:
+            if breakpoint_index(shell, line) >= 0:
+                return shell_color(225, 84, 78)
+            severity: i32 = ShellLsp::line_severity(shell, line - 1)
+            if severity == 1:
+                return shell_color(126, 68, 65)
+            elif severity == 2:
+                return shell_color(140, 112, 56)
+            elif severity > 2:
+                return shell_color(62, 92, 132)
+            return UiCore::Color{r: 0, g: 0, b: 0, a: 0}
+
+        def refresh_breakpoint_markers(shell: mutable Shell&) -> void:
+            index: mutable i32 = 0
+            while index < shell.source_line_count:
+                line: i64 = shell.source_line_offsets[index.usize()] + 1
+                row: UiHandles::Handle = shell.source_line_rows[index.usize()]
+                UiHandles::set_ring(row, line_ring(shell, line))
+                if UiHandles::is_enabled(row):
+                    text: sview = UiHandles::text_value(row)
+                    prefix: darray[u8] = gutter_prefix(shell, line)
+                    if not starts_with_bytes(text, prefix):
+                        old_unmarked: darray[u8] = gutter_prefix_for_state(line, false)
+                        old_marked: darray[u8] = gutter_prefix_for_state(line, true)
+                        if starts_with_bytes(text, old_unmarked) or starts_with_bytes(text, old_marked):
+                            display: mutable darray[u8] = []
+                            append_ascii(&display, ShellBytes::view_of(&prefix))
+                            body: sview = string_view_slice(text, prefix.count.i64(), text.len)
+                            append_ascii(&display, body)
+                            caret: usize = UiHandles::selection_location(row)
+                            selected_length: usize = UiHandles::selection_length(row)
+                            shell.refreshing_source <- true
+                            UiHandles::replace_text(row, ShellBytes::view_of(&display))
+                            UiHandles::set_selection_utf16(row, caret, selected_length)
+                            shell.refreshing_source <- false
+                index <- index + 1
+
+        def breakpoint_spec(shell: Shell&) -> darray[u8]:
+            spec: mutable darray[u8] = []
+            index: mutable i32 = 0
+            while index < shell.debug_breakpoint_count:
+                if index > 0:
+                    spec.push(44)
+                append_number(&spec, shell.debug_breakpoint_lines[index.usize()])
+                index <- index + 1
+            return spec
+
+        def send_breakpoint_set(shell: mutable Shell&) -> bool:
+            request: mutable darray[u8] = []
+            append_ascii(&request, "BREAKPOINTS ")
+            if shell.debug_breakpoint_count == 0:
+                request.push(45)
+            else:
+                spec: darray[u8] = breakpoint_spec(shell)
+                for index in 0..<spec.count:
+                    request.push(spec[index])
+            request.push(10)
+            return send(shell, ShellBytes::view_of(&request))
+
+        def send(shell: mutable Shell&, request: sview) -> bool:
+            can Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast:
+                return false if not shell.debug_started or not PosixProcess::valid(shell.debug_process)
+                return PosixProcess::write_stdin(&shell.debug_process, request) == request.len.i64()
+
+        def send_action(shell: mutable Shell&, action: sview) -> bool:
+            request: mutable darray[u8] = []
+            append_ascii(&request, action)
+            request.push(10)
+            return send(shell, ShellBytes::view_of(&request))
+
+        def starts_with(value: sview, prefix: sview) -> bool:
+            return false if value.len < prefix.len
+            index: mutable i64 = 0
+            while index < prefix.len:
+                return false if value[index] != prefix[index]
+                index <- index + 1
+            return true
+
+        def frame_index_from_line(line: sview) -> i32:
+            return -1 if line.len < 6 or line[0] != 32 or line[1] != 32
+            selected_line: bool = line[2] == 62 and line[3] == 32 and line[4] == 35
+            ordinary_line: bool = line[2] == 32 and line[3] == 32 and line[4] == 35
+            return -1 if not selected_line and not ordinary_line
+            digit: mutable i64 = 5
+            return -1 if digit >= line.len or line[digit] < 48 or line[digit] > 57
+            value: mutable i64 = 0
+            while digit < line.len and line[digit] >= 48 and line[digit] <= 57:
+                value <- value * 10 + (line[digit] - 48)
+                return -1 if value >= 6
+                digit <- digit + 1
+            return value.i32()
+
+        def remember_snapshot(shell: mutable Shell&, response: sview) -> void:
+            shell.debug_snapshot_length <- 0
+            length: mutable i64 = response.len
+            length <- 8191 if length > 8191
+            index: mutable i64 = 0
+            while index < length:
+                shell.debug_snapshot_storage[index.usize()] <- response[index].u8()
+                index <- index + 1
+            shell.debug_snapshot_storage[index.usize()] <- 0
+            shell.debug_snapshot_length <- index.i32()
+            shell.debug_snapshot_valid <- true
+
+        def render_debug_view(shell: mutable Shell&, response: sview) -> void:
+            shell.debug_frame_count <- 0
+            shell.debug_selected_frame <- -1
+            index: mutable i32 = 0
+            while index < MAX_PROBLEM_ROWS:
+                shell.debug_frame_indices[index.usize()] <- -1
+                UiHandles::set_visible(shell.problem_rows[index.usize()], false)
+                UiHandles::set_enabled(shell.problem_rows[index.usize()], false)
+                UiHandles::set_ring(shell.problem_rows[index.usize()], UiCore::Color{r: 0, g: 0, b: 0, a: 0})
+                index <- index + 1
+
+            if not shell.debug_snapshot_valid:
+                UiHandles::set_text(shell.problem_page_label, "Threads unavailable", 11.0, shell_color(148, 158, 180))
+                UiHandles::set_text(shell.build_output, "Waiting for a debugger snapshot...", 11.0, shell_color(172, 184, 204))
+                return
+            if not contains_ascii_fold(response, "Debugger stopped"):
+                UiHandles::set_text(shell.problem_page_label, "Threads and frames appear while stopped", 11.0, shell_color(148, 158, 180))
+                if contains_ascii_fold(response, "Debugger running"):
+                    message: mutable darray[u8] = []
+                    append_ascii(&message, "Pause the debuggee (F6) to inspect threads, stack frames, and locals.\n\n")
+                    append_ascii(&message, response)
+                    UiHandles::set_text(shell.build_output, ShellBytes::view_of(&message), 11.0, shell_color(172, 184, 204))
+                else:
+                    UiHandles::set_text(shell.build_output, response, 11.0, shell_color(172, 184, 204))
+                return
+
+            locals: mutable darray[u8] = []
+            append_ascii(&locals, "Locals for selected stack frame\n")
+            line_start: mutable i64 = 0
+            collecting_locals: mutable bool = false
+            thread_summary_found: mutable bool = false
+            while line_start <= response.len:
+                line_end: mutable i64 = line_start
+                while line_end < response.len and response[line_end] != 10:
+                    line_end <- line_end + 1
+                line: sview = string_view_slice(response, line_start, line_end)
+                if starts_with(line, "  Threads: "):
+                    summary: sview = string_view_slice(line, 2, line.len)
+                    UiHandles::set_text(shell.problem_page_label, summary, 11.0, shell_color(190, 202, 220))
+                    thread_summary_found <- true
+                frame_index: i32 = frame_index_from_line(line)
+                if frame_index >= 0:
+                    collecting_locals <- false
+                    selected: bool = line[2] == 62
+                    if shell.debug_frame_count < MAX_PROBLEM_ROWS:
+                        row_index: i32 = shell.debug_frame_count
+                        row: UiHandles::Handle = shell.problem_rows[row_index.usize()]
+                        shell.debug_frame_indices[row_index.usize()] <- frame_index
+                        UiHandles::set_text(row, line, 11.0, shell_color(230, 234, 242) if selected else shell_color(182, 192, 208))
+                        help: mutable darray[u8] = []
+                        append_ascii(&help, "Select stack frame #")
+                        append_number(&help, frame_index.i64())
+                        append_ascii(&help, " to inspect its local variables")
+                        UiHandles::set_help(row, ShellBytes::view_of(&help))
+                        UiHandles::set_visible(row, true)
+                        UiHandles::set_enabled(row, shell.debug_session_active)
+                        UiHandles::set_ring(row, shell_color(94, 132, 198) if selected else UiCore::Color{r: 0, g: 0, b: 0, a: 0})
+                        shell.debug_frame_count <- shell.debug_frame_count + 1
+                    if selected:
+                        shell.debug_selected_frame <- frame_index
+                        collecting_locals <- true
+                elif collecting_locals and starts_with(line, "      "):
+                    append_ascii(&locals, string_view_slice(line, 6, line.len))
+                    locals.push(10)
+                line_start <- line_end + 1
+            if not thread_summary_found:
+                UiHandles::set_text(shell.problem_page_label, "Thread list unavailable", 11.0, shell_color(148, 158, 180))
+            if shell.debug_selected_frame < 0:
+                append_ascii(&locals, "No selected stack frame is available.")
+            UiHandles::set_text(shell.build_output, ShellBytes::view_of(&locals), 11.0, shell_color(190, 202, 220))
+            UiHandles::set_visible(shell.problem_list, true)
+            UiHandles::set_visible(shell.problem_navigation, true)
+            UiHandles::set_visible(shell.build_output, true)
+
+        def select_frame_index(shell: mutable Shell&, frame_index: i32) -> void:
+            if not shell.debug_session_active:
+                set_status_view(shell, "Start a debug session before selecting a stack frame")
+                return
+            return if frame_index < 0 or frame_index >= 6
+            request: mutable darray[u8] = []
+            append_ascii(&request, "FRAME_SELECT ")
+            append_number(&request, frame_index.i64())
+            request.push(10)
+            if not send(shell, ShellBytes::view_of(&request)):
+                set_status_view(shell, "Debugger worker rejected stack-frame selection")
+                record_problem(shell, "Debugger worker rejected stack-frame selection")
+                return
+            shell.debug_poll_deadline_ms <- 0
+
+        def show_response(shell: mutable Shell&) -> void:
+            length: mutable usize = shell.debug_output_length.usize()
+            if shell.debug_output_overflow and length >= OUTPUT_CAPACITY:
+                shell.debug_output_storage[(OUTPUT_CAPACITY - 4).usize()] <- 46
+                shell.debug_output_storage[(OUTPUT_CAPACITY - 3).usize()] <- 46
+                shell.debug_output_storage[(OUTPUT_CAPACITY - 2).usize()] <- 46
+                length <- OUTPUT_CAPACITY - 1
+            response: sview = UiText::fixed_bytes_view_range[8192](shell.debug_output_storage, 0, length)
+            remember_snapshot(shell, response)
+            UiHandles::set_text(shell.build_output, response, 11.0, shell_color(172, 184, 204))
+            UiHandles::set_visible(shell.build_output, shell.bottom_tab == 1 or shell.bottom_tab == 2)
+            if contains_ascii_fold(response, "Debugger error:") or contains_ascii_fold(response, "Debugger failed:"):
+                shell.debug_snapshot_valid <- false
+                shell.debug_frame_count <- 0
+                if shell.debug_session_active:
+                    _ = send_action(shell, "STOP")
+                shell.debug_session_active <- false
+                UiHandles::set_text(shell.run_button, "Run", 12.0, shell_color(238, 242, 252))
+                set_status_view(shell, response)
+                record_problem(shell, response)
+                select_bottom_tab(shell, 0) if shell.bottom_tab == 2
+            else:
+                _ = handle_terminal_snapshot(shell, response)
+                render_debug_view(shell, response) if shell.bottom_tab == 2
+            shell.debug_output_length <- 0
+            shell.debug_output_overflow <- false
+
+        def consume_output(shell: mutable Shell&, bytes: u8&, amount: usize) -> void:
+            index: mutable usize = 0
+            while index < amount:
+                byte: u8 = bytes[index]
+                if byte == 30:
+                    if shell.debug_output_length > 0 or shell.debug_output_overflow:
+                        show_response(shell)
+                elif shell.debug_output_length < OUTPUT_CAPACITY.i64():
+                    shell.debug_output_storage[shell.debug_output_length.usize()] <- byte
+                    shell.debug_output_length <- shell.debug_output_length + 1
+                else:
+                    shell.debug_output_overflow <- true
+                index <- index + 1
+
+        def drain(shell: mutable Shell&) -> void:
+            can Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast:
+                output: mutable darray[u8] = []
+                amount: usize = PosixProcess::read_stdout(&shell.debug_process, &output, OUTPUT_CHUNK)
+                return if amount == 0
+                consume_output(shell, &output[0], amount)
+
+        def start_worker(shell: mutable Shell&) -> bool:
+            can Blocking.IO, Memory.Allocate, Memory.Release:
+                return true if shell.debug_started and PosixProcess::valid(shell.debug_process)
+                arguments: mutable darray[cstr] = []
+                arguments.push("python3")
+                arguments.push("-u")
+                arguments.push("worker/debug/ide_debug_host.py")
+                shell.debug_process <- PosixProcess::start(&arguments)
+                shell.debug_started <- PosixProcess::valid(shell.debug_process)
+                return shell.debug_started
+
+        def start_session_request(shell: mutable Shell&, artifact: sview, source: sview, revision: i64, line: i64) -> bool:
+            request: mutable darray[u8] = []
+            append_ascii(&request, "START ")
+            append_number(&request, revision)
+            request.push(32)
+            append_number(&request, line)
+            request.push(32)
+            append_hex(&request, artifact)
+            request.push(32)
+            append_hex(&request, source)
+            request.push(32)
+            if shell.debug_breakpoint_count == 0:
+                request.push(45)
+            else:
+                spec: darray[u8] = breakpoint_spec(shell)
+                for index in 0..<spec.count:
+                    request.push(spec[index])
+            request.push(10)
+            return send(shell, ShellBytes::view_of(&request))
+
+    public:
+        def handle_terminal_snapshot(shell: mutable Shell&, response: sview) -> bool:
+            return false if not contains_ascii_fold(response, "Debuggee exited.")
+            shell.debug_session_active <- false
+            shell.debug_poll_deadline_ms <- 0
+            UiHandles::set_text(shell.run_button, "Run", 12.0, shell_color(238, 242, 252))
+            set_status_view(shell, response)
+            return true
+
+        def source_gutter_prefix(shell: Shell&, line: i64) -> darray[u8]:
+            return gutter_prefix(shell, line)
+
+        def has_breakpoint(shell: Shell&, line: i64) -> bool:
+            return breakpoint_index(shell, line) >= 0
+
+        def refresh_debug_view(shell: mutable Shell&) -> void:
+            if not shell.debug_snapshot_valid:
+                render_debug_view(shell, "")
+                return
+            response: sview = UiText::fixed_bytes_view_range[8192](shell.debug_snapshot_storage, 0, shell.debug_snapshot_length.usize())
+            render_debug_view(shell, response)
+
+        def select_frame_row(shell: mutable Shell&, row_index: i32) -> void:
+            return if row_index < 0 or row_index >= shell.debug_frame_count
+            select_frame_index(shell, shell.debug_frame_indices[row_index.usize()])
+
+        def ensure_source(shell: mutable Shell&, source: sview, source_fingerprint: i64) -> void can[Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast]:
+            path_changed: bool = shell.debug_breakpoint_source_length == 0 or not source_matches(shell, source)
+            content_changed: bool = shell.debug_breakpoint_source_fingerprint_valid and shell.debug_breakpoint_source_fingerprint != source_fingerprint
+            return if not path_changed and not content_changed
+            had_breakpoints: bool = shell.debug_breakpoint_count > 0
+            had_session: bool = shell.debug_session_active
+            if had_session:
+                stop(shell)
+            clear_breakpoints(shell)
+            restored_count: mutable i64 = 0
+            if path_changed:
+                _ = remember_source(shell, source)
+                restored_count <- restore_breakpoints(shell, source, source_fingerprint)
+                if restored_count < 0:
+                    set_status_view(shell, "Saved breakpoints could not be read; source breakpoints were cleared")
+                    record_problem(shell, "Saved breakpoints are malformed or unavailable for this source")
+            elif content_changed:
+                if not persist_breakpoints(shell, source, source_fingerprint):
+                    record_problem(shell, "Stale source breakpoints could not be removed from local storage")
+            shell.debug_breakpoint_source_fingerprint <- source_fingerprint
+            shell.debug_breakpoint_source_fingerprint_valid <- true
+            if restored_count > 0:
+                status: mutable darray[u8] = []
+                append_ascii(&status, "Restored ")
+                append_number(&status, restored_count)
+                append_ascii(&status, " source breakpoints")
+                set_status_view(shell, ShellBytes::view_of(&status))
+            elif had_session or had_breakpoints:
+                set_status_view(shell, "Debug session stopped and breakpoints cleared because the Elisa source changed")
+
+        def toggle_breakpoint(shell: mutable Shell&, line: i64) -> bool:
+            can Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast:
+                return false if line < 1 or line > 100000000
+                source: HostClient::HostReply = HostClient::request(host_process, 114, 0, 0)
+                return false if source.result != 1 or source.text.count == 0
+                source_fingerprint: i64 = HostClient::request(host_process, 152, 0, 0).result
+                ensure_source(shell, ShellBytes::view_of(&source.text), source_fingerprint)
+                found: i32 = breakpoint_index(shell, line)
+                if found >= 0:
+                    index: mutable i32 = found
+                    while index + 1 < shell.debug_breakpoint_count:
+                        shell.debug_breakpoint_lines[index.usize()] <- shell.debug_breakpoint_lines[(index + 1).usize()]
+                        index <- index + 1
+                    shell.debug_breakpoint_count <- shell.debug_breakpoint_count - 1
+                    shell.debug_breakpoint_lines[shell.debug_breakpoint_count.usize()] <- 0
+                else:
+                    return false if shell.debug_breakpoint_count >= 256
+                    shell.debug_breakpoint_lines[shell.debug_breakpoint_count.usize()] <- line
+                    shell.debug_breakpoint_count <- shell.debug_breakpoint_count + 1
+                persistence_ok: bool = persist_breakpoints(shell,
+                    ShellBytes::view_of(&source.text), source_fingerprint)
+                if not persistence_ok:
+                    record_problem(shell, "Source breakpoints could not be saved to local IDE settings")
+                refresh_breakpoint_markers(shell)
+                if shell.debug_session_active:
+                    if not send_breakpoint_set(shell):
+                        set_status_view(shell, "Breakpoint update could not reach the debugger worker")
+                        record_problem(shell, "Breakpoint update could not reach the debugger worker")
+                        return false
+                    set_status_view(shell, "Source breakpoints updated; waiting for adapter verification")
+                else:
+                    set_status_view(shell, "Source breakpoint toggled; start Debug to bind it")
+                if not persistence_ok:
+                    set_status_view(shell, "Breakpoint changed in memory but could not be saved to IDE settings")
+                return true
+
+        def clear_breakpoints(shell: mutable Shell&) -> void:
+            shell.debug_breakpoint_count <- 0
+            index: mutable i32 = 0
+            while index < 256:
+                shell.debug_breakpoint_lines[index.usize()] <- 0
+                index <- index + 1
+            refresh_breakpoint_markers(shell)
+
+        def start(shell: mutable Shell&, artifact: sview, source: sview, revision: i64, line: i64) -> bool:
+            can Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast:
+                shell.debug_task_id <- revision
+                ensure_source(shell, source, shell.debug_artifact_fingerprint)
+                if shell.debug_started and PosixProcess::valid(shell.debug_process) and shell.debug_session_active:
+                    _ = send_action(shell, "STOP")
+                if not start_worker(shell):
+                    shell.debug_session_active <- false
+                    set_status_view(shell, "Debugger worker could not start; verify Python 3 is installed")
+                    record_problem(shell, "Debugger worker could not start; verify Python 3 is installed")
+                    return false
+                shell.debug_output_length <- 0
+                shell.debug_output_overflow <- false
+                shell.debug_snapshot_length <- 0
+                shell.debug_snapshot_valid <- false
+                shell.debug_frame_count <- 0
+                shell.debug_selected_frame <- -1
+                shell.debug_session_active <- true
+                shell.debug_poll_deadline_ms <- 0
+                shell.debug_source_validation_deadline_ms <- 0
+                UiHandles::set_text(shell.run_button, "Continue", 12.0, shell_color(238, 242, 252))
+                if not start_session_request(shell, artifact, source, revision, line):
+                    shell.debug_session_active <- false
+                    UiHandles::set_text(shell.run_button, "Run", 12.0, shell_color(238, 242, 252))
+                    set_status_view(shell, "Debugger worker closed its input before launch")
+                    record_problem(shell, "Debugger worker closed its input before launch")
+                    return false
+                select_bottom_tab(shell, 2)
+                clear_tool_problem(shell, PROBLEM_TOOL_DEBUGGER)
+                set_status_view(shell, "Launching managed Elisa debugger...")
+                return true
+
+        def continue_execution(shell: mutable Shell&) -> void:
+            if not shell.debug_session_active:
+                set_status_view(shell, "Start a debug session before continuing")
+                return
+            if not send_action(shell, "CONTINUE"):
+                set_status_view(shell, "Debugger worker rejected the continue command")
+                record_problem(shell, "Debugger worker rejected the continue command")
+                return
+            shell.debug_poll_deadline_ms <- 0
+
+        def step_next(shell: mutable Shell&) -> void:
+            if not shell.debug_session_active:
+                set_status_view(shell, "Start a debug session before stepping")
+                return
+            if not send_action(shell, "NEXT"):
+                set_status_view(shell, "Debugger worker rejected the step command")
+                record_problem(shell, "Debugger worker rejected the step command")
+                return
+            shell.debug_poll_deadline_ms <- 0
+
+        def pause(shell: mutable Shell&) -> void:
+            if not shell.debug_session_active:
+                set_status_view(shell, "Start a debug session before pausing")
+                return
+            if not send_action(shell, "PAUSE"):
+                set_status_view(shell, "Debugger worker rejected the pause command")
+                record_problem(shell, "Debugger worker rejected the pause command")
+                return
+            shell.debug_poll_deadline_ms <- 0
+
+        def select_thread(shell: mutable Shell&, next: bool) -> void:
+            if not shell.debug_session_active:
+                set_status_view(shell, "Start a debug session before selecting a thread")
+                return
+            if not send_action(shell, "THREAD_NEXT" if next else "THREAD_PREV"):
+                set_status_view(shell, "Debugger worker rejected thread selection")
+                record_problem(shell, "Debugger worker rejected thread selection")
+                return
+            shell.debug_poll_deadline_ms <- 0
+
+        def select_frame(shell: mutable Shell&, next: bool) -> void:
+            if not shell.debug_session_active:
+                set_status_view(shell, "Start a debug session before selecting a stack frame")
+                return
+            if not send_action(shell, "FRAME_NEXT" if next else "FRAME_PREV"):
+                set_status_view(shell, "Debugger worker rejected stack-frame selection")
+                record_problem(shell, "Debugger worker rejected stack-frame selection")
+                return
+            shell.debug_poll_deadline_ms <- 0
+
+        def poll(shell: mutable Shell&) -> void:
+            can Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast:
+                return if not shell.debug_started or not PosixProcess::valid(shell.debug_process)
+                if shell.debug_session_active:
+                    now: i64 = PosixProcess::monotonic_ms()
+                    if now >= shell.debug_source_validation_deadline_ms:
+                        shell.debug_source_validation_deadline_ms <- now + SOURCE_VALIDATION_INTERVAL_MS
+                        source_open: i64 = HostClient::request(host_process, 113, 0, 0).result
+                        valid_identity: mutable bool = false
+                        dirty: mutable i64 = -1
+                        externally_changed: mutable i64 = -1
+                        current_revision: mutable i64 = -1
+                        if source_open == 1:
+                            dirty <- HostClient::request(host_process, 130, 0, 0).result
+                            externally_changed <- HostClient::request(host_process, 138, 0, 0).result
+                            current_source: HostClient::HostReply = HostClient::request(host_process, 114, 0, 0)
+                            current_revision <- HostClient::request(host_process, 152, 0, 0).result
+                            valid_identity <- dirty == 0 and externally_changed == 0 and current_revision == shell.debug_artifact_fingerprint and source_matches(shell, ShellBytes::view_of(&current_source.text))
+                        if not valid_identity:
+                            stop(shell)
+                            clear_breakpoints(shell)
+                            stale_message: mutable darray[u8] = []
+                            if source_open != 1:
+                                append_ascii(&stale_message, "Debug session stopped: its source document was closed; reopen the saved source and rebuild before debugging.")
+                            elif dirty != 0:
+                                append_ascii(&stale_message, "Debug session stopped: the source has unsaved edits; save and rebuild before debugging.")
+                            elif externally_changed != 0:
+                                append_ascii(&stale_message, "Debug session stopped: the source file changed on disk; compare or reload it, then rebuild before debugging.")
+                            elif current_revision != shell.debug_artifact_fingerprint:
+                                append_ascii(&stale_message, "Debug session stopped: the saved source revision no longer matches its EDIR source map; rebuild before debugging.")
+                            else:
+                                append_ascii(&stale_message, "Debug session stopped: the saved source bytes no longer match its EDIR source map; rebuild before debugging.")
+                            stale_view: sview = ShellBytes::view_of(&stale_message)
+                            set_status_view(shell, stale_view)
+                            record_problem(shell, stale_view)
+                            return
+                finished: bool = PosixProcess::poll(&shell.debug_process, 0)
+                drain(shell)
+                if finished:
+                    shell.debug_started <- false
+                    shell.debug_session_active <- false
+                    PosixProcess::dispose(&shell.debug_process)
+                    UiHandles::set_text(shell.run_button, "Run", 12.0, shell_color(238, 242, 252))
+                    UiHandles::set_text(shell.build_output, "Debugger worker exited unexpectedly.", 11.0, shell_color(235, 154, 154))
+                    UiHandles::set_visible(shell.build_output, shell.bottom_tab == 1)
+                    record_problem(shell, "Debugger worker exited unexpectedly")
+                    return
+                if shell.debug_session_active:
+                    now: i64 = PosixProcess::monotonic_ms()
+                    if now >= shell.debug_poll_deadline_ms:
+                        if send_action(shell, "POLL"):
+                            shell.debug_poll_deadline_ms <- now + POLL_INTERVAL_MS
+                        else:
+                            shell.debug_session_active <- false
+                            UiHandles::set_text(shell.run_button, "Run", 12.0, shell_color(238, 242, 252))
+                            set_status_view(shell, "Debugger worker stopped accepting commands")
+                            record_problem(shell, "Debugger worker stopped accepting commands")
+
+        def stop(shell: mutable Shell&) -> void:
+            can Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast:
+                if shell.debug_started and PosixProcess::valid(shell.debug_process):
+                    if shell.debug_session_active:
+                        _ = send_action(shell, "STOP")
+                    shell.debug_session_active <- false
+                    UiHandles::set_text(shell.run_button, "Run", 12.0, shell_color(238, 242, 252))
+                    UiHandles::set_text(shell.build_output, "Debug session stopped.", 11.0, shell_color(172, 184, 204))
+                    UiHandles::set_visible(shell.build_output, shell.bottom_tab == 1)
+
+        def shutdown(shell: mutable Shell&) -> void:
+            can Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast:
+                if not shell.debug_started or not PosixProcess::valid(shell.debug_process):
+                    return
+                _ = send_action(shell, "SHUTDOWN")
+                _ = PosixProcess::close_stdin(&shell.debug_process)
+                stopped: bool = PosixProcess::poll(&shell.debug_process, 1000)
+                if not stopped:
+                    _ = PosixProcess::cancel(&shell.debug_process)
+                PosixProcess::dispose(&shell.debug_process)
+                shell.debug_started <- false
+                shell.debug_session_active <- false

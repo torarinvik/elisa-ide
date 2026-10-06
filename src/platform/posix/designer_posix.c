@@ -1122,6 +1122,237 @@ long designer_workspace_preferences_save_ratios(double left, double right, doubl
     return saved ? 1 : 0;
 }
 
+/* Debug breakpoints are local IDE state keyed by the canonical source path.
+ * A content fingerprint prevents a moved line number from silently binding to
+ * changed source. The file name uses FNV-1a for bounded lookup; the complete
+ * path is stored as hex inside the file so a hash collision cannot overwrite
+ * another source's data. */
+#define DESIGNER_DEBUG_BREAKPOINTS_MAX 256
+#define DESIGNER_DEBUG_BREAKPOINTS_BYTES ((size_t)16384)
+
+static int designer_debug_breakpoints_source_path(const char* input, char* canonical,
+                                                   size_t canonical_capacity) {
+    if (input == NULL || canonical == NULL || canonical_capacity == 0) return 0;
+    size_t length = strnlen(input, canonical_capacity);
+    if (length == 0 || length >= canonical_capacity) return 0;
+    for (size_t index = 0; index < length; index++) {
+        unsigned char byte = (unsigned char)input[index];
+        if (byte < 0x20 || byte == 0x7f) return 0;
+    }
+    return realpath(input, canonical) != NULL;
+}
+
+static uint64_t designer_debug_breakpoints_hash(const char* path) {
+    uint64_t hash = UINT64_C(14695981039346656037);
+    for (const unsigned char* byte = (const unsigned char*)path; *byte != 0; byte++) {
+        hash ^= *byte;
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static int designer_debug_breakpoints_file_path(const char* source_path,
+                                                char* canonical,
+                                                size_t canonical_capacity,
+                                                char* output,
+                                                size_t output_capacity) {
+    if (!designer_debug_breakpoints_source_path(source_path, canonical, canonical_capacity)) return 0;
+    char config[DESIGNER_CONFIG_PATH_CAP];
+    if (!designer_preferences_config_path(config, sizeof(config))) return 0;
+    char* slash = strrchr(config, '/');
+    if (slash == NULL) {
+        memcpy(config, ".", 2);
+    } else if (slash == config) {
+        slash[1] = '\0';
+    } else {
+        *slash = '\0';
+    }
+    const char* separator = config[strlen(config) - 1] == '/' ? "" : "/";
+    int amount = snprintf(output, output_capacity, "%s%sdebug-breakpoints/%016llx.bp",
+                          config, separator,
+                          (unsigned long long)designer_debug_breakpoints_hash(canonical));
+    return amount > 0 && (size_t)amount < output_capacity;
+}
+
+static int designer_debug_breakpoints_hex_matches(const char* encoded, const char* path) {
+    static const char digits[] = "0123456789abcdef";
+    size_t length = strlen(path);
+    if (strlen(encoded) != length * 2) return 0;
+    for (size_t index = 0; index < length; index++) {
+        unsigned char byte = (unsigned char)path[index];
+        if (encoded[index * 2] != digits[byte >> 4] ||
+            encoded[index * 2 + 1] != digits[byte & 15]) return 0;
+    }
+    return 1;
+}
+
+static char* designer_debug_breakpoints_next_line(char** cursor) {
+    if (cursor == NULL || *cursor == NULL) return NULL;
+    char* result = *cursor;
+    char* newline = strchr(result, '\n');
+    if (newline == NULL) {
+        *cursor = NULL;
+    } else {
+        *newline = '\0';
+        *cursor = newline + 1;
+    }
+    return result;
+}
+
+static int designer_debug_breakpoints_existing_source(const char* file_path,
+                                                       const char* canonical_source) {
+    char* contents = NULL;
+    long amount = designer_preferences_read_file(file_path, &contents);
+    if (amount == -(long)ENOENT) return 1;
+    if (amount < 0 || contents == NULL || (size_t)amount > DESIGNER_DEBUG_BREAKPOINTS_BYTES) {
+        free(contents);
+        return 0;
+    }
+    char* cursor = contents;
+    char* version = designer_debug_breakpoints_next_line(&cursor);
+    char* fingerprint = designer_debug_breakpoints_next_line(&cursor);
+    char* source = designer_debug_breakpoints_next_line(&cursor);
+    int result = version != NULL && strcmp(version, "elisa-ide-debug-breakpoints-v1") == 0 &&
+        fingerprint != NULL && strncmp(fingerprint, "fingerprint=", 12) == 0 &&
+        source != NULL && strncmp(source, "source=", 7) == 0 &&
+        designer_debug_breakpoints_hex_matches(source + 7, canonical_source);
+    free(contents);
+    return result;
+}
+
+long designer_debug_breakpoints_load(const char* source_path, int64_t fingerprint,
+                                     int64_t* output_lines, size_t capacity) {
+    if (output_lines == NULL || capacity == 0 || capacity > DESIGNER_DEBUG_BREAKPOINTS_MAX) return -EINVAL;
+    for (size_t index = 0; index < capacity; index++) output_lines[index] = 0;
+    char canonical[DESIGNER_CONFIG_PATH_CAP];
+    char file_path[DESIGNER_CONFIG_PATH_CAP];
+    if (!designer_debug_breakpoints_file_path(source_path, canonical, sizeof(canonical),
+                                               file_path, sizeof(file_path))) return -EINVAL;
+    char* contents = NULL;
+    long amount = designer_preferences_read_file(file_path, &contents);
+    if (amount == -(long)ENOENT) return 0;
+    if (amount < 0) return amount;
+    if (contents == NULL || (size_t)amount > DESIGNER_DEBUG_BREAKPOINTS_BYTES) {
+        free(contents);
+        return -EFBIG;
+    }
+
+    char* cursor = contents;
+    char* version = designer_debug_breakpoints_next_line(&cursor);
+    char* fingerprint_line = designer_debug_breakpoints_next_line(&cursor);
+    char* source_line = designer_debug_breakpoints_next_line(&cursor);
+    char* lines_line = designer_debug_breakpoints_next_line(&cursor);
+    if (version == NULL || strcmp(version, "elisa-ide-debug-breakpoints-v1") != 0 ||
+        fingerprint_line == NULL || strncmp(fingerprint_line, "fingerprint=", 12) != 0 ||
+        source_line == NULL || strncmp(source_line, "source=", 7) != 0 ||
+        lines_line == NULL || strncmp(lines_line, "lines=", 6) != 0) {
+        free(contents);
+        return -EINVAL;
+    }
+    char* fingerprint_end = NULL;
+    errno = 0;
+    long long saved_fingerprint = strtoll(fingerprint_line + 12, &fingerprint_end, 10);
+    if (errno != 0 || fingerprint_end == fingerprint_line + 12 || *fingerprint_end != '\0') {
+        free(contents);
+        return -EINVAL;
+    }
+    if (!designer_debug_breakpoints_hex_matches(source_line + 7, canonical)) {
+        free(contents);
+        return 0;
+    }
+    if ((int64_t)saved_fingerprint != fingerprint) {
+        (void)unlink(file_path);
+        free(contents);
+        return 0;
+    }
+
+    int64_t parsed[DESIGNER_DEBUG_BREAKPOINTS_MAX] = {0};
+    size_t count = 0;
+    const char* item = lines_line + 6;
+    while (*item != '\0') {
+        if (count >= capacity) {
+            free(contents);
+            return -E2BIG;
+        }
+        errno = 0;
+        char* end = NULL;
+        long long line = strtoll(item, &end, 10);
+        if (errno != 0 || end == item || line < 1 || line > 100000000LL ||
+            (*end != '\0' && *end != ',')) {
+            free(contents);
+            return -EINVAL;
+        }
+        for (size_t prior = 0; prior < count; prior++) {
+            if (parsed[prior] == (int64_t)line) {
+                free(contents);
+                return -EINVAL;
+            }
+        }
+        parsed[count++] = (int64_t)line;
+        if (*end == '\0') break;
+        item = end + 1;
+        if (*item == '\0') {
+            free(contents);
+            return -EINVAL;
+        }
+    }
+    if (cursor != NULL && *cursor != '\0') {
+        free(contents);
+        return -EINVAL;
+    }
+    for (size_t index = 0; index < count; index++) output_lines[index] = parsed[index];
+    free(contents);
+    return (long)count;
+}
+
+long designer_debug_breakpoints_save(const char* source_path, int64_t fingerprint,
+                                     const int64_t* lines, size_t count) {
+    if (count > DESIGNER_DEBUG_BREAKPOINTS_MAX || (count > 0 && lines == NULL)) return -EINVAL;
+    char canonical[DESIGNER_CONFIG_PATH_CAP];
+    char file_path[DESIGNER_CONFIG_PATH_CAP];
+    if (!designer_debug_breakpoints_file_path(source_path, canonical, sizeof(canonical),
+                                               file_path, sizeof(file_path))) return 0;
+    if (count == 0) {
+        if (unlink(file_path) != 0 && errno != ENOENT) return 0;
+        return 1;
+    }
+    for (size_t index = 0; index < count; index++) {
+        if (lines[index] < 1 || lines[index] > 100000000) return -EINVAL;
+        for (size_t prior = 0; prior < index; prior++) {
+            if (lines[prior] == lines[index]) return -EINVAL;
+        }
+    }
+    if (!designer_debug_breakpoints_existing_source(file_path, canonical)) return 0;
+    if (!designer_preferences_ensure_parent(file_path)) return 0;
+    char output[DESIGNER_DEBUG_BREAKPOINTS_BYTES];
+    int amount = snprintf(output, sizeof(output),
+                          "elisa-ide-debug-breakpoints-v1\nfingerprint=%lld\nsource=",
+                          (long long)fingerprint);
+    if (amount < 0 || (size_t)amount >= sizeof(output)) return 0;
+    size_t length = (size_t)amount;
+    static const char digits[] = "0123456789abcdef";
+    for (const unsigned char* byte = (const unsigned char*)canonical; *byte != 0; byte++) {
+        if (length + 2 >= sizeof(output)) return 0;
+        output[length++] = digits[*byte >> 4];
+        output[length++] = digits[*byte & 15];
+    }
+    const char* prefix = "\nlines=";
+    size_t prefix_length = strlen(prefix);
+    if (length + prefix_length >= sizeof(output)) return 0;
+    memcpy(output + length, prefix, prefix_length);
+    length += prefix_length;
+    for (size_t index = 0; index < count; index++) {
+        int written = snprintf(output + length, sizeof(output) - length,
+                               "%s%lld", index == 0 ? "" : ",", (long long)lines[index]);
+        if (written < 0 || (size_t)written >= sizeof(output) - length) return 0;
+        length += (size_t)written;
+    }
+    if (length + 1 >= sizeof(output)) return 0;
+    output[length++] = '\n';
+    if (!designer_preferences_write_atomic(file_path, output, length)) return 0;
+    return 1;
+}
+
 /* -------------------------------------------------------------- process --- */
 
 #define DESIGNER_STREAM_CAP ((size_t)4 * 1024 * 1024)

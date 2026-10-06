@@ -43,6 +43,7 @@ include "../../compiler/elisacore_std/elisacore_fileio.elisa"
 
 const MAX_SOURCE_HISTORY_ENTRIES: usize = 256
 const MAX_SOURCE_HISTORY_BYTES: i64 = 8388608
+const MAX_SESSION_TEXT_EXPORT_BYTES: usize = 1048576
 
 struct SourceHistoryEntry:
     start: mutable i64
@@ -104,8 +105,8 @@ struct State:
     hierarchy_rows: mutable darray[DesignIds::DesignId]
     hierarchy_depth: mutable darray[i32]
     inspector_rows: mutable darray[DesignValues::StringRef]
-    inspector_values: mutable darray[DesignValues::StringRef]
     inspector_tags: mutable darray[i32]
+    inspector_format_text: mutable darray[u8]
     event_keys: mutable darray[DesignValues::StringRef]
     event_labels: mutable darray[DesignValues::StringRef]
     event_values: mutable darray[DesignValues::StringRef]
@@ -115,10 +116,23 @@ struct State:
 
 global mutable state: State = zeroed
 global mutable state_initialized: bool = false
+global mutable session_text_export: mutable u8[MAX_SESSION_TEXT_EXPORT_BYTES] = zeroed
 
 module DesignerSession:
     private:
         const MAX_HANDLER_SCAN_BYTES: i64 = 67108864
+
+        def selection_path_view() -> sview:
+            count: usize = state.selection_path.count
+            return "" if count == 0 or state.selection_path.items == null or count > state.selection_path.capacity
+            return "" if count > MAX_SESSION_TEXT_EXPORT_BYTES
+            index: mutable usize = 0
+            while index < count:
+                session_text_export[index] <- state.selection_path[index]
+                index <- index + 1
+            trusted Unsafe.UncheckedIndex:
+                can Unsafe.PointerCast:
+                    return unsafe_sview_bounded_bytes(&session_text_export[0], count)
 
         def initialize_state() -> void:
             return if state_initialized
@@ -166,8 +180,8 @@ module DesignerSession:
             state.hierarchy_rows <- []
             state.hierarchy_depth <- []
             state.inspector_rows <- []
-            state.inspector_values <- []
             state.inspector_tags <- []
+            state.inspector_format_text <- []
             state.event_keys <- []
             state.event_labels <- []
             state.event_values <- []
@@ -306,7 +320,6 @@ module DesignerSession:
         @link_name("designer_session_rebuild_inspector")
         def rebuild_inspector() -> void:
             state.inspector_rows.resize(0)
-            state.inspector_values.resize(0)
             state.inspector_tags.resize(0)
             index: i64 = DesignForms::find_node(state.form, state.selection.primary)
             if index < 0:
@@ -318,27 +331,15 @@ module DesignerSession:
             row: mutable i64 = 0
             descriptor_set: DesignRegistry::ComponentDescriptor = state.registry.components[component.usize()]
             DesignStore::ensure_string_refs(&state.inspector_rows, descriptor_set.properties.count + 2)
-            DesignStore::ensure_string_refs(&state.inspector_values, descriptor_set.properties.count + 2)
             DesignStore::ensure_i32(&state.inspector_tags, descriptor_set.properties.count + 2)
             while row < descriptor_set.properties.count.i64():
                 descriptor: DesignRegistry::PropertyDescriptor = descriptor_set.properties[row.usize()]
-                key_view: sview = DesignValues::text_of(state.registry.strings, descriptor.key)
-                matching: i64 = DesignNodes::property_index(node, state.form.strings, key_view)
-                value_view: mutable sview = "—"
-                if descriptor.tag != DesignValues::ValueTag.Color:
-                    if matching >= 0:
-                        value_view <- value_to_text(state.form.nodes[index.usize()].properties[matching.usize()].value, state.form.strings)
-                    else:
-                        value_view <- value_to_text(descriptor.default_value, state.registry.strings)
-                state.inspector_rows.push(DesignValues::append(&state.form.strings.bytes, key_view))
-                state.inspector_values.push(DesignValues::append(&state.form.strings.bytes, value_view))
+                state.inspector_rows.push(descriptor.key)
                 state.inspector_tags.push(descriptor.tag.i32())
                 row <- row + 1
             state.inspector_rows.push(DesignValues::append(&state.form.strings.bytes, "__displayName"))
-            state.inspector_values.push(DesignValues::append(&state.form.strings.bytes, DesignValues::text_of(state.form.strings, node.name)))
             state.inspector_tags.push(7)
             state.inspector_rows.push(DesignValues::append(&state.form.strings.bytes, "__generatedSymbol"))
-            state.inspector_values.push(DesignValues::append(&state.form.strings.bytes, DesignValues::text_of(state.form.strings, node.symbol)))
             state.inspector_tags.push(7)
 
         # Rebuild the event projection for the primary selection. Every
@@ -383,39 +384,39 @@ module DesignerSession:
             if value.tag == DesignValues::ValueTag.Bool:
                 return "true" if value.bool_value else "false"
             if value.tag == DesignValues::ValueTag.Integer:
-                text: mutable darray[u8] = []
-                DesignText::push_i64(&text, value.int_value)
-                reference: DesignValues::StringRef = DesignValues::append(&state.form.strings.bytes, DesignText::view_of(text))
-                return DesignValues::text_of(state.form.strings, reference)
+                state.inspector_format_text.resize(0)
+                DesignStore::ensure_bytes(&state.inspector_format_text, 64)
+                DesignText::push_i64(&state.inspector_format_text, value.int_value)
+                return DesignText::view_of_ref(&state.inspector_format_text)
             if value.tag == DesignValues::ValueTag.Scalar or value.tag == DesignValues::ValueTag.Length:
-                text: mutable darray[u8] = []
+                state.inspector_format_text.resize(0)
+                DesignStore::ensure_bytes(&state.inspector_format_text, 64)
                 number: f64 = value.scalar_value
                 negative: bool = number < 0.0
                 magnitude: f64 = -number if negative else number
                 whole: mutable i64 = magnitude.i64()
                 if negative:
-                    text.push(45)
-                DesignText::push_i64(&text, whole)
+                    state.inspector_format_text.push(45)
+                DesignText::push_i64(&state.inspector_format_text, whole)
                 fraction_value: f64 = (magnitude - whole.f64()) * 1000000.0
                 fraction: mutable i64 = (fraction_value + 0.5).i64()
                 if fraction >= 1000000:
                     whole <- whole + 1
-                    text.resize(0)
+                    state.inspector_format_text.resize(0)
                     if negative:
-                        text.push(45)
-                    DesignText::push_i64(&text, whole)
+                        state.inspector_format_text.push(45)
+                    DesignText::push_i64(&state.inspector_format_text, whole)
                     fraction <- 0
                 if fraction > 0:
-                    text.push(46)
+                    state.inspector_format_text.push(46)
                     divisor: mutable i64 = 100000
                     while divisor > 0:
                         digit: i64 = (fraction / divisor) % 10
-                        text.push((48 + digit).u8())
+                        state.inspector_format_text.push((48 + digit).u8())
                         divisor <- divisor / 10
-                    while text.count > 0 and text[text.count - 1] == 48:
-                        text.resize(text.count - 1)
-                reference: DesignValues::StringRef = DesignValues::append(&state.form.strings.bytes, DesignText::view_of(text))
-                return DesignValues::text_of(state.form.strings, reference)
+                    while state.inspector_format_text.count > 0 and state.inspector_format_text[state.inspector_format_text.count - 1] == 48:
+                        state.inspector_format_text.resize(state.inspector_format_text.count - 1)
+                return DesignText::view_of_ref(&state.inspector_format_text)
             return DesignValues::text_of(strings, value.text_ref)
 
         @link_name("designer_session_rebuild_problems_filtered")
@@ -2931,20 +2932,52 @@ module DesignerSession:
         def inspector_count() -> i64:
             return state.inspector_rows.count.i64()
 
+        def inspector_key_text(row: i64) -> sview:
+            return "" if row < 0 or row >= state.inspector_rows.count.i64()
+            if state.inspector_tags[row.usize()] == 7:
+                return DesignValues::text_of(state.form.strings, state.inspector_rows[row.usize()])
+            return DesignValues::text_of(state.registry.strings, state.inspector_rows[row.usize()])
+
         @link_name("designer_session_inspector_label")
         def inspector_label(row: i64) -> sview:
             if row < 0 or row >= state.inspector_rows.count.i64():
                 return ""
-            key: sview = DesignValues::text_of(state.form.strings, state.inspector_rows[row.usize()])
+            key: sview = inspector_key_text(row)
             return "Display name" if DesignText::equal(key, "__displayName")
             return "Generated symbol" if DesignText::equal(key, "__generatedSymbol")
             return key
 
         @link_name("designer_session_inspector_value")
         def inspector_value(row: i64) -> sview:
-            if row < 0 or row >= state.inspector_values.count.i64():
+            if row < 0 or row >= state.inspector_rows.count.i64():
                 return ""
-            return DesignValues::text_of(state.form.strings, state.inspector_values[row.usize()])
+            node_index: i64 = DesignForms::find_node(state.form, state.selection.primary)
+            return "" if node_index < 0
+            key: sview = inspector_key_text(row)
+            if state.inspector_tags[row.usize()] == 7:
+                if DesignText::equal(key, "__displayName"):
+                    return DesignValues::text_of(state.form.strings, state.form.nodes[node_index.usize()].name)
+                return DesignValues::text_of(state.form.strings, state.form.nodes[node_index.usize()].symbol)
+            component: i64 = DesignRegistry::find_component(state.registry, DesignValues::text_of(state.form.strings, state.form.nodes[node_index.usize()].type_key))
+            return "" if component < 0
+            descriptor_index: i64 = DesignRegistry::find_property(state.registry, component, key)
+            return "" if descriptor_index < 0
+            descriptor: DesignRegistry::PropertyDescriptor = state.registry.components[component.usize()].properties[descriptor_index.usize()]
+            return "—" if descriptor.tag == DesignValues::ValueTag.Color
+            matching: i64 = DesignNodes::property_index(state.form.nodes[node_index.usize()], state.form.strings, key)
+            if matching >= 0:
+                stored: DesignValues::DesignValue = state.form.nodes[node_index.usize()].properties[matching.usize()].value
+                if stored.tag == DesignValues::ValueTag.Bool:
+                    return "true" if stored.bool_value else "false"
+                if stored.tag == DesignValues::ValueTag.Text or stored.tag == DesignValues::ValueTag.EnumKey or stored.tag == DesignValues::ValueTag.NodeRef or stored.tag == DesignValues::ValueTag.Unsupported:
+                    return DesignValues::text_of(state.form.strings, stored.text_ref)
+                return value_to_text(stored, state.form.strings)
+            default_value: DesignValues::DesignValue = descriptor.default_value
+            if default_value.tag == DesignValues::ValueTag.Bool:
+                return "true" if default_value.bool_value else "false"
+            if default_value.tag == DesignValues::ValueTag.Text or default_value.tag == DesignValues::ValueTag.EnumKey or default_value.tag == DesignValues::ValueTag.NodeRef or default_value.tag == DesignValues::ValueTag.Unsupported:
+                return DesignValues::text_of(state.registry.strings, default_value.text_ref)
+            return value_to_text(descriptor.default_value, state.registry.strings)
 
         @link_name("designer_session_inspector_tag")
         def inspector_tag(row: i64) -> i32:
@@ -2963,7 +2996,7 @@ module DesignerSession:
         def set_inspector_text(row: i64, text: sview) -> bool:
             if row < 0 or row >= state.inspector_rows.count.i64() or DesignIds::is_empty(state.selection.primary):
                 return false
-            key: sview = DesignValues::text_of(state.form.strings, state.inspector_rows[row.usize()])
+            key: sview = inspector_key_text(row)
             tag: i32 = state.inspector_tags[row.usize()]
             index: i64 = DesignForms::find_node(state.form, state.selection.primary)
             if index < 0:
@@ -3333,7 +3366,7 @@ module DesignerSession:
                 while index < empty_path.len:
                     state.selection_path.push(empty_path[index])
                     index <- index + 1
-                return DesignText::view_of(state.selection_path)
+                return selection_path_view()
 
             target_depth: i32 = state.hierarchy_depth[primary_row.usize()]
             required: mutable usize = 1
@@ -3373,7 +3406,7 @@ module DesignerSession:
                         state.selection_path.push(path_label[append_index])
                         append_index <- append_index + 1
                 level <- level + 1
-            return DesignText::view_of(state.selection_path)
+            return selection_path_view()
 
         @link_name("designer_session_selection_ancestor_count")
         def selection_ancestor_count() -> i64:

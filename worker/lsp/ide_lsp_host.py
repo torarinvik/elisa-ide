@@ -106,7 +106,16 @@ class IdeLspHost:
         self.environment = dict(os.environ if environment is None else environment)
         self.workspaces: dict[str, WorkspaceState] = {}
         self.documents: dict[str, str] = {}
+        self.active_document_uri: str | None = None
+        self.active_workspace_root: str | None = None
         self.stopping = False
+
+    def _select_document(self, source_path: Path) -> str:
+        uri = source_path.as_uri()
+        root = _project_root(source_path)
+        self.active_document_uri = uri
+        self.active_workspace_root = os.fspath(root)
+        return uri
 
     def _state_for(self, source_path: Path) -> WorkspaceState:
         root = _project_root(source_path)
@@ -156,7 +165,7 @@ class IdeLspHost:
             raise ValueError("LSP source path must be an absolute .elisa path")
         if len(source_text.encode("utf-8")) > MAX_SOURCE_BYTES:
             raise ValueError("LSP source exceeds the 1 MiB buffer limit")
-        uri = source_path.as_uri()
+        uri = self._select_document(source_path)
         state = self._state_for(source_path)
         if uri in self.documents:
             self.change_document(path_text, source_text)
@@ -174,7 +183,7 @@ class IdeLspHost:
 
     def change_document(self, path_text: str, source_text: str) -> None:
         source_path = Path(path_text).expanduser().resolve(strict=False)
-        uri = source_path.as_uri()
+        uri = self._select_document(source_path)
         if uri not in self.documents:
             self.open_document(path_text, source_text)
             return
@@ -211,7 +220,7 @@ class IdeLspHost:
             raise ValueError("LSP definition path must be an absolute .elisa path")
         if line < 0 or character < 0 or line > 100_000_000 or character > 100_000_000:
             raise ValueError("LSP definition position is outside the supported range")
-        uri = source_path.as_uri()
+        uri = self._select_document(source_path)
         root_key = self.documents.get(uri)
         state = self.workspaces.get(root_key) if root_key is not None else None
         if state is None or state.workspace is None:
@@ -251,7 +260,7 @@ class IdeLspHost:
             raise ValueError("LSP symbol search path must be an absolute .elisa path")
         if not query or len(query.encode("utf-8")) > 256:
             raise ValueError("LSP symbol query must contain 1 to 256 UTF-8 bytes")
-        uri = source_path.as_uri()
+        uri = self._select_document(source_path)
         root_key = self.documents.get(uri)
         state = self.workspaces.get(root_key) if root_key is not None else None
         if state is None or state.workspace is None:
@@ -315,6 +324,8 @@ class IdeLspHost:
         root_key = self.documents.pop(uri, None)
         if root_key is None:
             return
+        if self.active_document_uri == uri:
+            self.active_document_uri = None
         state = self.workspaces[root_key]
         state.buffers.pop(uri, None)
         if state.workspace is not None:
@@ -420,9 +431,15 @@ class IdeLspHost:
                         state.error = failure.message[:MAX_FIELD_BYTES]
                 if state.workspace is not None:
                     state.workspace.refresh_problems()
+            # The native shell presents one source buffer at a time. A
+            # workspace can retain other documents for cross-file server
+            # context, but their versions and diagnostics must not overwrite
+            # the active editor's projection.
+            if os.fspath(state.root) != self.active_workspace_root:
+                continue
             records.append(self._status_record(state))
-            for uri in state.buffers:
-                records.extend(self._document_records(state, uri))
+            if self.active_document_uri is not None and self.active_document_uri in state.buffers:
+                records.extend(self._document_records(state, self.active_document_uri))
         encoded_size = sum(len(record.encode("utf-8")) + 1 for record in records)
         if encoded_size > MAX_OUTPUT_BATCH_BYTES:
             raise ValueError("LSP response exceeds the 2 MiB batch limit")

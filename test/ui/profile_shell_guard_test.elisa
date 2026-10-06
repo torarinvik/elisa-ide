@@ -1,0 +1,133 @@
+# Focused retained-shell test for the profiler's dirty-source guard.
+
+include "shell_test_platform.elisa"
+include "preview_image_test_adapter.elisa"
+include "../../framework/src/test/ui_harness.elisa"
+include "../../src/shell/shell_app.elisa"
+
+global mutable profile_guard_failure: i64 = 0
+
+@link_name("designer_setenv")
+extern profile_guard_setenv(name: cstr, value: cstr) -> i64
+
+@link_name("designer_report_i64")
+extern profile_guard_report_i64(label: cstr, value: i64) -> void
+
+@link_name("designer_report_text")
+extern profile_guard_report_text(text: cstr) -> void
+
+def expect_profile_guard(condition: bool, code: i64) -> void:
+    if not condition and profile_guard_failure == 0:
+        profile_guard_failure <- code
+
+def profile_guard_report_view(text: sview) -> void can[Memory.Allocate, Memory.Release, Unsafe.PointerCast]:
+    bytes: mutable darray[u8] = []
+    for index in 0..<text.len:
+        bytes.push(text[index].u8())
+    bytes.push(0)
+    pointer: mutable cstr = ""
+    can Unsafe.PointerCast:
+        pointer <- (&bytes[0]).cast[cstr] can Unsafe.PointerCast
+    profile_guard_report_text(pointer)
+
+def app_init() -> void:
+    _ = profile_guard_setenv("ELISA_IDE_CONFIG", "build/profile-shell-guard/preferences.json")
+    init(shell)
+
+def app_widget_event(widget: usize, event: i32) -> void:
+    widget_event(shell, widget, event)
+
+def app_event(event: UiCore::Event) -> void:
+    handle_shell_event(shell, event)
+
+def app_text_input(text: sview) -> void:
+    UiHandles::insert_text(text)
+
+def app_text_editing(text: sview, selected_start: i32, selected_length: i32) -> void:
+    UiHandles::update_marked_text_utf8_characters(text, selected_start, selected_length)
+
+def app_frame() -> void:
+    frame(shell)
+
+def profile_guard_status() -> sview:
+    return "" if shell.status_length <= 0 or shell.status_length > 256
+    can Unsafe.PointerCast:
+        return UiText::unsafe_sview_bounded_bytes(&shell.status_storage[0], shell.status_length.usize())
+
+def click_profile_guard(handle: UiHandles::Handle) -> void:
+    return if not UiHandles::is_valid(handle) or not UiHandles::is_visible(handle) or not UiHandles::is_enabled(handle)
+    if UiHandles::widget(handle) is widget:
+        x: f32 = widget.x + widget.width * 0.5
+        y: f32 = widget.y + widget.height * 0.5
+        UiHarness::dispatch(UiCore::PointerEvent.Down(at: UiCore::Vec2(x, y), button: UiCore::PointerButton.Primary.i32()))
+        UiHarness::dispatch(UiCore::PointerEvent.Up(at: UiCore::Vec2(x, y), button: UiCore::PointerButton.Primary.i32()))
+
+def shutdown_profile_guard() -> void:
+    ShellLsp::stop(shell)
+    ShellPreview::stop(shell)
+    if shell.host_running:
+        HostClient::stop(&host_process)
+        _ = PosixProcess::poll(&host_process, 1000)
+        PosixProcess::dispose(&host_process)
+        shell.host_running <- false
+    UiHarness::stop()
+
+def main() -> i64:
+    UiHarness::start(600.0, 760.0)
+    UiHarness::focus_gained()
+    source_path: sview = "test/fixtures/source_task_fixture.elisa"
+    opened_source: HostClient::HostReply = HostClient::request_text(host_process, 112, 0, 0, source_path)
+    if opened_source.result == 1:
+        shell.source_page_start <- 0
+        shell.source_mode <- true
+        shell.standalone_source <- true
+        apply_shell_layout(shell)
+        refresh_all(shell, host_process)
+    UiHandles::layout(UiCore::viewport_width(), UiCore::viewport_height())
+    expect_profile_guard(opened_source.result == 1 and shell.compact_mode
+        and shell.source_mode and shell.standalone_source
+        and UiHandles::is_valid(shell.profile_button)
+        and UiHandles::is_visible(shell.profile_button)
+        and UiHandles::is_enabled(shell.profile_button), 1)
+
+    source_row: UiHandles::Handle = shell.source_line_rows[2.usize()]
+    focused: bool = UiHandles::request_focus(source_row)
+    UiHandles::set_selection_utf16(source_row, 0, UiFlat::text_utf16_length(source_row.widget_id.usize()))
+    app_text_input("3: def main() -> i64: # dirty profile guard test")
+    app_widget_event(source_row.widget_id.usize(), UiConst::WidgetEvent.Change.i32())
+    expect_profile_guard(focused and HostClient::request(host_process, 130, 0, 0).result == 1, 2)
+    app_frame()
+    expect_profile_guard(UiHandles::is_visible(shell.profile_button)
+        and UiHandles::is_enabled(shell.profile_button), 3)
+    click_profile_guard(shell.profile_button)
+    refused: mutable bool = not BuildJob::is_running(&build_job)
+    if shell.status_length < 1 or shell.status_length > 256:
+        refused <- false
+    elif not profile_guard_status_matches("Save the source file before profiling it"):
+        refused <- false
+    if not refused:
+        profile_guard_report_i64("build_running=", 1 if BuildJob::is_running(&build_job) else 0)
+        profile_guard_report_view(profile_guard_status())
+    expect_profile_guard(refused, 4)
+
+    shutdown_profile_guard()
+    if profile_guard_failure != 0:
+        profile_guard_report_i64("profile shell guard assertion=", profile_guard_failure)
+        return 1
+    profile_guard_report_i64("profile shell guard assertions passed=", 4)
+    return 0
+
+def profile_guard_status_matches(needle: sview) -> bool:
+    status: sview = profile_guard_status()
+    return false if needle.len == 0 or status.len < needle.len
+    start: mutable i64 = 0
+    while start + needle.len <= status.len:
+        matched: mutable bool = true
+        for offset in 0..<needle.len:
+            if status[start + offset] != needle[offset]:
+                matched <- false
+                break
+        if matched:
+            return true
+        start <- start + 1
+    return false

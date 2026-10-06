@@ -218,6 +218,44 @@ def test_native_sidecar_reports_current_versioned_diagnostics() -> None:
             if not any("646961676e6f737469632076657273696f6e2032" in record for record in restarted):
                 restarted = _wait_for_diagnostic(process, "646961676e6f737469632076657273696f6e2032")
 
+            # Keep the target open to provide cross-file server context. The
+            # sidecar protocol must still project only the currently selected
+            # source buffer's version and diagnostics to the native shell.
+            process.stdin.write(_command("OPEN", os.fspath(definition_path), "module target = 1\n"))
+            process.stdin.flush()
+            target_open = _batch(process)
+            target_uri_hex = definition_path.resolve().as_uri().encode("utf-8").hex()
+            source_uri_hex = source_path.resolve().as_uri().encode("utf-8").hex()
+            assert any(record.startswith(f"G\t{target_uri_hex}\t1\t") for record in target_open), target_open
+            assert not any(record.startswith(f"G\t{source_uri_hex}\t") for record in target_open), target_open
+
+            process.stdin.write(_command("CHANGE", os.fspath(source_path), "main = 2\n"))
+            process.stdin.flush()
+            source_reselected = _batch(process)
+            if not any(record.startswith(f"G\t{source_uri_hex}\t3\t1") for record in source_reselected):
+                source_reselected = _wait_for_diagnostic(
+                    process, "646961676e6f737469632076657273696f6e2033"
+                )
+            assert any(record.startswith(f"G\t{source_uri_hex}\t3\t1") for record in source_reselected), source_reselected
+            assert not any(record.startswith(f"G\t{target_uri_hex}\t") for record in source_reselected), source_reselected
+
+            second_root = root / "second workspace"
+            second_root.mkdir()
+            second_path = second_root / "second.elisa"
+            second_path.write_text("module second = 1\n", encoding="utf-8")
+            process.stdin.write(_command("OPEN", os.fspath(second_path), "module second = 1\n"))
+            process.stdin.flush()
+            second_workspace = _batch(process)
+            second_uri_hex = second_path.resolve().as_uri().encode("utf-8").hex()
+            assert any(record.startswith(f"G\t{second_uri_hex}\t1\t") for record in second_workspace), second_workspace
+            assert not any(record.startswith(f"G\t{source_uri_hex}\t") for record in second_workspace), second_workspace
+
+            process.stdin.write(_command("CHANGE", os.fspath(source_path), "main = 3\n"))
+            process.stdin.flush()
+            first_workspace_reselected = _batch(process)
+            assert any(record.startswith(f"G\t{source_uri_hex}\t4\t") for record in first_workspace_reselected), first_workspace_reselected
+            assert not any(record.startswith(f"G\t{second_uri_hex}\t") for record in first_workspace_reselected), first_workspace_reselected
+
             process.stdin.write(_command("CLOSE", os.fspath(source_path)))
             process.stdin.flush()
             closed = _batch(process)

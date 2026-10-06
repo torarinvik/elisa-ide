@@ -48,22 +48,19 @@ optimization trials. The preview worker compiles with Elisa `-O2` by default;
 optimization level alongside the Skia build identity.
 `build/provenance-preview-worker.json` records its compiler and optimization
 level.
-The ignored `compiler` symlink points at the newest available stage1 checkout,
-`../Elisa-compiler`, revision
-`b903bd1e700aa2acda4925b59efd1ee60389431a` on `main`, verified against the
-upstream `origin/main`. Its compiler product, runtime, and current source
-fingerprint pass the toolchain freshness check. The latest upstream commit only
-changes the differential-corpus timeout scaling; the compiler-source
-fingerprint is unchanged. The verified source fingerprint is
-`f085098e24fbf4f94f67a07afb124bc74eee45b1551f14f71c18628a27ed3335`, stage1
-SHA256 `734fad7984b0c6de3b50e6d57585e3c8573f975c33e4560f647a1209f9ed828d`,
-and runtime SHA256 `0db509f791ec1b075049dadc51a44f6e51e93e7c8fa9e6db4acbc336b7de022e`.
-The current AppKit + Skia bundle builds and signs with that compiler at `-O0`.
-The core and Skia doctor checks pass; the Skia check reports that the sibling
-`elisa-ui` checkout is dirty, so its build evidence is not fully reproducible.
-The generated-project shell integration passes all 163 assertions, including
-Build/Run job handling and source-map selection; focused command and codec tests
-also pass. Live Skia preview image binding has been verified. In the running
+The embedded compiler checkout is on `codex/edir-host-effects` at
+`6b475d894331f0a81c3112167ef7fcf5c642a424`, nine commits ahead of the latest
+fetched `origin/main` (`72a752820ab581d46bb17b3fb7158ba3879a16e3`). The local
+commits add the bounded EDIR host-effect support used by the debugger, plus
+subsequent compiler fixes; `origin/main` is an ancestor of this checkout. The
+stage1 wrapper rejects a product when its compiler source or runtime provenance
+is stale. Stage1 was freshly seeded from this checkout and its source/runtime
+provenance checks pass. The generated application and Skia IDE bundle were then
+built without a stale-stage1 override using compiler revision
+`6b475d894331f0a81c3112167ef7fcf5c642a424`; the debugger's EDIR path uses `-O2`
+and verifies the artifact before launch. The Skia check reports that the sibling
+`elisa-ui` checkout is dirty, so its build evidence is not fully reproducible. Live Skia preview image
+binding has been verified. In the running
 macOS app, inserting a Button from the component palette reached `Preview
 ready`, and the preview displayed the Button upright at the top of its Column.
 Clicking that rendered Button after selecting the root changed hierarchy
@@ -132,9 +129,141 @@ buffer edits and detected external file changes block Build or Run until the
 source is saved or reconciled. The Run process is supervised like a build, and
 its stdout/stderr are appended once to the bounded Build Output log.
 
-Advanced source editing and debugger/profiler connections remain
-planned; the DAP transport and profiler artifact reader now provide the bounded
-process/data foundations. `src/lsp/server_resolution.py` selects and hashes the
+For a saved source file inside a local `elisapkg` package, press
+**Ctrl/Cmd+Shift+T** to inspect declared test targets, the default target,
+resolved package-manager identity, exact offline command, and working
+directory. That first activation only creates a read-only plan. Press the
+shortcut again within 30 seconds to approve the same package manifest, selected
+target, and package-manager binary and run that target. The approval also binds
+a bounded SHA-256 fingerprint of package files and reachable local path
+dependencies. The task runner rechecks those inputs after completion, supervises
+the package manager as a process group, and makes **Stop** terminate and reap
+its descendants. Output appears in Build Output; failures appear in Problems,
+and results are marked stale if either the open source or package inputs change
+during the run. The input scan ignores top-level `.git`, `.elisa-ide`, `.cache`,
+`build`, `target`, and `__pycache__` directories; it refuses symlinks, special
+files, registry dependencies, and non-empty dev-dependencies, and caps the
+package graph at 128 local packages, 20,000 files, and 512 MiB. Target selection
+is available with **Ctrl/Cmd+Option+Shift+T**; the refreshed preview names the
+selected target, and **Ctrl/Cmd+Shift+T** approves/runs it. Recent-run history
+is available with **Ctrl/Cmd+Option+Shift+H**. The recent-run list shows up to
+eight of at most 64 private, atomic records; **Ctrl/Cmd+Option+Shift+J/K** moves
+through run details and back to the list. Each detail includes its target, task
+and input identities, command, working directory, and bounded stdout/stderr
+captures (6 KiB per stream, with truncation marked). Terminal control bytes are
+escaped before display. Records are stored under the package's private
+`.elisa-ide/package-test-history/` directory; only environment-variable names
+are stored, never values. This is target-level history; test-case-level states
+are shown only when `elisapkg` includes them in its output, and a richer
+interactive test explorer remains future work.
+
+Press **Ctrl/Cmd+Option+Shift+D** to run **Toolchain Doctor** from the IDE. Its
+Build Output report checks the selected Elisa stage1 compiler against its source
+and runtime freshness records and lists missing native build dependencies with
+repair commands. Project builds run the same SDL-profile preflight before
+generation, so an invalid compiler/runtime pair fails quickly with the doctor
+report instead of starting a longer build.
+
+### Managed debugger (early)
+
+For a saved standalone `.elisa` file, the Run control becomes **Debug**. It
+builds optimized EDIR with the current, freshness-checked stage1 compiler and
+launches the managed adapter selected through `ELISA_DEBUGGER_DAP`, a trusted
+nearby debugger build, or `PATH`. Right-click a source line to toggle its red
+breakpoint marker; changes are sent to the running DAP session and the adapter's
+verification appears in Build Output. Breakpoints are scoped to the open source
+file and cleared when its path or content changes. F5 starts Debug,
+F8 continues, F10 steps to the next source line, F6 pauses, and **Stop** ends the
+session. **Ctrl/Cmd+Shift+F5** explicitly restarts debugging by rebuilding EDIR
+for the current saved source before starting a new DAP session. It refuses dirty
+or externally changed source, so a restart cannot reuse an artifact from an
+earlier source revision. While stopped, Build Output shows the stop reason, bounded stack, and
+top-frame locals. The shell stops a session if the saved source becomes dirty,
+changes externally, or no longer matches the verified EDIR build.
+
+This first debugger path supports only the bounded EDIR shapes currently emitted
+by the compiler. Attach, conditional/log breakpoints, selectable threads/frames,
+and dedicated structured debugger panes are not implemented yet.
+
+### Managed profiler (initial)
+
+Open a saved standalone `.elisa` file and select **Profile** in the source
+header. Elisa IDE resolves `elisa-profiler` from `ELISA_PROFILER`, a nearby
+`../Elisa-profiler/bin/elisa-profiler`, or `PATH`, then starts a cancellable
+capture job. The default launch records one function-mode repetition with a
+30-second target limit. A project can select a saved launch configuration in
+`.elisa-ide/profile-launches.json`; its target must resolve to the exact saved
+source currently open. Configurations can set collection mode, repetitions,
+warmups, target timeout, sample period, working directory, stdin, target
+arguments, environment overrides, random seed, and profile output folder.
+Unknown fields, invalid paths, profiler transport variables, and configurations
+for another open source are rejected before a capture starts. Environment values
+in this local JSON file are plain text, so do not put secrets there. The IDE
+rejects unsaved or externally changed input and checks the artifact's
+`workload.source_sha256` against the captured source. Successful captures are
+stored under the user's private Elisa IDE Profiles directory
+(`~/Library/Application Support/Elisa IDE/Profiles` on macOS, or the XDG data
+directory on Linux) unless `output_directory` is set; the explicit
+`ELISA_IDE_PROFILE_ROOT` setting takes precedence. Each run has a unique name.
+Each capture also has an adjacent owner-only `.task.json` record with the
+configuration, target, terminal state, profiler/compiler hashes, and reported
+capability coverage; environment values are omitted.
+Build Output shows
+capture quality, measured event categories, target execution time when present,
+the top reported functions, compiler revision, stage1/runtime hashes, and
+artifact/tool hashes.
+It also shows the capture's event and capability coverage. A function-mode
+launch marks sampling and allocation disabled, task lifecycle unsupported, and
+native-frame unwinding and attach unavailable; fields the profiler does not
+report remain labeled **not recorded**.
+Stopping a capture terminates its process group, and a profiler recovery
+manifest is retained when one was written before cancellation.
+After a current capture, **Profile** becomes **Open Report**. The report is
+rendered from the newest validated capture for the unchanged saved source and
+opened with the configured viewer. HTML is the default; text, folded, and
+Speedscope formats are selectable with `ELISA_IDE_PROFILE_REPORT_FORMAT`.
+If a capture is interrupted and leaves a private, source-matching partial
+manifest, the same toolbar control becomes **Recover**. Recovery keeps only the
+profiler's complete framed records, validates that the saved source still has
+the recorded digest, and writes a separate recovered artifact and task record.
+The recovered report is marked incomplete; compiler/runtime hashes, workload
+duration, and completed repetitions remain unavailable because offline recovery
+does not rerun the workload. Once recovered, the control becomes **Open Report**.
+
+For example, this project-local file selects a sampling run for one source:
+
+```json
+{
+  "schema_version": 1,
+  "active_configuration": "release-sampling",
+  "configurations": [
+    {
+      "id": "release-sampling",
+      "target": "src/main.elisa",
+      "mode": "sample",
+      "repetitions": 5,
+      "warmup": 1,
+      "timeout_seconds": 45,
+      "sample_period_us": 1000,
+      "working_directory": ".",
+      "arguments": ["--scenario", "large input"],
+      "stdin": "fixtures/input.txt",
+      "environment": {"APP_PROFILE": "release"},
+      "random_seed": 17,
+      "output_directory": ".elisa-ide/profiles"
+    }
+  ]
+}
+```
+
+The initial workflow still profiles saved source through the profiler's managed
+compile path. Reusing a selected successful instrumented build artifact,
+allocation telemetry, source-location navigation, comparisons, and a dedicated
+profiler report pane remain future work. Offline partial-capture recovery is
+available for private manifests whose source path and digest still match. Missing
+profiler measurements remain labeled unavailable.
+
+`src/lsp/server_resolution.py` selects and hashes the
 configured server, trusted nearby build, `ELISA_LSP`, or `PATH` executable in
 that order. Elisa LSP, debugger, profiler, compiler,
 and package-manager connections are required parts of the IDE plan. The local
@@ -215,10 +344,10 @@ line in the status area.
 | SDL3 + SDL3_ttf | Headless/UI-test harnesses and generated-app profiles that select SDL3 | Homebrew (`/opt/homebrew/lib` on Apple silicon) |
 | clang | Links compiler objects, native services, and runtime | `clang` on `PATH` |
 | python3 | Compiler wrapper and development tooling | `python3` on `PATH` |
-| Elisa-LSP | Language service process for the planned source workspace | Local tool discovery; transport foundation is in `src/lsp/` |
-| elisa-debugger | Planned DAP debug adapter | Local tool discovery; EDIR support is currently restricted |
-| elisa-profiler | Planned profiling command-line tool | Local tool discovery; runs as a managed job |
-| elisa-pkg | Planned project/package task backend | Local tool discovery; local dependency graphs currently gate build/run/test |
+| Elisa-LSP | Managed source diagnostics and definition navigation | `ELISA_LSP`, trusted nearby server, or `PATH`; workspace-wide features remain limited |
+| elisa-debugger | Managed DAP debugging for supported standalone-source EDIR | `ELISA_DEBUGGER_DAP`, trusted nearby adapter, or `PATH`; emitted EDIR shapes remain limited |
+| elisa-profiler | Managed standalone-source function captures | `ELISA_PROFILER`, nearby profiler checkout, or `PATH` |
+| elisa-pkg | Local package test planning and default-target execution; broader package tasks are planned | `ELISA_IDE_ELISAPKG`, trusted nearby tool, `ELISAPKG`, or `PATH`; registry dependencies are refused in the IDE test profile |
 
 Current build environment overrides:
 
@@ -241,6 +370,18 @@ Current build environment overrides:
   `ELISA_UI_DESIGNER_CONFIG` name remains a compatibility fallback.
 - `ELISA_IDE_EDITOR` — optional editor executable for the read-only Source pane;
   it receives the selected file path and one-based line as separate arguments.
+- `ELISA_PROFILER` — explicit executable path for the Elisa profiler; when unset,
+  the IDE checks a nearby profiler checkout and then `PATH`.
+- `ELISA_IDE_ELISAPKG` — explicit package-manager executable for local package
+  test planning and execution; when unset, the IDE checks a trusted nearby tool,
+  then `ELISAPKG`, then `PATH`.
+- `ELISA_IDE_PROFILE_ROOT` — optional root directory for profile artifacts. Relative
+  paths resolve from the source project's root; the default uses private per-user
+  Elisa IDE application data storage.
+- `ELISA_IDE_PROFILE_REPORT_FORMAT` — report format rendered by **Open Report**:
+  `html` (default), `text`, `folded`, or `speedscope`.
+- `ELISA_IDE_VIEWER` — optional viewer executable. The IDE passes the generated
+  report path as its only argument; when unset it uses macOS `open` or `xdg-open`.
 
 When stage1 is stale, rebuild it from the compiler checkout:
 

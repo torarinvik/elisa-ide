@@ -23,6 +23,7 @@ def stop_runtime() -> void can[Blocking.IO, Memory.Release, Unsafe.PointerCast]:
     return if app_shutdown_started
     app_shutdown_started <- true
     stop_build_run(shell)
+    ShellDebug::shutdown(shell)
     ShellLsp::stop(shell)
     ShellPreview::stop(shell)
     if shell.host_running:

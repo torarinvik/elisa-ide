@@ -18,6 +18,9 @@ struct HostText:
     buf: mutable darray[u8]
 
 global mutable host_text: HostText = zeroed
+const HOST_REPLY_CAPACITY: usize = 1048576
+global mutable host_reply_bytes: mutable u8[HOST_REPLY_CAPACITY] = zeroed
+global mutable host_reply_length: usize = 0
 
 @link_name("designer_stdout_write")
 extern host_stdout_write(bytes: void&, count: usize) -> i64 can[Blocking.IO]
@@ -445,24 +448,42 @@ def host_dispatch(opcode: i64, arg0: i64, arg1: i64, running: mutable bool&) -> 
         if opcode == 80:
             snapshot: PreviewForm::Result = DesignerSession::preview_snapshot()
             if snapshot.code == PreviewForm::Issue.None:
-                host_text.buf <- snapshot.bytes
+                set_reply_text(DesignText::view_of_ref(&snapshot.bytes))
                 return 1
-            host_text.buf.resize(0)
+            host_reply_length <- 0
             return -1
         return -1
 
 def set_text(source: sview) -> i64:
-    host_text.buf <- snapshot(source)
-    return 1
-
-def snapshot(source: sview) -> darray[u8]:
-    copied: mutable darray[u8] = []
-    DesignStore::ensure_bytes(&copied, source.len.usize() + 1)
+    host_reply_length <- 0
+    return 0 if source.len < 0 or source.len.usize() > HOST_REPLY_CAPACITY
     index: mutable i64 = 0
     while index < source.len:
-        copied.push(source[index])
+        host_reply_bytes[index.usize()] <- source[index]
         index <- index + 1
-    return copied
+    host_reply_length <- source.len.usize()
+    return 1
+
+def set_reply_text(source: sview) -> void:
+    host_reply_length <- 0
+    return if source.len < 0 or source.len.usize() > HOST_REPLY_CAPACITY
+    index: mutable i64 = 0
+    while index < source.len:
+        host_reply_bytes[index.usize()] <- source[index]
+        index <- index + 1
+    host_reply_length <- source.len.usize()
+
+def append_reply_text(output: mutable darray[u8]&) -> void:
+    index: mutable usize = 0
+    while index < host_reply_length:
+        output.push(host_reply_bytes[index])
+        index <- index + 1
+
+def reply_text_view() -> sview:
+    return "" if host_reply_length == 0
+    trusted Unsafe.UncheckedIndex:
+        can Unsafe.PointerCast:
+            return unsafe_sview_bounded_bytes(&host_reply_bytes[0], host_reply_length)
 
 
 # File mode: `document_host request.bin reply.bin`. One or more binary
@@ -489,13 +510,14 @@ def run_file_mode(request_path: cstr, reply_path: cstr) -> i64:
                 cursor <- cursor + 4
                 copy_range(&incoming, cursor, text_length, &host_text.buf)
                 cursor <- cursor + text_length
+            set_reply_text(DesignText::view_of_ref(&host_text.buf))
             running: mutable bool = true
             result: i64 = host_dispatch(opcode, arg0, arg1, &running)
             if host_opcode_changes_document(opcode):
                 _ = DesignerSession::autosave_recovery()
             append_i32(&reply_bytes, result)
-            append_i32(&reply_bytes, host_text.buf.count.i64())
-            append_range(&reply_bytes, host_text.buf)
+            append_i32(&reply_bytes, host_reply_length.i64())
+            append_reply_text(&reply_bytes)
             if not running:
                 break
         write_bytes_file(reply_path, &reply_bytes)
@@ -582,11 +604,12 @@ def run_stream() -> i64:
                     break
             else:
                 host_text.buf.resize(0)
+            set_reply_text(DesignText::view_of_ref(&host_text.buf))
             result: i64 = host_dispatch(opcode, arg0, arg1, &running)
             if host_opcode_changes_document(opcode):
                 _ = DesignerSession::autosave_recovery()
             host_write_i32(result)
-            host_write_text(DesignText::view_of(host_text.buf))
+            host_write_text(reply_text_view())
         return 0
 
 
@@ -617,13 +640,16 @@ def run_signal_mode(request_path: cstr, reply_path: cstr) -> i64:
             result: mutable i64 = -1
             if valid:
                 host_text.buf <- payload
+                set_reply_text(DesignText::view_of_ref(&host_text.buf))
                 result <- host_dispatch(opcode, arg0, arg1, &running)
                 if host_opcode_changes_document(opcode):
                     _ = DesignerSession::autosave_recovery()
+            else:
+                host_reply_length <- 0
             reply.resize(0)
             append_i32(&reply, result)
-            append_i32(&reply, host_text.buf.count.i64())
-            append_range(&reply, host_text.buf)
+            append_i32(&reply, host_reply_length.i64())
+            append_reply_text(&reply)
             write_bytes_file(reply_path, &reply)
         return 0
 
@@ -648,14 +674,17 @@ def run_text_mode(request_path: cstr, reply_path: cstr) -> i64:
         result: mutable i64 = -1
         if valid:
             host_text.buf <- payload
+            set_reply_text(DesignText::view_of_ref(&host_text.buf))
             result <- host_dispatch(opcode, arg0, arg1, &running)
             if host_opcode_changes_document(opcode):
                 _ = DesignerSession::autosave_recovery()
+        else:
+            host_reply_length <- 0
         _ = DesignerSession::snapshot_to("build/host_state.json")
         reply: mutable darray[u8] = []
         append_i32(&reply, result)
-        append_i32(&reply, host_text.buf.count.i64())
-        append_range(&reply, host_text.buf)
+        append_i32(&reply, host_reply_length.i64())
+        append_reply_text(&reply)
         write_bytes_file(reply_path, &reply)
         return 0
 

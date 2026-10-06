@@ -1,0 +1,21 @@
+{
+  "schema-version": 1,
+  "package": {
+    "name": "ide-package-task-fixture",
+    "version": "0.1.0"
+  },
+  "dependencies": {},
+  "dev-dependencies": {},
+  "targets": [
+    {
+      "kind": "test",
+      "name": "unit-tests",
+      "entry": "test/unit_tests.elisa"
+    },
+    {
+      "kind": "test",
+      "name": "integration-tests",
+      "entry": "test/integration_tests.elisa"
+    }
+  ]
+}

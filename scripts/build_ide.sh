@@ -24,7 +24,9 @@ RUNTIME="$STAGE1/build/runtime/elisacore_runtime.o"
 IDE_NAME="elisa_ide"
 BUILD_DIR="$ROOT/build"
 SKIA_BUILD_DIR="$BUILD_DIR/ide-skia"
-APP="$BUILD_DIR/Elisa IDE.app"
+# Keep the default bundle path stable for normal builds; an alternate output
+# lets a new version be fully built and verified before the running app quits.
+APP="${ELISA_IDE_APP_OUTPUT:-$BUILD_DIR/Elisa IDE.app}"
 
 fail() {
     printf 'build_ide: %s\n' "$1" >&2
@@ -62,6 +64,8 @@ done
 [[ -f "$SKIA_OUT/libskia.a" ]] || fail "Skia archive is missing at $SKIA_OUT/libskia.a; build the pinned checkout with $UI_ROOT/scripts/build_skia.sh"
 
 mkdir -p "$BUILD_DIR" "$SKIA_BUILD_DIR"
+bash "$ROOT/scripts/build_profile_worker.sh" "$BUILD_DIR"
+bash "$ROOT/scripts/build_package_worker.sh" "$BUILD_DIR"
 
 # The IDE doctor mode checks the framework/compiler/toolchain and the Skia
 # source/build provenance together, and leaves a machine-readable record for
@@ -177,6 +181,10 @@ mkdir -p "$MACOS" "$RESOURCES"
 cp "$BUILD_DIR/$IDE_NAME" "$MACOS/$IDE_NAME"
 cp "$BUILD_DIR/document_host" "$RESOURCES/document_host"
 cp "$BUILD_DIR/preview_worker" "$RESOURCES/preview_worker"
+cp "$BUILD_DIR/profile_runner" "$RESOURCES/profile_runner"
+cp -R "$BUILD_DIR/profile_lib" "$RESOURCES/profile_lib"
+cp "$BUILD_DIR/package_runner" "$RESOURCES/package_runner"
+cp -R "$BUILD_DIR/package_lib" "$RESOURCES/package_lib"
 codesign --force --sign - "$RESOURCES/document_host" >/dev/null
 codesign --force --sign - "$RESOURCES/preview_worker" >/dev/null
 codesign --force --sign - "$MACOS/$IDE_NAME" >/dev/null

@@ -86,7 +86,7 @@ def source_line_prefix_utf16(line_number: i64) -> usize:
     while remaining >= 10:
         digits <- digits + 1
         remaining <- remaining / 10
-    return (digits + 2).usize()
+    return (11 if digits <= 6 else digits + 5).usize()
 
 def source_diagnostic_underline_color(shell: mutable Shell&, diagnostic_index: i32) -> UiCore::Color:
     severity: i32 = ShellLsp::diagnostic_severity(shell, diagnostic_index)
@@ -289,16 +289,16 @@ def build_events(shell: mutable Shell&, parent: UiHandles::Handle) -> void:
     while index < MAX_EVENT_ROWS:
         row: UiHandles::Handle = UiHandles::row(shell.events_list, 2.0, 4.0, shell_color(28, 31, 38))
         UiHandles::set_grow(row, 0.0)
-        name: UiHandles::Handle = UiHandles::label(row, "", 12.0, shell_color(166, 175, 196))
-        UiHandles::set_grow(name, 1.0)
         editor: UiHandles::Handle = UiHandles::text_field(row, "", "handler symbol", "", 110.0, 24.0, 12.0, shell_color(232, 236, 246), shell_color(27, 32, 43))
         UiHandles::set_help(editor, "Enter a handler symbol, then press Enter. The event signature is shown in the tooltip.")
         UiHandles::set_grow(editor, 2.0)
-        clear: UiHandles::Handle = UiHandles::button(row, 54.0, 24.0, shell_color(42, 47, 58), panel_hover_color(shell.dark), panel_press_color(shell.dark))
-        UiHandles::set_text(clear, "Clear", 11.0, shell_color(238, 242, 252))
-        UiHandles::set_help(clear, "Disconnect this event handler")
+        clear: UiHandles::Handle = UiHandles::button(row, 100.0, 24.0, shell_color(42, 47, 58), panel_hover_color(shell.dark), panel_press_color(shell.dark))
+        UiHandles::set_text(clear, "Event", 11.0, shell_color(238, 242, 252))
+        UiHandles::set_help(clear, "Click the event name to disconnect its handler; the signature is shown in the editor tooltip")
         UiHandles::set_grow(clear, 0.0)
-        shell.event_rows[index.usize()] <- name
+        # The event-name button replaces a separate label, leaving room in the
+        # bounded widget arena for the full editor shell.
+        shell.event_rows[index.usize()] <- clear
         shell.event_editors[index.usize()] <- editor
         shell.event_clear_buttons[index.usize()] <- clear
         shell.event_edit_dirty[index.usize()] <- false
@@ -319,6 +319,7 @@ def build_problems(shell: mutable Shell&, parent: UiHandles::Handle) -> void:
         shell.problem_count <- shell.problem_count + 1
         index <- index + 1
     navigation: UiHandles::Handle = UiHandles::row(parent, 0.0, 3.0, shell_color(24, 27, 33))
+    shell.problem_navigation <- navigation
     UiHandles::set_grow(navigation, 0.0)
     shell.problem_previous_button <- nav_button(navigation, shell.dark, "Prev", "Show the previous page of problems")
     shell.problem_page_label <- UiHandles::label(navigation, "0 of 0", 11.0, shell_color(148, 158, 180))
@@ -498,11 +499,10 @@ def refresh_events(shell: mutable Shell&, process: mutable PosixProcess::Process
             label: HostClient::HostReply = HostClient::request(process, 91, index.i64(), 0)
             value: HostClient::HostReply = HostClient::request(process, 92, index.i64(), 0)
             signature: HostClient::HostReply = HostClient::request(process, 93, index.i64(), 0)
-            UiHandles::set_text(name, ShellBytes::view_of(&label.text), 12.0, shell_color(166, 175, 196))
+            UiHandles::set_text(name, ShellBytes::view_of(&label.text), 11.0, shell_color(238, 242, 252))
             UiHandles::set_text(editor, ShellBytes::view_of(&value.text), 12.0, shell_color(232, 236, 246))
             UiHandles::replace_text(editor, ShellBytes::view_of(&value.text))
             UiHandles::set_help(editor, ShellBytes::view_of(&signature.text))
-            UiHandles::set_visible(name, true)
             UiHandles::set_visible(editor, true)
             UiHandles::set_enabled(editor, true)
             UiHandles::set_visible(clear, true)
@@ -556,10 +556,12 @@ def build_diagnostic_at(text: sview, wanted: i32) -> sview:
     return ""
 
 def refresh_problems(shell: mutable Shell&, process: mutable PosixProcess::Process&) -> void:
+    return if shell.bottom_tab == 2
     design_count: i64 = shell.projection.problem_count
     lsp_count: i64 = shell.source_lsp_diagnostics.i64()
     build_count: i64 = build_diagnostic_count(build_output_text(shell)).i64()
-    total_count: i64 = design_count + lsp_count + build_count
+    tool_count: i64 = active_tool_problem_count(shell)
+    total_count: i64 = design_count + lsp_count + build_count + tool_count
     window: ShellWindow::Window = ShellWindow::resolve(total_count, shell.problem_page.i64(), MAX_PROBLEM_ROWS.i64())
     shell.problem_page <- window.page.i32()
     index: mutable i32 = 0
@@ -634,10 +636,36 @@ def refresh_problems(shell: mutable Shell&, process: mutable PosixProcess::Proce
                     append_nonnegative(&help, end_character.i64() + 1)
                 append_diagnostic_related_help(&help, shell, diagnostic_index)
                 UiHandles::set_help(row, ShellBytes::view_of(&help))
-            else:
+            elif logical_row < design_count + lsp_count + build_count:
                 build_line: sview = build_diagnostic_at(build_output_text(shell), (logical_row - design_count - lsp_count).i32())
                 UiHandles::set_text(row, build_line, 12.0, shell_color(226, 194, 132))
                 UiHandles::set_help(row, "Build diagnostic; source mapping will be enabled when a matching source identity is available")
+            else:
+                task_index: i32 = active_tool_problem_index(shell, logical_row - design_count - lsp_count - build_count)
+                if task_index >= 0:
+                    problem: ToolProblem& = &shell.tool_problems[task_index.usize()]
+                    owner: sview = tool_problem_owner_name(problem.owner)
+                    message: sview = UiText::fixed_bytes_view_range[512](problem.message_storage, 0, problem.message_length.usize())
+                    display: mutable darray[u8] = []
+                    append_panel_text(&display, owner)
+                    append_panel_text(&display, " error: " if problem.severity == 1 else " warning: ")
+                    append_panel_text(&display, message)
+                    problem_color: UiCore::Color = shell_color(232, 142, 128) if problem.severity == 1 else shell_color(226, 194, 132)
+                    UiHandles::set_text(row, ShellBytes::view_of(&display), 12.0, problem_color)
+                    help: mutable darray[u8] = []
+                    append_panel_text(&help, owner)
+                    append_panel_text(&help, " | severity error" if problem.severity == 1 else " | severity warning")
+                    append_panel_text(&help, " | task ")
+                    append_nonnegative(&help, problem.task_id)
+                    append_panel_text(&help, " | source revision ")
+                    append_nonnegative(&help, problem.source_revision)
+                    if problem.source_path_length > 0:
+                        append_panel_text(&help, " | ")
+                        append_panel_text(&help, UiText::fixed_bytes_view_range[1024](problem.source_path_storage, 0, problem.source_path_length.usize()))
+                    UiHandles::set_help(row, ShellBytes::view_of(&help))
+                else:
+                    UiHandles::set_text(row, "Task problem is no longer available", 12.0, shell_color(226, 194, 132))
+                    UiHandles::set_help(row, "The task record expired from the bounded Problems model")
             UiHandles::set_visible(row, true)
         else:
             UiHandles::set_visible(row, false)
@@ -677,7 +705,6 @@ def refresh_source_lines(shell: mutable Shell&, text: sview) -> void:
     UiHandles::set_visible(shell.source_symbol_query, false)
     UiHandles::set_visible(shell.source_symbol_search_button, false)
     UiHandles::set_visible(shell.source_symbol_next_button, false)
-    UiHandles::set_visible(shell.source_symbol_status, false)
     line_start: mutable i64 = 0
     shell.refreshing_source <- true
     while line_start < text.len and shell.source_line_count < MAX_SOURCE_LINES:
@@ -687,8 +714,8 @@ def refresh_source_lines(shell: mutable Shell&, text: sview) -> void:
         line: sview = string_view_slice(text, line_start, line_end)
         row: UiHandles::Handle = shell.source_line_rows[shell.source_line_count.usize()]
         display: mutable darray[u8] = []
-        append_nonnegative(&display, shell.source_line_count.i64() + 1)
-        append_panel_text(&display, ": ")
+        gutter: darray[u8] = ShellDebug::source_gutter_prefix(shell, shell.source_line_count.i64() + 1)
+        append_panel_text(&display, ShellBytes::view_of(&gutter))
         append_panel_text(&display, line)
         UiHandles::set_visible(row, true)
         UiHandles::set_enabled(row, true)
@@ -737,7 +764,6 @@ def refresh_source_file_lines(shell: mutable Shell&, process: mutable PosixProce
     UiHandles::set_visible(shell.source_symbol_query, true)
     UiHandles::set_visible(shell.source_symbol_search_button, true)
     UiHandles::set_visible(shell.source_symbol_next_button, true)
-    UiHandles::set_visible(shell.source_symbol_status, true)
     shell.refreshing_source <- true
     visible: mutable i32 = 0
     while visible < MAX_SOURCE_LINES:
@@ -746,8 +772,8 @@ def refresh_source_file_lines(shell: mutable Shell&, process: mutable PosixProce
         if line_number < total:
             line: HostClient::HostReply = HostClient::request(process, 116, line_number, 0)
             display: mutable darray[u8] = []
-            append_nonnegative(&display, line_number + 1)
-            append_panel_text(&display, ": ")
+            gutter: darray[u8] = ShellDebug::source_gutter_prefix(shell, line_number + 1)
+            append_panel_text(&display, ShellBytes::view_of(&gutter))
             append_panel_text(&display, ShellBytes::view_of(&line.text))
             UiHandles::set_visible(row, true)
             UiHandles::set_enabled(row, true)
@@ -757,13 +783,17 @@ def refresh_source_file_lines(shell: mutable Shell&, process: mutable PosixProce
             else:
                 UiHandles::clear_text_underlines(row)
             severity: i32 = ShellLsp::line_severity(shell, line_number)
-            mark: UiCore::Color = UiCore::Color{r: 0, g: 0, b: 0, a: 0} if severity == 0 else (shell_color(126, 68, 65) if severity == 1 else (shell_color(140, 112, 56) if severity == 2 else shell_color(62, 92, 132)))
+            source_line: i64 = line_number + 1
+            mark: UiCore::Color = shell_color(225, 84, 78) if ShellDebug::has_breakpoint(shell, source_line) else (UiCore::Color{r: 0, g: 0, b: 0, a: 0} if severity == 0 else (shell_color(126, 68, 65) if severity == 1 else (shell_color(140, 112, 56) if severity == 2 else shell_color(62, 92, 132))))
             UiHandles::set_ring(row, mark)
             diagnostic_help: darray[u8] = source_diagnostic_help(shell, line_number)
-            if diagnostic_help.count > 0:
+            if ShellDebug::has_breakpoint(shell, source_line):
+                append_panel_text(&diagnostic_help, " | breakpoint set; click the gutter to toggle it")
+                UiHandles::set_help(row, ShellBytes::view_of(&diagnostic_help))
+            elif diagnostic_help.count > 0:
                 UiHandles::set_help(row, ShellBytes::view_of(&diagnostic_help))
             else:
-                UiHandles::set_help(row, "Elisa source line; long lines are locked to prevent editing hidden text")
+                UiHandles::set_help(row, "Elisa source line; click the left gutter to toggle a breakpoint. Long lines are locked to prevent editing hidden text")
             UiHandles::set_visible(row, true)
             UiHandles::set_enabled(row, line.result == 1)
             shell.source_line_offsets[visible.usize()] <- line_number
@@ -813,6 +843,9 @@ def refresh_source_conflict_bar(shell: mutable Shell&, process: mutable PosixPro
 
 def refresh_source_file_status(shell: mutable Shell&, process: mutable PosixProcess::Process&, total: i64, start: i64) -> void:
     path: HostClient::HostReply = HostClient::request(process, 114, 0, 0)
+    if path.result == 1:
+        fingerprint: i64 = HostClient::request(process, 152, 0, 0).result
+        ShellDebug::ensure_source(shell, ShellBytes::view_of(&path.text), fingerprint)
     UiHandles::set_enabled(shell.source_reveal_button, path.result == 1 and path.text.count > 0)
     ownership: mutable darray[u8] = []
     append_panel_text(&ownership, ShellBytes::view_of(&path.text))
@@ -824,7 +857,7 @@ def refresh_source_file_status(shell: mutable Shell&, process: mutable PosixProc
     append_nonnegative(&ownership, last)
     append_panel_text(&ownership, " of ")
     append_nonnegative(&ownership, total)
-    append_panel_text(&ownership, " | editable")
+    append_panel_text(&ownership, " | editable | right-click a line to toggle a breakpoint")
     UiHandles::set_text(shell.source_ownership, ShellBytes::view_of(&ownership), 10.0, shell_color(148, 158, 180))
     refresh_history_buttons(shell, process)
 
@@ -857,7 +890,6 @@ def refresh_source_view(shell: mutable Shell&, process: mutable PosixProcess::Pr
             UiHandles::set_visible(shell.source_symbol_query, false)
             UiHandles::set_visible(shell.source_symbol_search_button, false)
             UiHandles::set_visible(shell.source_symbol_next_button, false)
-            UiHandles::set_visible(shell.source_symbol_status, false)
             UiHandles::set_text(shell.source_ownership, "Line-aligned differences | scroll to review | Keep Buffer or Discard + Reload to resolve", 10.0, shell_color(148, 158, 180))
             index: mutable i32 = 0
             while index < MAX_SOURCE_LINES:
@@ -888,7 +920,6 @@ def refresh_source_view(shell: mutable Shell&, process: mutable PosixProcess::Pr
         UiHandles::set_visible(shell.source_symbol_query, true)
         UiHandles::set_visible(shell.source_symbol_search_button, true)
         UiHandles::set_visible(shell.source_symbol_next_button, true)
-        UiHandles::set_visible(shell.source_symbol_status, true)
         refresh_source_file_lines(shell, process)
         return
     shell.source_compare_mode <- false
@@ -905,7 +936,6 @@ def refresh_source_view(shell: mutable Shell&, process: mutable PosixProcess::Pr
     UiHandles::set_visible(shell.source_symbol_query, false)
     UiHandles::set_visible(shell.source_symbol_search_button, false)
     UiHandles::set_visible(shell.source_symbol_next_button, false)
-    UiHandles::set_visible(shell.source_symbol_status, false)
     UiHandles::set_visible(shell.source_conflict_bar, false)
     UiHandles::set_enabled(shell.source_compare_button, false)
     UiHandles::set_enabled(shell.source_keep_buffer_button, false)

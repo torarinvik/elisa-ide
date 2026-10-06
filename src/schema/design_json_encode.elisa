@@ -49,14 +49,14 @@ module DesignEncode:
 
         def object_key[@r](arena: mutable Arena& @r, buffer: mutable darray[u8]&, first: mutable bool&, key: sview) -> void:
             in arena:
-                if not first:
+                if first == false:
                     buffer.push(44)
                 first <- false
                 append_json_string(arena, buffer, key)
                 buffer.push(58)
 
         def array_item_prefix(buffer: mutable darray[u8]&, first: mutable bool&) -> void:
-            if not first:
+            if first == false:
                 buffer.push(44)
             first <- false
 

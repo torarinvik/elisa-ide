@@ -50,6 +50,7 @@ bash scripts/build_core.sh src/cli/elisa_ide_cli_main.elisa elisa_ide_cli >/dev/
 ./build/elisa_ide_cli migrate test/fixtures/legacy-form-v0.elisaform.json build/spikes/legacy-migrated.json >/dev/null
 scripts/smoke_cli_generate.sh
 scripts/smoke_project_generation.sh
+bash scripts/test_build_toolchain_preflight.sh
 
 # The LSP bridge is a host-side service because Elisa-LSP is an external
 # stdio process. Its framing, limits, lifecycle, and version-gated diagnostics
@@ -63,8 +64,15 @@ python3 test/source/source_document_test.py
 python3 test/problems/problem_model_test.py
 python3 test/build/build_diagnostics_test.py
 python3 test/debug/dap_client_test.py
+python3 test/debug/dap_session_test.py
+python3 test/debug/source_positions_test.py
+python3 test/debug/debug_host_test.py
 python3 test/profile/profile_artifact_test.py
+python3 test/profile/profile_config_test.py
+python3 test/profile/profile_progress_test.py
+python3 test/profile/profile_runner_test.py
 python3 test/toolchain/resolver_test.py
+python3 test/package/test_package_runner.py
 
 # The core document process and its cross-process protocol are UI-independent.
 bash scripts/build_core.sh worker/core/document_host.elisa document_host >/dev/null

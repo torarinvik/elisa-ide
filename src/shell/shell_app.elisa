@@ -7,6 +7,7 @@
 include "host_client.elisa"
 include "shell_state.elisa"
 include "shell_lsp.elisa"
+include "shell_debug.elisa"
 include "shell_layout.elisa"
 include "shell_preview.elisa"
 include "shell_panels.elisa"
@@ -22,10 +23,15 @@ extern designer_workspace_preferences_save_ratios(left: f64, right: f64, bottom:
 const PROJECT_BUILD_SCRIPT: cstr = "scripts/build_project.sh"
 const PROJECT_RUN_BINARY: cstr = "build/elisa_project_app"
 const SOURCE_RUN_BINARY: cstr = "build/elisa_ide_source_app"
+const DEBUG_EDIR_PATH: sview = "build/elisa_ide_debug.edir"
 const COMMAND_KEY_CAPACITY: usize = 512
 const BUILD_PATH_CAPACITY: usize = 1024
 const SOURCE_PATH_CAPACITY: usize = 4096
 const PROCESS_OUTPUT_CAPACITY: usize = 4096
+const MAX_PACKAGE_TEST_TARGETS: i64 = 64
+const PACKAGE_TASK_STALE_SUCCESS_EXIT: i64 = 250
+const PACKAGE_TASK_STALE_FAILURE_EXIT: i64 = 251
+const SOURCE_GUTTER_POINTER_WIDTH: f32 = 72.0
 
 const enum ShellCommand of u32:
     NewDocument = 1
@@ -45,6 +51,22 @@ const enum ShellCommand of u32:
     BuildProject = 12
     RunProject = 13
     StopProject = 14
+    DebugProject = 26
+    ContinueDebug = 27
+    StepDebug = 28
+    PauseDebug = 29
+    RunPackageTests = 30
+    CyclePackageTestTarget = 31
+    ShowPackageTestHistory = 32
+    OlderPackageTestHistory = 33
+    NewerPackageTestHistory = 34
+    ToolchainDoctor = 35
+    RestartDebug = 36
+    NextDebugFrame = 37
+    PreviousDebugFrame = 38
+    NextDebugThread = 39
+    PreviousDebugThread = 40
+    TogglePackageTestExplorer = 41
     CopySelection = 18
     CutSelection = 19
     PasteSelection = 20
@@ -59,16 +81,144 @@ global mutable host_path_storage: mutable u8[BUILD_PATH_CAPACITY] = zeroed
 global mutable build_process: mutable PosixProcess::Process = PosixProcess::Process{handle: null}
 global mutable run_process: mutable PosixProcess::Process = PosixProcess::Process{handle: null}
 global mutable build_job: BuildJob::Job = zeroed
+global mutable toolchain_doctor_process: mutable PosixProcess::Process = PosixProcess::Process{handle: null}
+global mutable toolchain_doctor_job: BuildJob::Job = zeroed
 global mutable build_revision: u64 = 0
+global mutable toolchain_doctor_revision: u64 = 0
+global mutable toolchain_doctor_active: bool = false
 global mutable build_run_after: bool = false
+global mutable build_debug_after: bool = false
+global mutable profile_active: bool = false
+global mutable profile_open_active: bool = false
+global mutable profile_recovery_active: bool = false
+global mutable profile_runner_path_storage: mutable u8[BUILD_PATH_CAPACITY] = zeroed
+global mutable package_task_active: bool = false
+global mutable package_runner_path_storage: mutable u8[BUILD_PATH_CAPACITY] = zeroed
+global mutable package_plan_storage: mutable u8[32768] = zeroed
+global mutable package_plan_length: mutable i64 = 0
+global mutable package_plan_exit_code: mutable i32 = -1
+global mutable package_plan_overflow: mutable bool = false
+global mutable package_plan_token_storage: mutable u8[65] = zeroed
+global mutable package_plan_target_storage: mutable u8[128] = zeroed
+global mutable package_plan_target_length: mutable i64 = 0
+global mutable package_test_targets_storage: mutable u8[8192] = zeroed
+global mutable package_test_targets_length: mutable i64 = 0
+global mutable package_test_target_count: mutable i64 = 0
+global mutable package_selected_target_index: mutable i64 = 0
+global mutable package_selected_token_storage: mutable u8[65] = zeroed
+global mutable package_selected_target_valid: bool = false
+global mutable package_pending_token_storage: mutable u8[65] = zeroed
+global mutable package_pending_target_storage: mutable u8[128] = zeroed
+global mutable package_pending_target_length: mutable i64 = 0
+global mutable package_pending_deadline_ms: mutable i64 = 0
+global mutable package_trusted_token_storage: mutable u8[65] = zeroed
+global mutable package_trusted_target_storage: mutable u8[128] = zeroed
+global mutable package_trusted_target_length: mutable i64 = 0
+global mutable package_task_source_fingerprint: mutable i64 = 0
+global mutable package_history_selection: mutable i64 = -1
+global mutable package_test_explorer_open: mutable bool = false
+global mutable package_test_explorer_run_selection: mutable i64 = 0
+global mutable package_test_case_selection: mutable i64 = 0
+global mutable package_test_explorer_run_argument: mutable u8[16] = zeroed
+global mutable package_test_explorer_case_argument: mutable u8[16] = zeroed
 global mutable run_active: bool = false
 global mutable shell_command_key_latched: bool[512] = zeroed
+
+def shell_task_running() -> bool:
+    return BuildJob::is_running(&build_job) or BuildJob::is_running(&toolchain_doctor_job)
+
+def package_index_argument(value: i64, storage: mutable u8[16]&) -> cstr can[Unsafe.PointerCast]:
+    digits: mutable u8[16] = zeroed
+    count: mutable i64 = 0
+    remaining: mutable i64 = value if value > 0 else 0
+    if remaining == 0:
+        digits[0] <- 48
+        count <- 1
+    else:
+        while remaining > 0 and count < 15 |remaining, count, digits|:
+            digits[count.usize()] <- (48 + (remaining % 10).u8())
+            remaining <- remaining / 10
+            count <- count + 1
+    index: mutable i64 = 0
+    while index < count |index, count, digits, storage|:
+        storage[index.usize()] <- digits[(count - index - 1).usize()]
+        index <- index + 1
+    storage[count.usize()] <- 0
+    return (&storage[0]).cast[cstr] can Unsafe.PointerCast
 
 def toolbar_button(shell: mutable Shell&, parent: UiHandles::Handle, label: sview, width: f32) -> UiHandles::Handle:
     button: UiHandles::Handle = UiHandles::button(parent, width, 24.0, shell_color(48, 54, 68) if shell.dark else shell_color(218, 223, 234), panel_hover_color(shell.dark), panel_press_color(shell.dark))
     UiHandles::set_text(button, label, 12.0, shell_color(238, 242, 252))
     UiHandles::set_grow(button, 0.0)
     return button
+
+def record_tool_problem(shell: mutable Shell&, owner: i32, severity: i32, task_id: i64, source_revision: i64, message: sview) -> void:
+    return if owner < 0 or owner >= MAX_TOOL_PROBLEMS
+    source_path: sview = UiHandles::text_value(shell.compact_open_path_field) if shell.compact_mode else UiHandles::text_value(shell.open_path_field)
+    message_length: mutable i64 = TOOL_PROBLEM_MESSAGE_CAPACITY.i64()
+    message_length <- message.len if message.len < message_length
+    message_length <- UiText::valid_utf8_prefix(message, message_length.usize()).i64()
+    source_length: mutable i64 = TOOL_PROBLEM_PATH_CAPACITY.i64()
+    source_length <- source_path.len if source_path.len < source_length
+    source_length <- UiText::valid_utf8_prefix(source_path, source_length.usize()).i64()
+    slot: usize = owner.usize()
+    shell.tool_problems[slot].active <- true
+    shell.tool_problems[slot].owner <- owner
+    shell.tool_problems[slot].severity <- severity
+    shell.tool_problems[slot].task_id <- task_id
+    shell.tool_problems[slot].source_revision <- source_revision
+    shell.tool_problems[slot].message_length <- message_length.i32()
+    shell.tool_problems[slot].source_path_length <- source_length.i32()
+    index: mutable i64 = 0
+    while index < message_length:
+        shell.tool_problems[slot].message_storage[index.usize()] <- message[index]
+        index <- index + 1
+    index <- 0
+    while index < source_length:
+        shell.tool_problems[slot].source_path_storage[index.usize()] <- source_path[index]
+        index <- index + 1
+    shell.problems_dirty <- true
+
+def clear_tool_problem(shell: mutable Shell&, owner: i32) -> void:
+    return if owner < 0 or owner >= MAX_TOOL_PROBLEMS
+    slot: usize = owner.usize()
+    shell.tool_problems[slot].active <- false
+    shell.tool_problems[slot].message_length <- 0
+    shell.tool_problems[slot].source_path_length <- 0
+    shell.problems_dirty <- true
+
+def record_profile_problem(shell: mutable Shell&, severity: i32, message: sview) -> void:
+    record_tool_problem(shell, PROBLEM_TOOL_PROFILER, severity, build_revision.i64(), shell.building_source_fingerprint, message)
+
+def active_tool_problem_count(shell: Shell&) -> i64:
+    count: mutable i64 = 0
+    index: mutable i32 = 0
+    while index < MAX_TOOL_PROBLEMS:
+        count <- count + 1 if shell.tool_problems[index.usize()].active
+        index <- index + 1
+    return count
+
+def active_tool_problem_index(shell: Shell&, wanted: i64) -> i32:
+    return -1 if wanted < 0
+    found: mutable i64 = 0
+    index: mutable i32 = 0
+    while index < MAX_TOOL_PROBLEMS:
+        if shell.tool_problems[index.usize()].active:
+            return index if found == wanted
+            found <- found + 1
+        index <- index + 1
+    return -1
+
+def tool_problem_owner_name(owner: i32) -> sview:
+    if owner == PROBLEM_TOOL_PREVIEW:
+        return "Elisa-ui preview"
+    elif owner == PROBLEM_TOOL_DEBUGGER:
+        return "Elisa debugger"
+    elif owner == PROBLEM_TOOL_PROFILER:
+        return "Elisa profiler"
+    elif owner == PROBLEM_TOOL_PACKAGE_MANAGER:
+        return "Elisa package manager"
+    return "Elisa test runner"
 
 def start_host(shell: mutable Shell&) -> void:
     if shell.host_running:
@@ -144,6 +294,22 @@ def bind_primary_shortcuts(primary: u32) -> void:
     _ = UiShortcuts::bind_application(UiCore::Key.B.i32(), primary, ShellCommand.BuildProject.u32(), false)
     _ = UiShortcuts::bind_application(UiCore::Key.R.i32(), primary, ShellCommand.RunProject.u32(), false)
     _ = UiShortcuts::bind_application(UiCore::Key.C.i32(), primary | UiShortcuts::MOD_SHIFT, ShellCommand.StopProject.u32(), false)
+    _ = UiShortcuts::bind_application(UiCore::Key.F5.i32(), 0, ShellCommand.DebugProject.u32(), false)
+    _ = UiShortcuts::bind_application(UiCore::Key.F5.i32(), primary | UiShortcuts::MOD_SHIFT, ShellCommand.RestartDebug.u32(), false)
+    _ = UiShortcuts::bind_application(UiCore::Key.F8.i32(), 0, ShellCommand.ContinueDebug.u32(), false)
+    _ = UiShortcuts::bind_application(UiCore::Key.F10.i32(), 0, ShellCommand.StepDebug.u32(), false)
+    _ = UiShortcuts::bind_application(UiCore::Key.F6.i32(), 0, ShellCommand.PauseDebug.u32(), false)
+    _ = UiShortcuts::bind_application(UiCore::Key.F7.i32(), 0, ShellCommand.NextDebugFrame.u32(), false)
+    _ = UiShortcuts::bind_application(UiCore::Key.F7.i32(), UiShortcuts::MOD_SHIFT, ShellCommand.PreviousDebugFrame.u32(), false)
+    _ = UiShortcuts::bind_application(UiCore::Key.F7.i32(), UiShortcuts::MOD_CONTROL, ShellCommand.NextDebugThread.u32(), false)
+    _ = UiShortcuts::bind_application(UiCore::Key.F7.i32(), UiShortcuts::MOD_CONTROL | UiShortcuts::MOD_SHIFT, ShellCommand.PreviousDebugThread.u32(), false)
+    _ = UiShortcuts::bind_application(UiCore::Key.T.i32(), primary | UiShortcuts::MOD_SHIFT, ShellCommand.RunPackageTests.u32(), false)
+    _ = UiShortcuts::bind_application(UiCore::Key.T.i32(), primary | UiShortcuts::MOD_ALT | UiShortcuts::MOD_SHIFT, ShellCommand.CyclePackageTestTarget.u32(), false)
+    _ = UiShortcuts::bind_application(UiCore::Key.H.i32(), primary | UiShortcuts::MOD_ALT | UiShortcuts::MOD_SHIFT, ShellCommand.ShowPackageTestHistory.u32(), false)
+    _ = UiShortcuts::bind_application(UiCore::Key.J.i32(), primary | UiShortcuts::MOD_ALT | UiShortcuts::MOD_SHIFT, ShellCommand.OlderPackageTestHistory.u32(), false)
+    _ = UiShortcuts::bind_application(UiCore::Key.K.i32(), primary | UiShortcuts::MOD_ALT | UiShortcuts::MOD_SHIFT, ShellCommand.NewerPackageTestHistory.u32(), false)
+    _ = UiShortcuts::bind_application(UiCore::Key.E.i32(), primary | UiShortcuts::MOD_ALT | UiShortcuts::MOD_SHIFT, ShellCommand.TogglePackageTestExplorer.u32(), false)
+    _ = UiShortcuts::bind_application(UiCore::Key.D.i32(), primary | UiShortcuts::MOD_ALT | UiShortcuts::MOD_SHIFT, ShellCommand.ToolchainDoctor.u32(), false)
     _ = UiShortcuts::bind_application(UiCore::Key.Delete.i32(), 0, ShellCommand.DeleteSelection.u32(), false)
 
 def apply_shell_layout(shell: mutable Shell&) -> void:
@@ -162,6 +328,9 @@ def apply_shell_layout(shell: mutable Shell&) -> void:
     UiHandles::set_visible(shell.duplicate_button, not compact)
     UiHandles::set_visible(shell.surface_pane, not shell.source_mode)
     UiHandles::set_visible(shell.source_pane, shell.source_mode)
+    UiHandles::set_visible(shell.profile_button, shell.source_mode and shell.standalone_source)
+    UiHandles::set_enabled(shell.profile_button, shell.source_mode and shell.standalone_source
+        and not shell_task_running() and not run_active and not shell.debug_session_active)
     UiHandles::set_grow(shell.surface_pane, 0.0 if shell.source_mode else 1.0)
     UiHandles::set_grow(shell.source_pane, 1.0 if shell.source_mode else 0.0)
     if compact:
@@ -192,6 +361,49 @@ def apply_shell_layout(shell: mutable Shell&) -> void:
     UiHandles::set_min_size(shell.right_pane, rects.right_width, 0.0)
     UiHandles::set_min_size(shell.bottom_splitter, 0.0, 6.0)
     UiHandles::set_min_size(shell.bottom_pane, 0.0, rects.bottom_height)
+
+def select_bottom_tab(shell: mutable Shell&, tab: i32) -> void:
+    previous_bottom_tab: i32 = shell.bottom_tab
+    has_debug_view: bool = shell.debug_session_active or shell.debug_snapshot_valid
+    shell.bottom_tab <- 2 if tab == 2 and has_debug_view else (1 if tab == 1 else 0)
+    show_problems: bool = shell.bottom_tab == 0
+    show_output: bool = shell.bottom_tab == 1
+    show_debug: bool = shell.bottom_tab == 2
+    UiHandles::set_visible(shell.problem_list, show_problems or show_debug)
+    UiHandles::set_visible(shell.problem_navigation, show_problems or show_debug)
+    UiHandles::set_visible(shell.build_output, show_output or show_debug)
+    UiHandles::set_visible(shell.problem_copy_button, show_problems)
+    UiHandles::set_visible(shell.problem_related_button, show_problems)
+    if show_debug:
+        UiHandles::set_text(shell.problem_previous_button, "Thread -", 11.0, shell_color(238, 242, 252))
+        UiHandles::set_help(shell.problem_previous_button, "Select the previous stopped debugger thread")
+        UiHandles::set_text(shell.problem_next_button, "Thread +", 11.0, shell_color(238, 242, 252))
+        UiHandles::set_help(shell.problem_next_button, "Select the next stopped debugger thread")
+        UiHandles::set_enabled(shell.problem_previous_button, shell.debug_session_active)
+        UiHandles::set_enabled(shell.problem_next_button, shell.debug_session_active)
+        ShellDebug::refresh_debug_view(shell)
+    else:
+        UiHandles::set_text(shell.problem_previous_button, "Prev", 11.0, shell_color(238, 242, 252))
+        UiHandles::set_help(shell.problem_previous_button, "Show the previous page of problems")
+        UiHandles::set_text(shell.problem_next_button, "Next", 11.0, shell_color(238, 242, 252))
+        UiHandles::set_help(shell.problem_next_button, "Show the next page of problems")
+        if show_problems and shell.host_running:
+            refresh_problems(shell, host_process)
+        elif show_output and previous_bottom_tab == 2 and shell.debug_snapshot_valid:
+            snapshot: sview = UiText::fixed_bytes_view_range[8192](shell.debug_snapshot_storage, 0, shell.debug_snapshot_length.usize())
+            UiHandles::set_text(shell.build_output, snapshot, 11.0, shell_color(172, 184, 204))
+    if shell.bottom_tab == 0:
+        UiHandles::set_text(shell.bottom_switch_button, "Show Output", 11.0, shell_color(238, 242, 252))
+        UiHandles::set_help(shell.bottom_switch_button, "Switch from diagnostics to task output")
+    elif shell.bottom_tab == 1 and has_debug_view:
+        UiHandles::set_text(shell.bottom_switch_button, "Show Debug", 11.0, shell_color(238, 242, 252))
+        UiHandles::set_help(shell.bottom_switch_button, "Show stopped threads, call stack, and selected-frame locals")
+    elif shell.bottom_tab == 1:
+        UiHandles::set_text(shell.bottom_switch_button, "Show Problems", 11.0, shell_color(238, 242, 252))
+        UiHandles::set_help(shell.bottom_switch_button, "Switch from task output back to diagnostics")
+    else:
+        UiHandles::set_text(shell.bottom_switch_button, "Show Problems", 11.0, shell_color(238, 242, 252))
+        UiHandles::set_help(shell.bottom_switch_button, "Return to design, Elisa-LSP, build, and task diagnostics")
 
 def pointer_over_splitter(handle: UiHandles::Handle, at: UiCore::Vec2) -> bool:
     UiHandles::ensure_layout()
@@ -226,6 +438,16 @@ def source_row_at(shell: Shell&, at: UiCore::Vec2) -> i32:
     while index < shell.source_line_count:
         if pointer_over_handle(shell.source_line_rows[index.usize()], at):
             return index
+        index <- index + 1
+    return -1
+
+def source_gutter_row_at(shell: Shell&, at: UiCore::Vec2) -> i32:
+    index: mutable i32 = 0
+    while index < shell.source_line_count:
+        row: UiHandles::Handle = shell.source_line_rows[index.usize()]
+        if pointer_over_handle(row, at):
+            if UiHandles::widget(row) is widget:
+                return index if at.x <= widget.x + SOURCE_GUTTER_POINTER_WIDTH
         index <- index + 1
     return -1
 
@@ -264,7 +486,7 @@ def indent_source_line(shell: mutable Shell&, outdent: bool) -> bool:
             remove_count <- leading if leading < 4 else 4
         return true if remove_count == 0
         edit_finish <- line_start + remove_count
-    prefix: darray[u8] = source_line_prefix(line_number + 1)
+    prefix: darray[u8] = source_line_prefix(shell, line_number + 1)
     caret_byte: usize = UiFlat::selection_end(row.widget_id.usize())
     caret_column: mutable i64 = caret_byte.i64() - prefix.count.i64()
     caret_column <- 0 if caret_column < 0
@@ -283,7 +505,7 @@ def indent_source_line(shell: mutable Shell&, outdent: bool) -> bool:
     if target_index >= 0 and target_index < shell.source_line_count:
         target_row: UiHandles::Handle = shell.source_line_rows[target_index.usize()]
         if UiHandles::request_focus(target_row):
-            target_prefix: darray[u8] = source_line_prefix(line_number + 1)
+            target_prefix: darray[u8] = source_line_prefix(shell, line_number + 1)
             target_value: sview = UiHandles::text_value(target_row)
             available_bytes: mutable i64 = target_value.len - target_prefix.count.i64()
             available_bytes <- 0 if available_bytes < 0
@@ -302,7 +524,7 @@ def insert_source_line_break(shell: mutable Shell&) -> bool:
     return false if row_index < 0
     row: UiHandles::Handle = shell.source_line_rows[row_index.usize()]
     line_number: i64 = shell.source_line_offsets[row_index.usize()]
-    prefix: darray[u8] = source_line_prefix(line_number + 1)
+    prefix: darray[u8] = source_line_prefix(shell, line_number + 1)
     value: sview = UiHandles::text_value(row)
     content_length: mutable i64 = value.len - prefix.count.i64()
     content_length <- 0 if content_length < 0
@@ -327,7 +549,7 @@ def insert_source_line_break(shell: mutable Shell&) -> bool:
     if target_index >= 0 and target_index < shell.source_line_count:
         target_row: UiHandles::Handle = shell.source_line_rows[target_index.usize()]
         if UiHandles::request_focus(target_row):
-            target_prefix: darray[u8] = source_line_prefix(target_line + 1)
+            target_prefix: darray[u8] = source_line_prefix(shell, target_line + 1)
             cursor: usize = UiFlat::text_utf16_offset(target_row.widget_id.usize(), target_prefix.count)
             UiHandles::set_selection_utf16(target_row, cursor, 0)
             shell.source_selected_line <- target_line + 1
@@ -342,7 +564,7 @@ def merge_source_lines(shell: mutable Shell&, direction: i32) -> bool:
     row: UiHandles::Handle = shell.source_line_rows[row_index.usize()]
     line_number: i64 = shell.source_line_offsets[row_index.usize()]
     value: sview = UiHandles::text_value(row)
-    prefix: darray[u8] = source_line_prefix(line_number + 1)
+    prefix: darray[u8] = source_line_prefix(shell, line_number + 1)
     content_length: mutable i64 = value.len - prefix.count.i64()
     content_length <- 0 if content_length < 0
     selection_start: usize = UiFlat::selection_start(row.widget_id.usize())
@@ -386,7 +608,7 @@ def merge_source_lines(shell: mutable Shell&, direction: i32) -> bool:
     if target_index >= 0 and target_index < shell.source_line_count:
         target_row: UiHandles::Handle = shell.source_line_rows[target_index.usize()]
         if UiHandles::request_focus(target_row):
-            target_prefix: darray[u8] = source_line_prefix(target_line + 1)
+            target_prefix: darray[u8] = source_line_prefix(shell, target_line + 1)
             target_bytes: mutable i64 = target_prefix.count.i64() + target_column
             target_text: sview = UiHandles::text_value(target_row)
             target_bytes <- target_text.len if target_bytes > target_text.len
@@ -402,7 +624,7 @@ def move_source_caret(shell: mutable Shell&, direction: i32, page_jump: bool) ->
     current_index: i32 = focused_source_row(shell)
     return false if current_index < 0
     current_row: UiHandles::Handle = shell.source_line_rows[current_index.usize()]
-    current_prefix: darray[u8] = source_line_prefix(shell.source_line_offsets[current_index.usize()] + 1)
+    current_prefix: darray[u8] = source_line_prefix(shell, shell.source_line_offsets[current_index.usize()] + 1)
     current_caret: usize = UiFlat::selection_end(current_row.widget_id.usize())
     source_column: mutable i64 = current_caret.i64() - current_prefix.count.i64()
     source_column <- 0 if source_column < 0
@@ -425,7 +647,7 @@ def move_source_caret(shell: mutable Shell&, direction: i32, page_jump: bool) ->
     return false if target_index < 0 or target_index >= shell.source_line_count
     target_row: UiHandles::Handle = shell.source_line_rows[target_index.usize()]
     return false if not UiHandles::request_focus(target_row)
-    target_prefix: darray[u8] = source_line_prefix(shell.source_line_offsets[target_index.usize()] + 1)
+    target_prefix: darray[u8] = source_line_prefix(shell, shell.source_line_offsets[target_index.usize()] + 1)
     target_value: sview = UiHandles::text_value(target_row)
     target_column: mutable i64 = target_value.len - target_prefix.count.i64()
     target_column <- source_column if source_column < target_column
@@ -605,12 +827,12 @@ def build_shell(shell: mutable Shell&) -> void:
     shell.build_button <- toolbar_button(shell, shell.toolbar, "Build", 64.0)
     UiHandles::set_help(shell.build_button, "Build the saved standalone Elisa source file or generate and compile the visual project")
     shell.run_button <- toolbar_button(shell, shell.toolbar, "Run", 58.0)
-    UiHandles::set_help(shell.run_button, "Run the last successful standalone-source or visual-project build")
+    UiHandles::set_help(shell.run_button, "Run the last successful standalone-source or visual-project build; open saved source to Debug")
     shell.stop_button <- toolbar_button(shell, shell.toolbar, "Stop", 58.0)
-    UiHandles::set_help(shell.stop_button, "Cancel the active build or stop the running application")
+    UiHandles::set_help(shell.stop_button, "Cancel the active build, stop the application, or end the debugger session")
     shell.save_button <- toolbar_button(shell, shell.toolbar, "Save", 64.0)
     shell.source_button <- toolbar_button(shell, shell.toolbar, "Source", 72.0)
-    UiHandles::set_help(shell.source_button, "Show an opened Elisa source file or the generated view")
+    UiHandles::set_help(shell.source_button, "Show an opened Elisa source file or the generated view; Ctrl/Cmd+Shift+T previews and runs package tests")
     shell.reload_button <- toolbar_button(shell, shell.toolbar, "Reload", 72.0)
     UiHandles::set_help(shell.reload_button, "Reload the on-disk form after an external change when the document is clean")
     UiHandles::set_visible(shell.reload_button, false)
@@ -682,6 +904,10 @@ def build_shell(shell: mutable Shell&) -> void:
     source_header: UiHandles::Handle = UiHandles::row(shell.source_pane, 6.0, 0.0, shell_color(22, 25, 31))
     UiHandles::set_grow(source_header, 0.0)
     shell.source_title <- UiHandles::label(source_header, "Generated Elisa source (read-only)", 15.0, shell_color(230, 234, 242))
+    shell.profile_button <- toolbar_button(shell, source_header, "Profile", 64.0)
+    UiHandles::set_help(shell.profile_button, "Capture a source-identified function profile for this saved Elisa file")
+    UiHandles::set_visible(shell.profile_button, false)
+    UiHandles::set_enabled(shell.profile_button, false)
     shell.source_open_editor_button <- toolbar_button(shell, source_header, "Open in Editor", 112.0)
     UiHandles::set_help(shell.source_open_editor_button, "Open the selected handwritten source line in the editor configured by ELISA_IDE_EDITOR")
     UiHandles::set_visible(shell.source_open_editor_button, false)
@@ -719,8 +945,6 @@ def build_shell(shell: mutable Shell&) -> void:
     shell.source_symbol_next_button <- toolbar_button(shell, source_symbol_row, "Next", 54.0)
     UiHandles::set_help(shell.source_symbol_next_button, "Open the next result from the latest workspace symbol search")
     UiHandles::set_enabled(shell.source_symbol_next_button, false)
-    shell.source_symbol_status <- UiHandles::label(source_symbol_row, "Workspace symbols unavailable", 10.0, shell_color(148, 158, 180))
-    UiHandles::set_grow(shell.source_symbol_status, 1.0)
     source_find_row: UiHandles::Handle = UiHandles::row(shell.source_pane, 5.0, 2.0, shell_color(22, 25, 31))
     UiHandles::set_grow(source_find_row, 0.0)
     shell.source_find_field <- UiHandles::text_field(source_find_row, "Find in source", "Search source text", "", 120.0, 22.0, 11.0, shell_color(232, 236, 246), shell_color(27, 32, 43))
@@ -776,13 +1000,13 @@ def build_shell(shell: mutable Shell&) -> void:
     UiHandles::set_grow(shell.bottom_splitter, 0.0)
     shell.bottom_pane <- UiHandles::column(shell.center_pane, 4.0, 2.0, shell_color(24, 27, 33))
     UiHandles::set_grow(shell.bottom_pane, 0.0)
-    _ = UiHandles::label(shell.bottom_pane, "Problems", 13.0, shell_color(148, 158, 180))
-    bottom_parent: UiHandles::Handle = shell.bottom_pane
-    build_problems(shell, bottom_parent)
+    shell.bottom_switch_button <- UiHandles::button(shell.bottom_pane, 132.0, 22.0, shell_color(42, 47, 58), panel_hover_color(shell.dark), panel_press_color(shell.dark))
+    build_problems(shell, shell.bottom_pane)
     shell.build_output <- UiHandles::label(shell.bottom_pane, "", 11.0, shell_color(172, 184, 204))
     UiHandles::set_cross_alignment(shell.build_output, UiConst::CrossAlignment.Start)
-    UiHandles::set_visible(shell.build_output, false)
-    UiHandles::set_grow(shell.build_output, 0.0)
+    UiHandles::set_grow(shell.build_output, 1.0)
+    shell.bottom_tab <- 0
+    select_bottom_tab(shell, 0)
 
     right_parent: UiHandles::Handle = shell.right_pane
     build_inspector(shell, right_parent)
@@ -984,6 +1208,8 @@ def open_document(shell: mutable Shell&) -> void:
     if path_has_suffix(path, ".elisa"):
         opened_source: HostClient::HostReply = HostClient::request_text(host_process, 112, 0, 0, path)
         if opened_source.result == 1:
+            shell.profile_report_ready <- false
+            shell.profile_recovery_ready <- false
             shell.source_page_start <- 0
             shell.source_mode <- true
             shell.standalone_source <- true
@@ -994,6 +1220,8 @@ def open_document(shell: mutable Shell&) -> void:
         return
     opened_form: HostClient::HostReply = HostClient::request_text(host_process, 11, 0, 0, path)
     if opened_form.result == 1:
+        shell.profile_report_ready <- false
+        shell.profile_recovery_ready <- false
         shell.source_mode <- false
         shell.standalone_source <- false
         shell.source_page_start <- 0
@@ -1012,6 +1240,8 @@ def create_project(shell: mutable Shell&) -> void:
     path: sview = UiHandles::text_value(shell.compact_open_path_field) if shell.compact_mode else UiHandles::text_value(shell.open_path_field)
     _ = HostClient::request_text(host_process, 19, 0, 0, path)
     shell.standalone_source <- false
+    shell.profile_report_ready <- false
+    shell.profile_recovery_ready <- false
     refresh_all(shell, host_process)
 
 def save_as_form(shell: mutable Shell&) -> void:
@@ -1021,6 +1251,8 @@ def save_as_form(shell: mutable Shell&) -> void:
         return
     path: sview = UiHandles::text_value(shell.compact_open_path_field) if shell.compact_mode else UiHandles::text_value(shell.open_path_field)
     _ = HostClient::request_text(host_process, 18, 0, 0, path)
+    shell.profile_report_ready <- false
+    shell.profile_recovery_ready <- false
     refresh_all(shell, host_process)
 
 def build_project_path(shell: mutable Shell&) -> cstr:
@@ -1034,6 +1266,680 @@ def source_build_path(shell: mutable Shell&) -> cstr:
     can Unsafe.PointerCast:
         path <- (&shell.building_source_path_storage[0]).cast[cstr] can Unsafe.PointerCast
     return path
+
+def profile_runner_path() -> cstr:
+    path: mutable cstr = ""
+    can Unsafe.PointerCast:
+        path <- (&profile_runner_path_storage[0]).cast[cstr] can Unsafe.PointerCast
+    return path
+
+def append_package_plan_capture(bytes: darray[u8]&, amount: usize) -> void:
+    index: mutable usize = 0
+    while index < amount:
+        if package_plan_length < 32768:
+            package_plan_storage[package_plan_length.usize()] <- bytes[index]
+            package_plan_length <- package_plan_length + 1
+        else:
+            package_plan_overflow <- true
+        index <- index + 1
+
+def package_helper_output_contains(needle: sview) -> bool:
+    return false if needle.len <= 0 or package_plan_length < needle.len
+    start: mutable i64 = 0
+    while start + needle.len <= package_plan_length:
+        matched: mutable bool = true
+        index: mutable i64 = 0
+        while index < needle.len |matched, index, start, needle|:
+            matched <- false if package_plan_storage[(start + index).usize()] != needle[index]
+            index <- index + 1
+        return true if matched
+        start <- start + 1
+    return false
+
+def run_package_helper(source_path: darray[u8]&, operation: cstr, detail_history: bool) -> bool can[Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast]:
+    package_plan_length <- 0
+    package_plan_exit_code <- -1
+    package_plan_overflow <- false
+    if package_runner_path_storage[0] == 0 and shell_preview_helper_path("package_runner", &package_runner_path_storage[0], BUILD_PATH_CAPACITY) != 0:
+        return false
+    arguments: mutable darray[cstr] = []
+    arguments.push("python3")
+    arguments.push((&package_runner_path_storage[0]).cast[cstr] can Unsafe.PointerCast)
+    arguments.push("history" if detail_history else operation)
+    arguments.push((&source_path[0]).cast[cstr] can Unsafe.PointerCast)
+    if detail_history:
+        history_index: cstr = "0" if package_history_selection == 0 else "1" if package_history_selection == 1 else "2" if package_history_selection == 2 else "3" if package_history_selection == 3 else "4" if package_history_selection == 4 else "5" if package_history_selection == 5 else "6" if package_history_selection == 6 else "7"
+        arguments.push(history_index)
+    elif cstr_equal(operation, "test-explorer"):
+        arguments.push(package_index_argument(package_test_explorer_run_selection, package_test_explorer_run_argument))
+        arguments.push(package_index_argument(package_test_case_selection, package_test_explorer_case_argument))
+    plan_process: mutable PosixProcess::Process = PosixProcess::start(&arguments)
+    return false if not PosixProcess::valid(plan_process)
+    start_ms: i64 = PosixProcess::monotonic_ms()
+    status: mutable PosixProcess::Status = PosixProcess::status(&plan_process)
+    while not status.finished and PosixProcess::monotonic_ms() - start_ms < 5000:
+        _ = PosixProcess::poll(&plan_process, 40)
+        output: mutable darray[u8] = []
+        amount: usize = PosixProcess::read_stdout(&plan_process, &output, PROCESS_OUTPUT_CAPACITY)
+        append_package_plan_capture(output, amount)
+        error_output: mutable darray[u8] = []
+        error_amount: usize = PosixProcess::read_stderr(&plan_process, &error_output, PROCESS_OUTPUT_CAPACITY)
+        append_package_plan_capture(error_output, error_amount)
+        status <- PosixProcess::status(&plan_process)
+    if not status.finished:
+        _ = PosixProcess::cancel(&plan_process)
+        _ = PosixProcess::poll(&plan_process, 1000)
+    status <- PosixProcess::status(&plan_process)
+    output: mutable darray[u8] = []
+    amount: usize = PosixProcess::read_stdout(&plan_process, &output, PROCESS_OUTPUT_CAPACITY)
+    append_package_plan_capture(output, amount)
+    error_output: mutable darray[u8] = []
+    error_amount: usize = PosixProcess::read_stderr(&plan_process, &error_output, PROCESS_OUTPUT_CAPACITY)
+    append_package_plan_capture(error_output, error_amount)
+    package_plan_exit_code <- status.exit_code
+    PosixProcess::dispose(&plan_process)
+    return status.finished and status.exit_code == 0 and not package_plan_overflow
+
+def parse_package_plan_record() -> bool:
+    line_start: mutable i64 = 0
+    while line_start < package_plan_length:
+        line_end: mutable i64 = line_start
+        while line_end < package_plan_length and package_plan_storage[line_end.usize()] != 10:
+            line_end <- line_end + 1
+        if line_end - line_start >= 6:
+            marker_matches: mutable bool = true
+            index: mutable i64 = 0
+            while index < 6:
+                byte: u8 = package_plan_storage[(line_start + index).usize()]
+                marker_matches <- false if index == 0 and byte != 80
+                marker_matches <- false if index == 1 and byte != 76
+                marker_matches <- false if index == 2 and byte != 65
+                marker_matches <- false if index == 3 and byte != 78
+                marker_matches <- false if index == 4 and byte != 49
+                marker_matches <- false if index == 5 and byte != 32
+                index <- index + 1
+            if marker_matches:
+                token_start: i64 = line_start + 6
+                token_end: mutable i64 = token_start
+                while token_end < line_end and package_plan_storage[token_end.usize()] != 32:
+                    token_end <- token_end + 1
+                return false if token_end - token_start != 64 or token_end >= line_end
+                index <- 0
+                while index < 64:
+                    byte: u8 = package_plan_storage[(token_start + index).usize()]
+                    return false if not ((byte >= 48 and byte <= 57) or (byte >= 97 and byte <= 102))
+                    package_plan_token_storage[index.usize()] <- byte
+                    index <- index + 1
+                package_plan_token_storage[64.usize()] <- 0
+                package_plan_target_length <- 0
+                target_start: i64 = token_end + 1
+                while target_start + package_plan_target_length < line_end:
+                    return false if package_plan_target_length >= 127
+                    byte: u8 = package_plan_storage[(target_start + package_plan_target_length).usize()]
+                    return false if not ((byte >= 97 and byte <= 122) or (byte >= 48 and byte <= 57) or byte == 45)
+                    package_plan_target_storage[package_plan_target_length.usize()] <- byte
+                    package_plan_target_length <- package_plan_target_length + 1
+                return false if package_plan_target_length == 0
+                package_plan_target_storage[package_plan_target_length.usize()] <- 0
+                return true
+        line_start <- line_end + 1
+    return false
+
+def parse_package_test_targets_record() -> bool:
+    package_test_targets_length <- 0
+    package_test_target_count <- 0
+    line_start: mutable i64 = 0
+    while line_start < package_plan_length:
+        line_end: mutable i64 = line_start
+        while line_end < package_plan_length and package_plan_storage[line_end.usize()] != 10:
+            line_end <- line_end + 1
+        if line_end - line_start >= 10:
+            marker_matches: mutable bool = true
+            index: mutable i64 = 0
+            while index < 9:
+                byte: u8 = package_plan_storage[(line_start + index).usize()]
+                marker_matches <- false if index == 0 and byte != 84
+                marker_matches <- false if index == 1 and byte != 65
+                marker_matches <- false if index == 2 and byte != 82
+                marker_matches <- false if index == 3 and byte != 71
+                marker_matches <- false if index == 4 and byte != 69
+                marker_matches <- false if index == 5 and byte != 84
+                marker_matches <- false if index == 6 and byte != 83
+                marker_matches <- false if index == 7 and byte != 49
+                marker_matches <- false if index == 8 and byte != 32
+                index <- index + 1
+            if marker_matches:
+                cursor: mutable i64 = line_start + 9
+                while cursor < line_end:
+                    while cursor < line_end and package_plan_storage[cursor.usize()] == 32:
+                        cursor <- cursor + 1
+                    break if cursor >= line_end
+                    return false if package_test_target_count >= MAX_PACKAGE_TEST_TARGETS
+                    target_start: i64 = cursor
+                    target_length: mutable i64 = 0
+                    while cursor < line_end and package_plan_storage[cursor.usize()] != 32:
+                        byte: u8 = package_plan_storage[cursor.usize()]
+                        if target_length == 0:
+                            return false if byte < 97 or byte > 122
+                        else:
+                            return false if not ((byte >= 97 and byte <= 122) or (byte >= 48 and byte <= 57) or byte == 45)
+                        target_length <- target_length + 1
+                        return false if target_length > 127
+                        cursor <- cursor + 1
+                    return false if target_length == 0
+                    return false if package_test_targets_length + target_length >= 8192
+                    index <- 0
+                    while index < target_length:
+                        package_test_targets_storage[(package_test_targets_length + index).usize()] <- package_plan_storage[(target_start + index).usize()]
+                        index <- index + 1
+                    package_test_targets_length <- package_test_targets_length + target_length
+                    package_test_targets_storage[package_test_targets_length.usize()] <- 0
+                    package_test_targets_length <- package_test_targets_length + 1
+                    package_test_target_count <- package_test_target_count + 1
+                return package_test_target_count > 0
+        line_start <- line_end + 1
+    return false
+
+def copy_package_test_target(index: i64) -> bool:
+    return false if index < 0 or index >= package_test_target_count
+    cursor: mutable i64 = 0
+    target_index: mutable i64 = 0
+    while target_index < package_test_target_count:
+        target_start: i64 = cursor
+        target_length: mutable i64 = 0
+        while cursor < package_test_targets_length and package_test_targets_storage[cursor.usize()] != 0:
+            cursor <- cursor + 1
+            target_length <- target_length + 1
+        return false if target_length > 127
+        if target_index == index:
+            package_plan_target_length <- target_length
+            copy_index: mutable i64 = 0
+            while copy_index < target_length:
+                package_plan_target_storage[copy_index.usize()] <- package_test_targets_storage[(target_start + copy_index).usize()]
+                copy_index <- copy_index + 1
+            package_plan_target_storage[target_length.usize()] <- 0
+            return true
+        cursor <- cursor + 1
+        target_index <- target_index + 1
+    return false
+
+def package_plan_token_matches_selected() -> bool:
+    return false if not package_selected_target_valid
+    index: mutable i32 = 0
+    while index < 65:
+        return false if package_plan_token_storage[index.usize()] != package_selected_token_storage[index.usize()]
+        index <- index + 1
+    return true
+
+def select_package_test_target_for_plan() -> bool:
+    if not package_plan_token_matches_selected() or package_selected_target_index >= package_test_target_count:
+        package_selected_target_index <- 0
+        index: mutable i32 = 0
+        while index < 65:
+            package_selected_token_storage[index.usize()] <- package_plan_token_storage[index.usize()]
+            index <- index + 1
+        package_selected_target_valid <- true
+    return copy_package_test_target(package_selected_target_index)
+
+def package_plan_target_matches_trusted() -> bool:
+    return false if package_plan_target_length != package_trusted_target_length
+    index: mutable i64 = 0
+    while index <= package_plan_target_length:
+        return false if package_plan_target_storage[index.usize()] != package_trusted_target_storage[index.usize()]
+        index <- index + 1
+    return true
+
+def copy_package_trusted_target() -> void:
+    index: mutable i64 = 0
+    while index <= package_plan_target_length:
+        package_trusted_target_storage[index.usize()] <- package_plan_target_storage[index.usize()]
+        index <- index + 1
+    package_trusted_target_length <- package_plan_target_length
+
+def package_plan_token_matches_pending() -> bool:
+    index: mutable i32 = 0
+    while index < 65:
+        return false if package_plan_token_storage[index.usize()] != package_pending_token_storage[index.usize()]
+        index <- index + 1
+    return true
+
+def package_plan_token_matches_trusted() -> bool:
+    index: mutable i32 = 0
+    while index < 65:
+        return false if package_plan_token_storage[index.usize()] != package_trusted_token_storage[index.usize()]
+        index <- index + 1
+    return true
+
+def package_plan_target_matches_pending() -> bool:
+    return false if package_plan_target_length != package_pending_target_length
+    index: mutable i64 = 0
+    while index <= package_plan_target_length:
+        return false if package_plan_target_storage[index.usize()] != package_pending_target_storage[index.usize()]
+        index <- index + 1
+    return true
+
+def copy_package_trust_token(target: mutable u8[65]&) -> void:
+    index: mutable i32 = 0
+    while index < 65:
+        target[index.usize()] <- package_plan_token_storage[index.usize()]
+        index <- index + 1
+
+def copy_package_trust_target(target: mutable u8[128]&) -> void:
+    index: mutable i64 = 0
+    while index <= package_plan_target_length:
+        target[index.usize()] <- package_plan_target_storage[index.usize()]
+        index <- index + 1
+
+def display_package_test_plan(shell: mutable Shell&) -> void:
+    plan_bytes: mutable darray[u8] = []
+    append_panel_text(&plan_bytes, "Selected test target: ")
+    append_panel_text(&plan_bytes, UiText::fixed_bytes_view_range[128](package_plan_target_storage, 0, package_plan_target_length.usize()))
+    append_panel_text(&plan_bytes, "\nNo project code has run.\nNot trusted: press Ctrl/Cmd+Shift+T again within 30 seconds to approve and run this target. Press Ctrl/Cmd+Option+Shift+T to cycle targets.\n\nPackage trust preview:\n")
+    prefix_length: mutable i64 = package_plan_length
+    scan: mutable i64 = 0
+    while scan < package_plan_length:
+        if scan + 6 <= package_plan_length and package_plan_storage[scan] == 80 and package_plan_storage[scan + 1] == 76 and package_plan_storage[scan + 2] == 65 and package_plan_storage[scan + 3] == 78 and package_plan_storage[scan + 4] == 49 and package_plan_storage[scan + 5] == 32:
+            prefix_length <- scan
+            break
+        scan <- scan + 1
+    scan <- 0
+    while scan < prefix_length:
+        plan_bytes.push(package_plan_storage[scan.usize()])
+        scan <- scan + 1
+    UiHandles::set_text(shell.build_output, ShellBytes::view_of(&plan_bytes), 11.0, shell_color(172, 184, 204))
+    UiHandles::set_visible(shell.build_output, true)
+    select_bottom_tab(shell, 1)
+    set_status_view(shell, "Review the selected package test target, then approve it with Ctrl/Cmd+Shift+T")
+
+def set_package_target_pending() -> void:
+    copy_package_trust_token(&package_pending_token_storage[0])
+    copy_package_trust_target(&package_pending_target_storage[0])
+    package_pending_target_length <- package_plan_target_length
+    package_pending_deadline_ms <- PosixProcess::monotonic_ms() + 30000
+
+def start_package_test_job(shell: mutable Shell&, source_path: darray[u8]) -> void can[Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast]:
+    if shell_task_running():
+        set_status_view(shell, "Wait for the current task to finish before running package tests")
+        return
+    if not copy_source_build_path(shell, bytes_view_range(source_path, 0, source_path.count - 1)):
+        set_status_view(shell, "Package tests require a saved Elisa source file")
+        return
+    shell.building_source_fingerprint <- HostClient::request(host_process, 152, 0, 0).result
+    package_task_source_fingerprint <- shell.building_source_fingerprint
+    build_revision <- build_revision + 1
+    if not BuildJob::begin(&build_job, build_revision):
+        set_status_view(shell, "Package test task could not start")
+        return
+    build_run_after <- false
+    build_debug_after <- false
+    profile_active <- false
+    shell.building_source <- false
+    shell.build_problem_count <- 0
+    package_task_active <- true
+    package_history_selection <- -1
+    package_test_explorer_open <- false
+    clear_tool_problem(shell, PROBLEM_TOOL_TEST_RUNNER)
+    target: cstr = (&package_plan_target_storage[0]).cast[cstr] can Unsafe.PointerCast
+    approval: cstr = (&package_plan_token_storage[0]).cast[cstr] can Unsafe.PointerCast
+    arguments: mutable darray[cstr] = []
+    arguments.push("python3")
+    arguments.push((&package_runner_path_storage[0]).cast[cstr] can Unsafe.PointerCast)
+    arguments.push("run")
+    arguments.push(source_build_path(shell))
+    arguments.push(target)
+    arguments.push(approval)
+    build_process <- PosixProcess::start(&arguments)
+    if not PosixProcess::valid(build_process):
+        _ = BuildJob::finish(&build_job, build_revision, -1)
+        package_task_active <- false
+        record_tool_problem(shell, PROBLEM_TOOL_TEST_RUNNER, 1, build_revision.i64(), package_task_source_fingerprint, "Package test runner could not start")
+        set_status_view(shell, "Package test runner could not start")
+        return
+    select_bottom_tab(shell, 1)
+    BuildJob::append_output(&build_job, "Running trusted package test target ")
+    BuildJob::append_output(&build_job, UiText::fixed_bytes_view_range[128](package_plan_target_storage, 0, package_plan_target_length.usize()))
+    BuildJob::append_output(&build_job, " with the local elisapkg runner...\n")
+    set_status_view(shell, "Running the selected Elisa package test")
+    refresh_build_output(shell)
+
+def run_package_tests(shell: mutable Shell&) -> void can[Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast]:
+    if shell_task_running():
+        set_status_view(shell, "Wait for the current task to finish before planning package tests")
+        return
+    if run_active or shell.debug_session_active:
+        set_status_view(shell, "Stop the running application or debugger before package tests")
+        return
+    if not shell.standalone_source or not shell.source_mode or not shell.host_running:
+        set_status_view(shell, "Run package tests from an opened Elisa source file inside an Elisa package")
+        return
+    if HostClient::request(host_process, 130, 0, 0).result == 1:
+        set_status_view(shell, "Save the source file before running package tests")
+        return
+    if HostClient::request(host_process, 138, 0, 0).result == 1:
+        set_status_view(shell, "Source changed on disk; compare or reload it before running package tests")
+        return
+    source_path: darray[u8] = source_path_for_external_action(host_process)
+    if source_path.count <= 1:
+        set_status_view(shell, "The saved source path for package tests is unavailable")
+        return
+    build_revision <- build_revision + 1
+    if not run_package_helper(source_path, "plan", false):
+        display: sview = UiText::fixed_bytes_view_range[32768](package_plan_storage, 0, package_plan_length.usize())
+        UiHandles::set_text(shell.build_output, display, 11.0, shell_color(235, 154, 154))
+        UiHandles::set_visible(shell.build_output, true)
+        select_bottom_tab(shell, 1)
+        clear_tool_problem(shell, PROBLEM_TOOL_PACKAGE_MANAGER)
+        record_tool_problem(shell, PROBLEM_TOOL_PACKAGE_MANAGER, 1, build_revision.i64(), HostClient::request(host_process, 152, 0, 0).result, "elisapkg test planning failed; inspect the displayed package diagnostic")
+        set_status_view(shell, "Package test planning failed; inspect Output")
+        return
+    if not parse_package_plan_record():
+        set_status_view(shell, "elisapkg returned an invalid package test plan")
+        record_tool_problem(shell, PROBLEM_TOOL_PACKAGE_MANAGER, 1, build_revision.i64(), HostClient::request(host_process, 152, 0, 0).result, "elisapkg returned an invalid test plan")
+        return
+    if not parse_package_test_targets_record() or not select_package_test_target_for_plan():
+        set_status_view(shell, "elisapkg returned an invalid package test target list")
+        record_tool_problem(shell, PROBLEM_TOOL_PACKAGE_MANAGER, 1, build_revision.i64(), HostClient::request(host_process, 152, 0, 0).result, "elisapkg returned an invalid test target list")
+        return
+    if package_plan_token_matches_trusted() and package_plan_target_matches_trusted():
+        start_package_test_job(shell, source_path)
+        return
+    if (package_pending_deadline_ms > PosixProcess::monotonic_ms()
+        and package_plan_token_matches_pending() and package_plan_target_matches_pending()):
+        copy_package_trust_token(&package_trusted_token_storage[0])
+        copy_package_trusted_target()
+        package_pending_deadline_ms <- 0
+        start_package_test_job(shell, source_path)
+        return
+    set_package_target_pending()
+    display_package_test_plan(shell)
+
+def cycle_package_test_target(shell: mutable Shell&) -> void can[Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast]:
+    if shell_task_running():
+        set_status_view(shell, "Wait for the current task to finish before changing the package test target")
+        return
+    if run_active or shell.debug_session_active:
+        set_status_view(shell, "Stop the running application or debugger before choosing a package test target")
+        return
+    if not shell.standalone_source or not shell.source_mode or not shell.host_running:
+        set_status_view(shell, "Choose package test targets from an opened Elisa source file inside an Elisa package")
+        return
+    if HostClient::request(host_process, 130, 0, 0).result == 1:
+        set_status_view(shell, "Save the source file before choosing a package test target")
+        return
+    if HostClient::request(host_process, 138, 0, 0).result == 1:
+        set_status_view(shell, "Source changed on disk; compare or reload it before choosing a package test target")
+        return
+    source_path: darray[u8] = source_path_for_external_action(host_process)
+    if source_path.count <= 1:
+        set_status_view(shell, "The saved source path for package tests is unavailable")
+        return
+    build_revision <- build_revision + 1
+    if not run_package_helper(source_path, "plan", false):
+        display: sview = UiText::fixed_bytes_view_range[32768](package_plan_storage, 0, package_plan_length.usize())
+        UiHandles::set_text(shell.build_output, display, 11.0, shell_color(235, 154, 154))
+        UiHandles::set_visible(shell.build_output, true)
+        select_bottom_tab(shell, 1)
+        set_status_view(shell, "Package test target discovery failed; inspect Output")
+        return
+    if not parse_package_plan_record() or not parse_package_test_targets_record() or not select_package_test_target_for_plan():
+        set_status_view(shell, "elisapkg returned an invalid package test target list")
+        record_tool_problem(shell, PROBLEM_TOOL_PACKAGE_MANAGER, 1, build_revision.i64(), HostClient::request(host_process, 152, 0, 0).result, "elisapkg returned an invalid test target list")
+        return
+    if package_test_target_count < 2:
+        set_status_view(shell, "This package declares only one test target")
+        return
+    package_selected_target_index <- (package_selected_target_index + 1) % package_test_target_count
+    index: mutable i32 = 0
+    while index < 65:
+        package_selected_token_storage[index.usize()] <- package_plan_token_storage[index.usize()]
+        index <- index + 1
+    package_selected_target_valid <- true
+    if not copy_package_test_target(package_selected_target_index):
+        set_status_view(shell, "The selected package test target could not be read")
+        return
+    set_package_target_pending()
+    display_package_test_plan(shell)
+
+def show_package_test_history(shell: mutable Shell&) -> void can[Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast]:
+    if shell_task_running():
+        set_status_view(shell, "Wait for the current task to finish before loading package test history")
+        return
+    if not shell.standalone_source or not shell.source_mode or not shell.host_running:
+        set_status_view(shell, "Open an Elisa source file inside a package to view its test history")
+        return
+    source_path: darray[u8] = source_path_for_external_action(host_process)
+    if source_path.count <= 1:
+        set_status_view(shell, "The saved source path for package test history is unavailable")
+        return
+    package_history_selection <- -1
+    package_test_explorer_open <- false
+    if not run_package_helper(source_path, "history", false):
+        display: sview = UiText::fixed_bytes_view_range[32768](package_plan_storage, 0, package_plan_length.usize())
+        UiHandles::set_text(shell.build_output, display, 11.0, shell_color(235, 154, 154))
+        UiHandles::set_visible(shell.build_output, true)
+        select_bottom_tab(shell, 1)
+        set_status_view(shell, "Package test history could not be read; inspect Output")
+        return
+    display: sview = UiText::fixed_bytes_view_range[32768](package_plan_storage, 0, package_plan_length.usize())
+    UiHandles::set_text(shell.build_output, display, 11.0, shell_color(172, 184, 204))
+    UiHandles::set_visible(shell.build_output, true)
+    select_bottom_tab(shell, 1)
+    set_status_view(shell, "Showing recent package test runs; use Ctrl/Cmd+Option+Shift+J/K to inspect run output")
+
+def show_package_test_explorer(shell: mutable Shell&) -> void can[Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast]:
+    if shell_task_running():
+        set_status_view(shell, "Wait for the current task to finish before opening the package test explorer")
+        return
+    if not shell.standalone_source or not shell.source_mode or not shell.host_running:
+        set_status_view(shell, "Open an Elisa source file inside a package to explore its test results")
+        return
+    source_path: darray[u8] = source_path_for_external_action(host_process)
+    if source_path.count <= 1:
+        set_status_view(shell, "The saved source path for the package test explorer is unavailable")
+        return
+    if package_test_explorer_open:
+        package_test_explorer_open <- false
+        package_history_selection <- package_test_explorer_run_selection
+        if not run_package_helper(source_path, "history", true):
+            set_status_view(shell, "Package test run detail could not be read; inspect Output")
+            return
+        display: sview = UiText::fixed_bytes_view_range[32768](package_plan_storage, 0, package_plan_length.usize())
+        UiHandles::set_text(shell.build_output, display, 11.0, shell_color(172, 184, 204))
+        UiHandles::set_visible(shell.build_output, true)
+        select_bottom_tab(shell, 1)
+        set_status_view(shell, "Showing the selected package test run")
+        return
+    package_test_explorer_run_selection <- package_history_selection if package_history_selection >= 0 else 0
+    package_test_case_selection <- 0
+    if not run_package_helper(source_path, "test-explorer", false):
+        display: sview = UiText::fixed_bytes_view_range[32768](package_plan_storage, 0, package_plan_length.usize())
+        UiHandles::set_text(shell.build_output, display, 11.0, shell_color(235, 154, 154))
+        UiHandles::set_visible(shell.build_output, true)
+        select_bottom_tab(shell, 1)
+        set_status_view(shell, "Package test results could not be read; inspect Output")
+        return
+    display: sview = UiText::fixed_bytes_view_range[32768](package_plan_storage, 0, package_plan_length.usize())
+    UiHandles::set_text(shell.build_output, display, 11.0, shell_color(172, 184, 204))
+    UiHandles::set_visible(shell.build_output, true)
+    select_bottom_tab(shell, 1)
+    if package_helper_output_contains("This run did not report structured Elisa @test cases"):
+        set_status_view(shell, "This package run has no structured Elisa test cases; its full output remains in run history")
+    else:
+        package_test_explorer_open <- true
+        set_status_view(shell, "Test explorer: Ctrl/Cmd+Option+Shift+J/K selects the previous/next case; E returns to run detail")
+
+def move_package_test_case(shell: mutable Shell&, next_case: bool) -> void can[Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast]:
+    return if not package_test_explorer_open or shell_task_running()
+    source_path: darray[u8] = source_path_for_external_action(host_process)
+    if source_path.count <= 1:
+        set_status_view(shell, "The saved source path for the package test explorer is unavailable")
+        return
+    previous_selection: i64 = package_test_case_selection
+    if next_case:
+        package_test_case_selection <- package_test_case_selection + 1
+    elif package_test_case_selection > 0:
+        package_test_case_selection <- package_test_case_selection - 1
+    else:
+        set_status_view(shell, "This is the first case in the package test result")
+        return
+    if not run_package_helper(source_path, "test-explorer", false):
+        invalid_selection: bool = package_helper_output_contains("selected Elisa test case index is invalid")
+        package_test_case_selection <- previous_selection
+        if invalid_selection:
+            set_status_view(shell, "This is the last case in the package test result")
+            _ = run_package_helper(source_path, "test-explorer", false)
+        else:
+            set_status_view(shell, "Package test case could not be read; inspect Output")
+    display: sview = UiText::fixed_bytes_view_range[32768](package_plan_storage, 0, package_plan_length.usize())
+    UiHandles::set_text(shell.build_output, display, 11.0, shell_color(172, 184, 204))
+    UiHandles::set_visible(shell.build_output, true)
+    select_bottom_tab(shell, 1)
+
+def move_package_test_history(shell: mutable Shell&, older: bool) -> void can[Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast]:
+    if package_test_explorer_open:
+        move_package_test_case(shell, older)
+        return
+    return if shell_task_running()
+    if not shell.standalone_source or not shell.source_mode or not shell.host_running:
+        set_status_view(shell, "Open an Elisa source file inside a package to inspect test history")
+        return
+    source_path: darray[u8] = source_path_for_external_action(host_process)
+    if source_path.count <= 1:
+        set_status_view(shell, "The saved source path for package test history is unavailable")
+        return
+    if older:
+        package_history_selection <- 0 if package_history_selection < 0 else 7 if package_history_selection >= 7 else package_history_selection + 1
+    else:
+        package_history_selection <- -1 if package_history_selection <= 0 else package_history_selection - 1
+    detail_history: bool = package_history_selection >= 0
+    if not run_package_helper(source_path, "history", detail_history):
+        set_status_view(shell, "Package test history entry could not be read; inspect Output")
+    else:
+        display: sview = UiText::fixed_bytes_view_range[32768](package_plan_storage, 0, package_plan_length.usize())
+        UiHandles::set_text(shell.build_output, display, 11.0, shell_color(172, 184, 204))
+        UiHandles::set_visible(shell.build_output, true)
+        select_bottom_tab(shell, 1)
+        set_status_view(shell, "Inspecting package test run history")
+
+def refresh_toolchain_doctor_output(shell: mutable Shell&) -> void:
+    output: sview = BuildJob::output_view(&toolchain_doctor_job)
+    if output.len > 0:
+        UiHandles::set_text(shell.build_output, output, 11.0, shell_color(172, 184, 204))
+        UiHandles::set_visible(shell.build_output, true)
+        select_bottom_tab(shell, 1)
+
+def start_toolchain_doctor(shell: mutable Shell&) -> void can[Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast]:
+    if shell_task_running():
+        set_status_view(shell, "Wait for the current task to finish before checking the toolchain")
+        return
+    if run_active or shell.debug_session_active:
+        set_status_view(shell, "Stop the running application or debugger before checking the toolchain")
+        return
+    toolchain_doctor_revision <- toolchain_doctor_revision + 1
+    if not BuildJob::begin(&toolchain_doctor_job, toolchain_doctor_revision):
+        set_status_view(shell, "Toolchain doctor could not start")
+        return
+    toolchain_doctor_active <- true
+    BuildJob::append_output(&toolchain_doctor_job, "Checking the compiler/runtime pair and native build prerequisites...\n")
+    arguments: mutable darray[cstr] = []
+    arguments.push("bash")
+    arguments.push("scripts/doctor.sh")
+    arguments.push("--core")
+    toolchain_doctor_process <- PosixProcess::start(&arguments)
+    if not PosixProcess::valid(toolchain_doctor_process):
+        _ = BuildJob::finish(&toolchain_doctor_job, toolchain_doctor_revision, -1)
+        toolchain_doctor_active <- false
+        BuildJob::append_output(&toolchain_doctor_job, "Toolchain doctor process could not start.\n")
+        refresh_toolchain_doctor_output(shell)
+        set_status_view(shell, "Toolchain doctor could not start; inspect Build Output")
+        return
+    refresh_toolchain_doctor_output(shell)
+    set_status_view(shell, "Checking the Elisa compiler/runtime pair and native build prerequisites")
+
+def poll_toolchain_doctor(shell: mutable Shell&) -> void can[Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast]:
+    return if not toolchain_doctor_active
+    _ = PosixProcess::poll(&toolchain_doctor_process, 0)
+    output: mutable darray[u8] = []
+    amount: usize = PosixProcess::read_stdout(&toolchain_doctor_process, &output, PROCESS_OUTPUT_CAPACITY)
+    if amount > 0:
+        BuildJob::append_output(&toolchain_doctor_job, ShellBytes::view_of(&output))
+    error_output: mutable darray[u8] = []
+    error_amount: usize = PosixProcess::read_stderr(&toolchain_doctor_process, &error_output, PROCESS_OUTPUT_CAPACITY)
+    if error_amount > 0:
+        BuildJob::append_output(&toolchain_doctor_job, ShellBytes::view_of(&error_output))
+    refresh_toolchain_doctor_output(shell) if amount > 0 or error_amount > 0
+    status: PosixProcess::Status = PosixProcess::status(&toolchain_doctor_process)
+    return if not status.finished
+    _ = BuildJob::finish(&toolchain_doctor_job, toolchain_doctor_revision, status.exit_code.i64())
+    PosixProcess::dispose(&toolchain_doctor_process)
+    toolchain_doctor_active <- false
+    refresh_toolchain_doctor_output(shell)
+    if toolchain_doctor_job.state == BuildJob::State.Succeeded:
+        set_status_view(shell, "Toolchain doctor passed; required compiler/runtime inputs are ready")
+    else:
+        set_status_view(shell, "Toolchain doctor found a missing or stale dependency; follow the actions in Build Output")
+
+def start_profile_report(shell: mutable Shell&) -> void can[Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast]:
+    if shell_task_running():
+        set_status_view(shell, "Wait for the current task to finish before opening a profile report")
+        return
+    if run_active or shell.debug_session_active:
+        set_status_view(shell, "Stop the running application or debugger before opening a profile report")
+        return
+    if not shell.standalone_source or not shell.source_mode or not shell.host_running:
+        set_status_view(shell, "Open the saved source associated with the profile report")
+        return
+    if HostClient::request(host_process, 113, 0, 0).result != 1 or HostClient::request(host_process, 130, 0, 0).result == 1:
+        shell.profile_report_ready <- false
+        shell.profile_recovery_ready <- false
+        set_status_view(shell, "Profile report is out of date; save the current source and capture it again")
+        return
+    if HostClient::request(host_process, 138, 0, 0).result == 1:
+        shell.profile_report_ready <- false
+        shell.profile_recovery_ready <- false
+        set_status_view(shell, "Profile report is out of date; compare or reload the changed source")
+        return
+    source_path: darray[u8] = source_path_for_external_action(host_process)
+    if source_path.count <= 1:
+        set_status_view(shell, "The saved source path for this profile report is unavailable")
+        return
+    if shell_preview_helper_path("profile_runner", &profile_runner_path_storage[0], BUILD_PATH_CAPACITY) != 0:
+        set_status_view(shell, "Profile runner is missing; rebuild the IDE helpers")
+        return
+    shell.building_source_fingerprint <- HostClient::request(host_process, 152, 0, 0).result
+    build_revision <- build_revision + 1
+    if not BuildJob::begin(&build_job, build_revision):
+        record_profile_problem(shell, 1, "Profile report task could not start")
+        set_status_view(shell, "Profile report could not start")
+        return
+    clear_tool_problem(shell, PROBLEM_TOOL_PROFILER)
+    build_run_after <- false
+    build_debug_after <- false
+    profile_active <- true
+    profile_open_active <- true
+    profile_recovery_active <- false
+    shell.building_source <- false
+    shell.build_problem_count <- 0
+    arguments: mutable darray[cstr] = []
+    arguments.push("python3")
+    arguments.push(profile_runner_path())
+    arguments.push("--open-latest-report")
+    viewer_source_path: mutable cstr = ""
+    can Unsafe.PointerCast:
+        viewer_source_path <- (&source_path[0]).cast[cstr] can Unsafe.PointerCast
+    arguments.push(viewer_source_path)
+    build_process <- PosixProcess::start(&arguments)
+    if not PosixProcess::valid(build_process):
+        _ = BuildJob::finish(&build_job, build_revision, -1)
+        profile_active <- false
+        profile_open_active <- false
+        record_profile_problem(shell, 1, "Profile report viewer could not start; check Python 3 and the configured viewer")
+        set_status_view(shell, "Profile report could not open; check Python 3 and the configured viewer")
+        return
+    select_bottom_tab(shell, 1)
+    UiHandles::set_text(shell.build_output, "Rendering and opening the saved profile report...", 11.0, shell_color(172, 184, 204))
+    UiHandles::set_visible(shell.build_output, true)
+    set_status_view(shell, "Opening the profile report for the unchanged saved source")
 
 def copy_source_build_path(shell: mutable Shell&, path: sview) -> bool:
     return false if path.len <= 0 or path.len >= SOURCE_PATH_CAPACITY.i64()
@@ -1102,10 +2008,11 @@ def project_path_matches_build(shell: Shell&) -> bool:
     return true
 
 def refresh_build_output(shell: mutable Shell&) -> void:
+    return if shell.debug_session_active
     output: sview = BuildJob::output_view(&build_job)
     if output.len > 0:
         UiHandles::set_text(shell.build_output, output, 11.0, shell_color(172, 184, 204))
-        UiHandles::set_visible(shell.build_output, true)
+        UiHandles::set_visible(shell.build_output, shell.bottom_tab == 1)
     diagnostic_count: i32 = build_diagnostic_count(output)
     if diagnostic_count != shell.build_problem_count:
         shell.build_problem_count <- diagnostic_count
@@ -1119,6 +2026,7 @@ def start_run_process(shell: mutable Shell&, source_run: bool) -> void can[Block
     run_process <- PosixProcess::start(&arguments)
     run_active <- PosixProcess::valid(run_process)
     if run_active:
+        select_bottom_tab(shell, 1)
         BuildJob::append_output(&build_job, "\n--- application run ---\n")
         set_status_view(shell, "Running Elisa source application..." if source_run else "Running generated application...")
         refresh_build_output(shell)
@@ -1126,7 +2034,9 @@ def start_run_process(shell: mutable Shell&, source_run: bool) -> void can[Block
         set_status_view(shell, "Run could not start; build the project again")
 
 def start_build_process(shell: mutable Shell&, run_after: bool) -> void can[Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast]:
-    if BuildJob::is_running(&build_job):
+    if shell.debug_session_active:
+        ShellDebug::stop(shell)
+    if shell_task_running():
         set_status_view(shell, "A build is already running")
         return
     if run_active:
@@ -1164,6 +2074,7 @@ def start_build_process(shell: mutable Shell&, run_after: bool) -> void can[Bloc
         set_status_view(shell, "Build could not start")
         return
     build_run_after <- run_after
+    build_debug_after <- false
     shell.building_source <- source_build
     if source_build:
         shell.source_artifact_valid <- false
@@ -1184,9 +2095,183 @@ def start_build_process(shell: mutable Shell&, run_after: bool) -> void can[Bloc
         build_run_after <- false
         set_status_view(shell, "Build could not start")
         return
+    select_bottom_tab(shell, 1)
     UiHandles::set_text(shell.build_output, "Building project...", 11.0, shell_color(172, 184, 204))
     UiHandles::set_visible(shell.build_output, true)
     set_status_view(shell, "Building project...")
+
+def start_debug_build(shell: mutable Shell&) -> void can[Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast]:
+    if shell_task_running():
+        set_status_view(shell, "Wait for the current build to finish")
+        return
+    if run_active:
+        set_status_view(shell, "Stop the running application before debugging")
+        return
+    if not shell.standalone_source or not shell.host_running or HostClient::request(host_process, 113, 0, 0).result != 1:
+        set_status_view(shell, "Debug currently requires an opened standalone Elisa source file")
+        return
+    if HostClient::request(host_process, 130, 0, 0).result == 1:
+        set_status_view(shell, "Save the source file before debugging it")
+        return
+    if HostClient::request(host_process, 138, 0, 0).result == 1:
+        set_status_view(shell, "Source changed on disk; compare or reload it before debugging")
+        return
+    source_path_reply: HostClient::HostReply = HostClient::request(host_process, 114, 0, 0)
+    if source_path_reply.result != 1 or not copy_source_build_path(shell, ShellBytes::view_of(&source_path_reply.text)):
+        set_status_view(shell, "Open a saved .elisa source file with a buildable path")
+        return
+    if shell.debug_session_active:
+        ShellDebug::stop(shell)
+    shell.building_source_fingerprint <- HostClient::request(host_process, 152, 0, 0).result
+    build_revision <- build_revision + 1
+    if not BuildJob::begin(&build_job, build_revision):
+        set_status_view(shell, "Debug build could not start")
+        return
+    build_run_after <- false
+    build_debug_after <- true
+    shell.building_source <- true
+    shell.debug_artifact_valid <- false
+    shell.build_problem_count <- 0
+    arguments: mutable darray[cstr] = []
+    arguments.push("bash")
+    arguments.push("scripts/build_debug_edir.sh")
+    arguments.push(source_build_path(shell))
+    arguments.push("build/elisa_ide_debug.edir")
+    build_process <- PosixProcess::start(&arguments)
+    if not PosixProcess::valid(build_process):
+        _ = BuildJob::finish(&build_job, build_revision, -1)
+        build_debug_after <- false
+        shell.building_source <- false
+        set_status_view(shell, "Optimized EDIR build could not start")
+        return
+    select_bottom_tab(shell, 1)
+    UiHandles::set_text(shell.build_output, "Building optimized managed-debug EDIR...", 11.0, shell_color(172, 184, 204))
+    UiHandles::set_visible(shell.build_output, true)
+    set_status_view(shell, "Building optimized EDIR with the current Elisa compiler...")
+
+def start_profile_capture(shell: mutable Shell&) -> void can[Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast]:
+    if shell.profile_recovery_ready:
+        start_profile_recovery(shell)
+        return
+    if shell.profile_report_ready:
+        start_profile_report(shell)
+        return
+    if shell_task_running():
+        set_status_view(shell, "Wait for the current task to finish before profiling")
+        return
+    if run_active:
+        set_status_view(shell, "Stop the running application before profiling its source")
+        return
+    if shell.debug_session_active:
+        set_status_view(shell, "Stop the debugger before starting a profile capture")
+        return
+    if not shell.standalone_source or not shell.source_mode or not shell.host_running or HostClient::request(host_process, 113, 0, 0).result != 1:
+        set_status_view(shell, "Profiling currently requires an opened standalone Elisa source file")
+        return
+    if HostClient::request(host_process, 130, 0, 0).result == 1:
+        set_status_view(shell, "Save the source file before profiling it")
+        return
+    if HostClient::request(host_process, 138, 0, 0).result == 1:
+        set_status_view(shell, "Source changed on disk; compare or reload it before profiling")
+        return
+    source_path_reply: HostClient::HostReply = HostClient::request(host_process, 114, 0, 0)
+    if source_path_reply.result != 1 or not copy_source_build_path(shell, ShellBytes::view_of(&source_path_reply.text)):
+        set_status_view(shell, "Open a saved .elisa source file with a buildable path")
+        return
+    if shell_preview_helper_path("profile_runner", &profile_runner_path_storage[0], BUILD_PATH_CAPACITY) != 0:
+        set_status_view(shell, "Profile runner is missing; rebuild the IDE helpers")
+        return
+    shell.building_source_fingerprint <- HostClient::request(host_process, 152, 0, 0).result
+    build_revision <- build_revision + 1
+    if not BuildJob::begin(&build_job, build_revision):
+        record_profile_problem(shell, 1, "Profile capture task could not start")
+        set_status_view(shell, "Profile capture could not start")
+        return
+    clear_tool_problem(shell, PROBLEM_TOOL_PROFILER)
+    build_run_after <- false
+    build_debug_after <- false
+    profile_active <- true
+    profile_open_active <- false
+    profile_recovery_active <- false
+    shell.profile_report_ready <- false
+    shell.profile_recovery_ready <- false
+    shell.building_source <- false
+    shell.build_problem_count <- 0
+    arguments: mutable darray[cstr] = []
+    arguments.push("python3")
+    arguments.push(profile_runner_path())
+    arguments.push(source_build_path(shell))
+    build_process <- PosixProcess::start(&arguments)
+    if not PosixProcess::valid(build_process):
+        _ = BuildJob::finish(&build_job, build_revision, -1)
+        profile_active <- false
+        record_profile_problem(shell, 1, "Profile runner could not start; check that Python 3 is available")
+        set_status_view(shell, "Profile runner could not start; check that Python 3 is available")
+        return
+    select_bottom_tab(shell, 1)
+    UiHandles::set_text(shell.build_output, "Profiling saved Elisa source...", 11.0, shell_color(172, 184, 204))
+    UiHandles::set_visible(shell.build_output, true)
+    set_status_view(shell, "Profiling source with Elisa profiler; Stop cancels the capture")
+
+def start_profile_recovery(shell: mutable Shell&) -> void can[Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast]:
+    if shell_task_running():
+        set_status_view(shell, "Wait for the current task to finish before recovering a profile")
+        return
+    if run_active or shell.debug_session_active:
+        set_status_view(shell, "Stop the running application or debugger before recovering a profile")
+        return
+    if not shell.standalone_source or not shell.source_mode or not shell.host_running:
+        set_status_view(shell, "Open the saved source associated with the partial profile")
+        return
+    if HostClient::request(host_process, 113, 0, 0).result != 1 or HostClient::request(host_process, 130, 0, 0).result == 1:
+        shell.profile_recovery_ready <- false
+        set_status_view(shell, "Profile recovery is out of date; save the matching source before recovery")
+        return
+    if HostClient::request(host_process, 138, 0, 0).result == 1:
+        shell.profile_recovery_ready <- false
+        set_status_view(shell, "Profile recovery is out of date; compare or reload the changed source")
+        return
+    source_path: darray[u8] = source_path_for_external_action(host_process)
+    if source_path.count <= 1:
+        set_status_view(shell, "The saved source path for profile recovery is unavailable")
+        return
+    if shell_preview_helper_path("profile_runner", &profile_runner_path_storage[0], BUILD_PATH_CAPACITY) != 0:
+        set_status_view(shell, "Profile runner is missing; rebuild the IDE helpers")
+        return
+    shell.building_source_fingerprint <- HostClient::request(host_process, 152, 0, 0).result
+    build_revision <- build_revision + 1
+    if not BuildJob::begin(&build_job, build_revision):
+        record_profile_problem(shell, 1, "Profile recovery task could not start")
+        set_status_view(shell, "Profile recovery could not start")
+        return
+    clear_tool_problem(shell, PROBLEM_TOOL_PROFILER)
+    build_run_after <- false
+    build_debug_after <- false
+    profile_active <- true
+    profile_open_active <- false
+    profile_recovery_active <- true
+    shell.building_source <- false
+    shell.build_problem_count <- 0
+    arguments: mutable darray[cstr] = []
+    arguments.push("python3")
+    arguments.push(profile_runner_path())
+    arguments.push("--recover-latest")
+    recovery_source_path: mutable cstr = ""
+    can Unsafe.PointerCast:
+        recovery_source_path <- (&source_path[0]).cast[cstr] can Unsafe.PointerCast
+    arguments.push(recovery_source_path)
+    build_process <- PosixProcess::start(&arguments)
+    if not PosixProcess::valid(build_process):
+        _ = BuildJob::finish(&build_job, build_revision, -1)
+        profile_active <- false
+        profile_recovery_active <- false
+        record_profile_problem(shell, 1, "Profile recovery runner could not start; check Python 3")
+        set_status_view(shell, "Profile recovery could not start; check that Python 3 is available")
+        return
+    select_bottom_tab(shell, 1)
+    UiHandles::set_text(shell.build_output, "Recovering complete frames from the private partial profile...", 11.0, shell_color(172, 184, 204))
+    UiHandles::set_visible(shell.build_output, true)
+    set_status_view(shell, "Recovering the newest partial profile for the unchanged saved source")
 
 def poll_build_process(shell: mutable Shell&) -> void can[Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast]:
     return if not BuildJob::is_running(&build_job)
@@ -1205,22 +2290,111 @@ def poll_build_process(shell: mutable Shell&) -> void can[Blocking.IO, Memory.Al
     exit_code: i64 = status.exit_code.i64()
     if status.cancelled:
         _ = BuildJob::request_cancel(&build_job)
-    _ = BuildJob::finish(&build_job, build_revision, exit_code)
+    package_inputs_stale: bool = package_task_active and (exit_code == PACKAGE_TASK_STALE_SUCCESS_EXIT or exit_code == PACKAGE_TASK_STALE_FAILURE_EXIT)
+    task_exit_code: i64 = 0 if exit_code == PACKAGE_TASK_STALE_SUCCESS_EXIT else 1 if exit_code == PACKAGE_TASK_STALE_FAILURE_EXIT else exit_code
+    _ = BuildJob::finish(&build_job, build_revision, task_exit_code)
     PosixProcess::dispose(&build_process)
+    if package_task_active:
+        package_task_active <- false
+        if package_inputs_stale:
+            record_tool_problem(shell, PROBLEM_TOOL_TEST_RUNNER, 2, build_revision.i64(), package_task_source_fingerprint, "Package test result is stale because its manifest, source tree, or package-manager identity changed during the run; inspect Output")
+            set_status_view(shell, "Package test result is stale; source-tree inputs changed while it ran")
+        elif build_job.state == BuildJob::State.Succeeded and build_source_still_current(shell):
+            clear_tool_problem(shell, PROBLEM_TOOL_TEST_RUNNER)
+            set_status_view(shell, "Elisa package tests passed for the unchanged source revision")
+        elif build_job.state == BuildJob::State.Succeeded:
+            record_tool_problem(shell, PROBLEM_TOOL_TEST_RUNNER, 2, build_revision.i64(), package_task_source_fingerprint, "Package test result is stale for the current source and was not attached")
+            set_status_view(shell, "Package tests finished, but the source changed; review the output as stale")
+        elif build_job.state == BuildJob::State.Cancelled:
+            clear_tool_problem(shell, PROBLEM_TOOL_TEST_RUNNER)
+            set_status_view(shell, "Package tests cancelled")
+        else:
+            record_tool_problem(shell, PROBLEM_TOOL_TEST_RUNNER, 1, build_revision.i64(), package_task_source_fingerprint, "Package tests failed; inspect Output for the test result and tool diagnostic")
+            set_status_view(shell, "Package tests failed; inspect Output")
+        refresh_build_output(shell)
+        return
+    if profile_active:
+        profile_active <- false
+        if profile_open_active:
+            profile_open_active <- false
+            if build_job.state == BuildJob::State.Succeeded:
+                clear_tool_problem(shell, PROBLEM_TOOL_PROFILER)
+                set_status_view(shell, "Profile report opened in the configured viewer")
+            elif build_job.state == BuildJob::State.Cancelled:
+                clear_tool_problem(shell, PROBLEM_TOOL_PROFILER)
+                set_status_view(shell, "Opening the profile report was cancelled")
+            else:
+                record_profile_problem(shell, 1, "Profile report could not open; inspect Build Output")
+                set_status_view(shell, "Profile report could not open; inspect Build Output")
+            refresh_build_output(shell)
+            return
+        if profile_recovery_active:
+            profile_recovery_active <- false
+            if build_job.state == BuildJob::State.Succeeded and build_source_still_current(shell):
+                clear_tool_problem(shell, PROBLEM_TOOL_PROFILER)
+                shell.profile_recovery_ready <- false
+                shell.profile_report_ready <- contains_ascii_fold(BuildJob::output_view(&build_job), "Profile report available")
+                set_status_view(shell, "Partial profile recovered; the incomplete report is ready to open")
+            elif build_job.state == BuildJob::State.Succeeded:
+                record_profile_problem(shell, 2, "Recovered profile is stale for the current source and was not attached")
+                set_status_view(shell, "Profile recovery finished, but its source changed; the report was not attached")
+            elif build_job.state == BuildJob::State.Cancelled:
+                clear_tool_problem(shell, PROBLEM_TOOL_PROFILER)
+                set_status_view(shell, "Profile recovery cancelled; the partial capture remains available")
+            else:
+                record_profile_problem(shell, 1, "Profile recovery failed; inspect Build Output and the retained manifest")
+                set_status_view(shell, "Profile recovery failed; inspect Build Output and the retained manifest")
+            refresh_build_output(shell)
+            return
+        if build_job.state == BuildJob::State.Succeeded:
+            if build_source_still_current(shell):
+                clear_tool_problem(shell, PROBLEM_TOOL_PROFILER)
+                shell.profile_report_ready <- contains_ascii_fold(BuildJob::output_view(&build_job), "Profile report available")
+                shell.profile_recovery_ready <- false
+                set_status_view(shell, "Profile capture completed; the validated report is in Build Output")
+            else:
+                shell.profile_report_ready <- false
+                shell.profile_recovery_ready <- false
+                BuildJob::append_output(&build_job, "\nProfile result is stale for the current editor buffer; the saved artifact is not attached.\n")
+                record_profile_problem(shell, 2, "Profile result is stale for the current editor buffer and was not attached")
+                set_status_view(shell, "Profile finished, but its source changed; the capture is retained without attaching it")
+        elif build_job.state == BuildJob::State.Cancelled:
+            clear_tool_problem(shell, PROBLEM_TOOL_PROFILER)
+            shell.profile_report_ready <- false
+            shell.profile_recovery_ready <- contains_ascii_fold(BuildJob::output_view(&build_job), "Profile recovery available")
+            set_status_view(shell, "Profile cancelled; any partial capture is retained for recovery")
+        else:
+            shell.profile_report_ready <- false
+            shell.profile_recovery_ready <- contains_ascii_fold(BuildJob::output_view(&build_job), "Profile recovery available")
+            record_profile_problem(shell, 1, "Profile failed; inspect Build Output and any retained recovery manifest")
+            set_status_view(shell, "Profile failed; inspect Build Output and any retained recovery manifest")
+        refresh_build_output(shell)
+        return
     if build_job.state == BuildJob::State.Succeeded:
         if shell.building_source:
             if build_source_still_current(shell):
-                artifact_index: mutable i64 = 0
-                while artifact_index < shell.building_source_path_length:
-                    shell.source_artifact_path_storage[artifact_index.usize()] <- shell.building_source_path_storage[artifact_index.usize()]
-                    artifact_index <- artifact_index + 1
-                shell.source_artifact_path_storage[artifact_index.usize()] <- 0
-                shell.source_artifact_path_length <- artifact_index
-                shell.source_artifact_fingerprint <- shell.building_source_fingerprint
-                shell.source_artifact_valid <- true
-                set_status_view(shell, "Source build succeeded; Run is ready")
+                if build_debug_after:
+                    shell.debug_artifact_fingerprint <- shell.building_source_fingerprint
+                    shell.debug_artifact_valid <- true
+                    source_path: sview = UiText::fixed_bytes_view_range[4096](shell.building_source_path_storage, 0, shell.building_source_path_length.usize())
+                    started: bool = ShellDebug::start(shell, DEBUG_EDIR_PATH, source_path, build_revision.i64(), shell.source_selected_line)
+                    if started:
+                        set_status_view(shell, "Managed debugger launched with the current saved source")
+                    build_debug_after <- false
+                else:
+                    artifact_index: mutable i64 = 0
+                    while artifact_index < shell.building_source_path_length:
+                        shell.source_artifact_path_storage[artifact_index.usize()] <- shell.building_source_path_storage[artifact_index.usize()]
+                        artifact_index <- artifact_index + 1
+                    shell.source_artifact_path_storage[artifact_index.usize()] <- 0
+                    shell.source_artifact_path_length <- artifact_index
+                    shell.source_artifact_fingerprint <- shell.building_source_fingerprint
+                    shell.source_artifact_valid <- true
+                    set_status_view(shell, "Source build succeeded; Run is ready")
             else:
-                set_status_view(shell, "Source changed during build; rebuild before running")
+                shell.debug_artifact_valid <- false if build_debug_after
+                build_debug_after <- false
+                set_status_view(shell, "Source changed during build; rebuild before running or debugging")
         else:
             set_status_view(shell, "Build succeeded")
         if build_run_after:
@@ -1228,9 +2402,13 @@ def poll_build_process(shell: mutable Shell&) -> void can[Blocking.IO, Memory.Al
             run_project(shell)
     elif build_job.state == BuildJob::State.Cancelled:
         build_run_after <- false
+        build_debug_after <- false
+        shell.debug_artifact_valid <- false
         set_status_view(shell, "Build cancelled")
     else:
         build_run_after <- false
+        build_debug_after <- false
+        shell.debug_artifact_valid <- false
         set_status_view(shell, "Build failed; inspect the Problems panel or build log")
     refresh_build_output(shell)
 
@@ -1260,26 +2438,73 @@ def poll_run_process(shell: mutable Shell&) -> void can[Blocking.IO, Memory.Allo
     else:
         set_status_view(shell, "Application exited with an error")
 
-def stop_build_run(shell: mutable Shell&) -> void can[Blocking.IO, Memory.Release]:
+def stop_build_run(shell: mutable Shell&) -> void can[Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast]:
     if BuildJob::is_running(&build_job):
+        was_package: bool = package_task_active
+        was_profile: bool = profile_active
+        was_profile_open: bool = profile_open_active
+        was_profile_recovery: bool = profile_recovery_active
         _ = BuildJob::request_cancel(&build_job)
         _ = PosixProcess::cancel(&build_process)
         _ = PosixProcess::poll(&build_process, 1000)
+        if (was_profile and not was_profile_open) or was_package:
+            output: mutable darray[u8] = []
+            amount: usize = PosixProcess::read_stdout(&build_process, &output, PROCESS_OUTPUT_CAPACITY)
+            BuildJob::append_output(&build_job, ShellBytes::view_of(&output)) if amount > 0
+            error_output: mutable darray[u8] = []
+            error_amount: usize = PosixProcess::read_stderr(&build_process, &error_output, PROCESS_OUTPUT_CAPACITY)
+            BuildJob::append_output(&build_job, ShellBytes::view_of(&error_output)) if error_amount > 0
         PosixProcess::dispose(&build_process)
         _ = BuildJob::finish(&build_job, build_revision, -1)
         build_run_after <- false
-        set_status_view(shell, "Build cancelled")
+        build_debug_after <- false
+        profile_active <- false
+        profile_open_active <- false
+        profile_recovery_active <- false
+        package_task_active <- false
+        if was_package:
+            clear_tool_problem(shell, PROBLEM_TOOL_TEST_RUNNER)
+            set_status_view(shell, "Package tests cancelled")
+        elif was_profile_open:
+            set_status_view(shell, "Opening the profile report was cancelled")
+        elif was_profile_recovery:
+            set_status_view(shell, "Profile recovery cancelled; the partial capture remains available")
+        elif was_profile:
+            shell.profile_recovery_ready <- contains_ascii_fold(BuildJob::output_view(&build_job), "Profile recovery available")
+            set_status_view(shell, "Profile cancelled; any partial capture is retained for recovery")
+        else:
+            set_status_view(shell, "Build cancelled")
+        refresh_build_output(shell)
+    if BuildJob::is_running(&toolchain_doctor_job):
+        _ = BuildJob::request_cancel(&toolchain_doctor_job)
+        _ = PosixProcess::cancel(&toolchain_doctor_process)
+        _ = PosixProcess::poll(&toolchain_doctor_process, 1000)
+        output: mutable darray[u8] = []
+        amount: usize = PosixProcess::read_stdout(&toolchain_doctor_process, &output, PROCESS_OUTPUT_CAPACITY)
+        BuildJob::append_output(&toolchain_doctor_job, ShellBytes::view_of(&output)) if amount > 0
+        error_output: mutable darray[u8] = []
+        error_amount: usize = PosixProcess::read_stderr(&toolchain_doctor_process, &error_output, PROCESS_OUTPUT_CAPACITY)
+        BuildJob::append_output(&toolchain_doctor_job, ShellBytes::view_of(&error_output)) if error_amount > 0
+        PosixProcess::dispose(&toolchain_doctor_process)
+        _ = BuildJob::finish(&toolchain_doctor_job, toolchain_doctor_revision, -1)
+        toolchain_doctor_active <- false
+        refresh_toolchain_doctor_output(shell)
+        set_status_view(shell, "Toolchain doctor cancelled")
     if run_active:
         _ = PosixProcess::cancel(&run_process)
         _ = PosixProcess::poll(&run_process, 1000)
         PosixProcess::dispose(&run_process)
         run_active <- false
         set_status_view(shell, "Application stopped")
+    if shell.debug_session_active:
+        ShellDebug::stop(shell)
 
 def run_project(shell: mutable Shell&) -> void can[Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast]:
-    if BuildJob::is_running(&build_job):
+    if shell_task_running():
         set_status_view(shell, "Wait for the build to finish")
         return
+    if shell.debug_session_active:
+        ShellDebug::stop(shell)
     if shell.standalone_source:
         if not shell.source_artifact_valid:
             set_status_view(shell, "Build this Elisa source file before running it")
@@ -1338,7 +2563,7 @@ def source_history_action(shell: mutable Shell&, opcode: i64) -> bool:
     if row_index >= 0 and row_index < shell.source_line_count:
         row: UiHandles::Handle = shell.source_line_rows[row_index.usize()]
         target_line <- shell.source_line_offsets[row_index.usize()]
-        prefix: darray[u8] = source_line_prefix(target_line + 1)
+        prefix: darray[u8] = source_line_prefix(shell, target_line + 1)
         caret_byte: usize = UiFlat::selection_end(row.widget_id.usize())
         caret_utf16: usize = UiFlat::text_utf16_offset(row.widget_id.usize(), caret_byte)
         column_units <- caret_utf16 - prefix.count if caret_utf16 > prefix.count else 0
@@ -1361,7 +2586,7 @@ def source_history_action(shell: mutable Shell&, opcode: i64) -> bool:
     if target_index >= 0 and target_index < shell.source_line_count:
         target_row: UiHandles::Handle = shell.source_line_rows[target_index.usize()]
         if UiHandles::request_focus(target_row):
-            target_prefix: darray[u8] = source_line_prefix(target_line + 1)
+            target_prefix: darray[u8] = source_line_prefix(shell, target_line + 1)
             text_units: usize = UiFlat::text_utf16_length(target_row.widget_id.usize())
             available_units: usize = text_units - target_prefix.count if text_units > target_prefix.count else 0
             column_units <- available_units if column_units > available_units
@@ -1375,6 +2600,8 @@ def run_shell_command(shell: mutable Shell&, command_id: u32) -> void:
     if command_id == ShellCommand.NewDocument.u32():
         command(shell, 10, 0)
         shell.standalone_source <- false
+        shell.profile_report_ready <- false
+        shell.profile_recovery_ready <- false
     elif command_id == ShellCommand.OpenDocument.u32():
         open_document(shell)
     elif command_id == ShellCommand.NewProject.u32():
@@ -1382,6 +2609,8 @@ def run_shell_command(shell: mutable Shell&, command_id: u32) -> void:
     elif command_id == ShellCommand.SaveDocument.u32():
         if shell.host_running and shell.source_mode and HostClient::request(host_process, 113, 0, 0).result == 1:
             _ = HostClient::request(host_process, 131, 0, 0)
+            shell.profile_report_ready <- false
+            shell.profile_recovery_ready <- false
             status: HostClient::HostReply = HostClient::request(host_process, 56, 0, 0)
             set_status(shell, status.text)
             refresh_source_view(shell, host_process)
@@ -1394,6 +2623,8 @@ def run_shell_command(shell: mutable Shell&, command_id: u32) -> void:
             saved: HostClient::HostReply = HostClient::request_text(host_process, 146, 0, 0, path)
             set_status(shell, HostClient::request(host_process, 56, 0, 0).text)
             if saved.result == 1:
+                shell.profile_report_ready <- false
+                shell.profile_recovery_ready <- false
                 shell.source_compare_mode <- false
                 ShellLsp::sync_active(shell, host_process)
                 refresh_source_view(shell, host_process)
@@ -1442,6 +2673,38 @@ def run_shell_command(shell: mutable Shell&, command_id: u32) -> void:
         run_project(shell)
     elif command_id == ShellCommand.StopProject.u32():
         stop_build_run(shell)
+    elif command_id == ShellCommand.DebugProject.u32():
+        start_debug_build(shell)
+    elif command_id == ShellCommand.RestartDebug.u32():
+        start_debug_build(shell)
+    elif command_id == ShellCommand.ContinueDebug.u32():
+        ShellDebug::continue_execution(shell)
+    elif command_id == ShellCommand.StepDebug.u32():
+        ShellDebug::step_next(shell)
+    elif command_id == ShellCommand.PauseDebug.u32():
+        ShellDebug::pause(shell)
+    elif command_id == ShellCommand.NextDebugFrame.u32():
+        ShellDebug::select_frame(shell, true)
+    elif command_id == ShellCommand.PreviousDebugFrame.u32():
+        ShellDebug::select_frame(shell, false)
+    elif command_id == ShellCommand.NextDebugThread.u32():
+        ShellDebug::select_thread(shell, true)
+    elif command_id == ShellCommand.PreviousDebugThread.u32():
+        ShellDebug::select_thread(shell, false)
+    elif command_id == ShellCommand.RunPackageTests.u32():
+        run_package_tests(shell)
+    elif command_id == ShellCommand.CyclePackageTestTarget.u32():
+        cycle_package_test_target(shell)
+    elif command_id == ShellCommand.ShowPackageTestHistory.u32():
+        show_package_test_history(shell)
+    elif command_id == ShellCommand.OlderPackageTestHistory.u32():
+        move_package_test_history(shell, true)
+    elif command_id == ShellCommand.NewerPackageTestHistory.u32():
+        move_package_test_history(shell, false)
+    elif command_id == ShellCommand.TogglePackageTestExplorer.u32():
+        show_package_test_explorer(shell)
+    elif command_id == ShellCommand.ToolchainDoctor.u32():
+        start_toolchain_doctor(shell)
 
 def shell_text_focus(shell: Shell&) -> bool:
     return true if UiFlat::accepts_text()
@@ -1469,12 +2732,23 @@ def handle_shell_event(shell: mutable Shell&, incoming: UiCore::Event) -> void:
             UiHandles::layout(UiCore::viewport_width(), UiCore::viewport_height())
             return
         UiCore::PointerEvent.Down(at, button):
+            if shell.source_mode and shell.host_running and button == UiCore::PointerButton.Secondary.i32() and HostClient::request(host_process, 113, 0, 0).result == 1:
+                breakpoint_row: i32 = source_row_at(shell, at)
+                if breakpoint_row >= 0 and breakpoint_row < shell.source_line_count:
+                    source_line: i64 = shell.source_line_offsets[breakpoint_row.usize()] + 1
+                    _ = ShellDebug::toggle_breakpoint(shell, source_line)
+                    return
             if shell.source_mode and shell.host_running and button == UiCore::PointerButton.Primary.i32():
+                gutter_row: i32 = source_gutter_row_at(shell, at)
+                if gutter_row >= 0 and HostClient::request(host_process, 113, 0, 0).result == 1:
+                    shell.source_selected_line <- shell.source_line_offsets[gutter_row.usize()] + 1
+                    _ = ShellDebug::toggle_breakpoint(shell, shell.source_selected_line)
+                    return
                 focused_before_click: i32 = focused_source_row(shell)
                 if focused_before_click >= 0 and focused_before_click < shell.source_line_count:
                     focused_row: UiHandles::Handle = shell.source_line_rows[focused_before_click.usize()]
                     shell.source_selected_line <- shell.source_line_offsets[focused_before_click.usize()] + 1
-                    prefix_before_click: darray[u8] = source_line_prefix(shell.source_selected_line)
+                    prefix_before_click: darray[u8] = source_line_prefix(shell, shell.source_selected_line)
                     caret_before_click: usize = UiFlat::selection_utf16_location(focused_row.widget_id.usize())
                     shell.source_selected_character <- (caret_before_click - prefix_before_click.count if caret_before_click >= prefix_before_click.count else 0).i32()
             if shell.source_mode and shell.host_running and button == UiCore::PointerButton.Primary.i32() and HostClient::request(host_process, 113, 0, 0).result == 1:
@@ -1559,7 +2833,7 @@ def handle_shell_event(shell: mutable Shell&, incoming: UiCore::Event) -> void:
                 if focused >= 0 and focused < shell.source_line_count:
                     row: UiHandles::Handle = shell.source_line_rows[focused.usize()]
                     shell.source_selected_line <- shell.source_line_offsets[focused.usize()] + 1
-                    prefix: darray[u8] = source_line_prefix(shell.source_selected_line)
+                    prefix: darray[u8] = source_line_prefix(shell, shell.source_selected_line)
                     caret: usize = UiFlat::selection_utf16_location(row.widget_id.usize())
                     shell.source_selected_character <- (caret - prefix.count if caret >= prefix.count else 0).i32()
             if button == UiCore::PointerButton.Primary.i32() and ShellPreview::select_at(shell, host_process, at):
@@ -1644,11 +2918,8 @@ def handle_shell_event(shell: mutable Shell&, incoming: UiCore::Event) -> void:
         _:
             UiHandles::handle(incoming)
 
-def source_line_prefix(line_number: i64) -> darray[u8]:
-    prefix: mutable darray[u8] = []
-    append_nonnegative(&prefix, line_number)
-    append_panel_text(&prefix, ": ")
-    return prefix
+def source_line_prefix(shell: Shell&, line_number: i64) -> darray[u8]:
+    return ShellDebug::source_gutter_prefix(shell, line_number)
 
 def parse_source_line_number(value: sview) -> i64:
     return -1 if value.len == 0 or value.len > 7
@@ -1688,7 +2959,7 @@ def go_to_source_line(shell: mutable Shell&, requested_line: i64) -> bool:
     target: UiHandles::Handle = shell.source_line_rows[target_index.usize()]
     return false if not UiHandles::request_focus(target)
     shell.source_selected_line <- requested_line
-    prefix: darray[u8] = source_line_prefix(requested_line)
+    prefix: darray[u8] = source_line_prefix(shell, requested_line)
     UiHandles::set_selection(target, prefix.count, prefix.count)
     reveal_source_row(shell, target)
     status: mutable darray[u8] = []
@@ -1703,7 +2974,7 @@ def go_to_source_position(shell: mutable Shell&, requested_line: i64, requested_
     target_index: i32 = (requested_line - 1 - shell.source_page_start).i32()
     return false if target_index < 0 or target_index >= shell.source_line_count
     target: UiHandles::Handle = shell.source_line_rows[target_index.usize()]
-    prefix: darray[u8] = source_line_prefix(requested_line)
+    prefix: darray[u8] = source_line_prefix(shell, requested_line)
     value: sview = UiHandles::text_value(target)
     body: sview = string_view_slice(value, prefix.count.i64(), value.len)
     body_column_utf16: usize = ShellLsp::character_to_utf16(body, encoding, requested_character)
@@ -1727,7 +2998,7 @@ def request_source_definition(shell: mutable Shell&) -> void:
     if selected_index >= 0 and selected_index < shell.source_line_count:
         selected_row: UiHandles::Handle = shell.source_line_rows[selected_index.usize()]
         requested_line <- shell.source_line_offsets[selected_index.usize()]
-        prefix: darray[u8] = source_line_prefix(requested_line + 1)
+        prefix: darray[u8] = source_line_prefix(shell, requested_line + 1)
         caret: usize = UiFlat::selection_utf16_location(selected_row.widget_id.usize())
         requested_utf16 <- caret - prefix.count if caret >= prefix.count else 0
         shell.source_selected_line <- requested_line + 1
@@ -2171,7 +3442,7 @@ def navigate_to_source_query(shell: mutable Shell&, query: sview) -> bool:
     _ = UiHandles::request_focus(target)
     line_start: i64 = HostClient::request(host_process, 118, target_line, 0).result
     column: usize = (match_offset - line_start).usize()
-    prefix: darray[u8] = source_line_prefix(target_line + 1)
+    prefix: darray[u8] = source_line_prefix(shell, target_line + 1)
     UiHandles::set_selection(target, prefix.count + column, prefix.count + column + query.len.usize())
     reveal_source_row(shell, target)
     status: mutable darray[u8] = []
@@ -2194,7 +3465,7 @@ def find_source_text(shell: mutable Shell&, forward: bool) -> bool:
         row_index: i32 = focused_source_row(shell)
         if row_index >= 0 and row_index < shell.source_line_count and UiHandles::is_enabled(shell.source_line_rows[row_index.usize()]):
             row: UiHandles::Handle = shell.source_line_rows[row_index.usize()]
-            prefix: darray[u8] = source_line_prefix(shell.source_line_offsets[row_index.usize()] + 1)
+            prefix: darray[u8] = source_line_prefix(shell, shell.source_line_offsets[row_index.usize()] + 1)
             line_start: i64 = HostClient::request(host_process, 118, shell.source_line_offsets[row_index.usize()], 0).result
             selection_start: usize = UiFlat::selection_start(row.widget_id.usize())
             selection_end: usize = UiFlat::selection_end(row.widget_id.usize())
@@ -2237,7 +3508,7 @@ def find_source_text(shell: mutable Shell&, forward: bool) -> bool:
     _ = UiHandles::request_focus(target)
     line_start: i64 = HostClient::request(host_process, 118, target_line, 0).result
     column: usize = (match_offset - line_start).usize()
-    prefix: darray[u8] = source_line_prefix(target_line + 1)
+    prefix: darray[u8] = source_line_prefix(shell, target_line + 1)
     UiHandles::set_selection(target, prefix.count + column, prefix.count + column + query.len.usize())
     reveal_source_row(shell, target)
     status: mutable darray[u8] = []
@@ -2297,7 +3568,7 @@ def replace_next_source_text(shell: mutable Shell&) -> bool:
     if UiHandles::is_enabled(target):
         _ = UiHandles::request_focus(target)
         line_start: i64 = HostClient::request(host_process, 118, current_line, 0).result
-        prefix: darray[u8] = source_line_prefix(current_line + 1)
+        prefix: darray[u8] = source_line_prefix(shell, current_line + 1)
         begin: usize = prefix.count + (match_offset - line_start).usize()
         UiHandles::set_selection(target, begin, begin + replacement.len.usize())
         shell.source_selected_line <- current_line + 1
@@ -2340,7 +3611,7 @@ def select_source_line_body(shell: mutable Shell&) -> bool:
     return false if row_index < 0 or row_index >= shell.source_line_count
     row: UiHandles::Handle = shell.source_line_rows[row_index.usize()]
     return false if not UiHandles::is_enabled(row)
-    prefix: darray[u8] = source_line_prefix(shell.source_line_offsets[row_index.usize()] + 1)
+    prefix: darray[u8] = source_line_prefix(shell, shell.source_line_offsets[row_index.usize()] + 1)
     value: sview = UiHandles::text_value(row)
     source_start: mutable usize = prefix.count
     source_finish: usize = value.len.usize()
@@ -2359,12 +3630,13 @@ def source_line_prefix_matches(value: sview, prefix: darray[u8]&) -> bool:
 
 def source_line_changed(shell: mutable Shell&, index: i32) -> void:
     return if not shell.host_running or index < 0 or index >= shell.source_line_count
+    debug_was_active: bool = shell.debug_session_active
     shell.source_find_match_valid <- false
     return if HostClient::request(host_process, 113, 0, 0).result != 1
     row: UiHandles::Handle = shell.source_line_rows[index.usize()]
     value: sview = UiHandles::text_value(row)
     line_index: i64 = shell.source_line_offsets[index.usize()]
-    prefix: darray[u8] = source_line_prefix(line_index + 1)
+    prefix: darray[u8] = source_line_prefix(shell, line_index + 1)
     body: mutable sview = ""
     copied_body: mutable darray[u8] = []
     if source_line_prefix_matches(value, prefix):
@@ -2385,11 +3657,18 @@ def source_line_changed(shell: mutable Shell&, index: i32) -> void:
     if result.result == 1:
         shell.source_find_match_valid <- false
         ShellLsp::sync_active(shell, host_process)
+        source_path: HostClient::HostReply = HostClient::request(host_process, 114, 0, 0)
+        if source_path.result == 1:
+            source_fingerprint: i64 = HostClient::request(host_process, 152, 0, 0).result
+            ShellDebug::ensure_source(shell, ShellBytes::view_of(&source_path.text), source_fingerprint)
         dirty: bool = HostClient::request(host_process, 130, 0, 0).result == 1
         UiHandles::set_text(shell.source_title, "Elisa source (modified)" if dirty else "Elisa source", 15.0, shell_color(230, 234, 242))
         refresh_history_buttons(shell, host_process)
         refresh_source_conflict_bar(shell, host_process)
-        set_status_view(shell, "Elisa source has unsaved changes" if dirty else "Elisa source matches the saved file")
+        if debug_was_active and not shell.debug_session_active:
+            set_status_view(shell, "Debug session stopped and breakpoints cleared because the source changed; save and rebuild before debugging again")
+        else:
+            set_status_view(shell, "Elisa source has unsaved changes" if dirty else "Elisa source matches the saved file")
     else:
         status: HostClient::HostReply = HostClient::request(host_process, 56, 0, 0)
         set_status(shell, status.text)
@@ -2409,7 +3688,7 @@ def widget_event(shell: mutable Shell&, widget: usize, event: i32) -> void:
         while index < shell.source_line_count:
             if UiHandles::callback_matches(widget, shell.source_line_rows[index.usize()]):
                 shell.source_selected_line <- shell.source_line_offsets[index.usize()] + 1
-                prefix: darray[u8] = source_line_prefix(shell.source_selected_line)
+                prefix: darray[u8] = source_line_prefix(shell, shell.source_selected_line)
                 caret: usize = UiFlat::selection_utf16_location(widget)
                 shell.source_selected_character <- (caret - prefix.count if caret >= prefix.count else 0).i32()
                 source_line_changed(shell, index)
@@ -2461,6 +3740,7 @@ def widget_event(shell: mutable Shell&, widget: usize, event: i32) -> void:
     build_handle: UiHandles::Handle = shell.build_button
     run_handle: UiHandles::Handle = shell.run_button
     stop_handle: UiHandles::Handle = shell.stop_button
+    profile_handle: UiHandles::Handle = shell.profile_button
     open_handle: UiHandles::Handle = shell.open_button
     save_as_handle: UiHandles::Handle = shell.save_as_button
     new_project_handle: UiHandles::Handle = shell.new_project_button
@@ -2540,10 +3820,19 @@ def widget_event(shell: mutable Shell&, widget: usize, event: i32) -> void:
         run_shell_command(shell, ShellCommand.BuildProject.u32())
         return
     if UiHandles::callback_matches(widget, run_handle):
+        if shell.debug_session_active:
+            run_shell_command(shell, ShellCommand.ContinueDebug.u32())
+            return
+        if shell.standalone_source:
+            run_shell_command(shell, ShellCommand.DebugProject.u32())
+            return
         run_shell_command(shell, ShellCommand.RunProject.u32())
         return
     if UiHandles::callback_matches(widget, stop_handle):
         run_shell_command(shell, ShellCommand.StopProject.u32())
+        return
+    if UiHandles::callback_matches(widget, profile_handle):
+        start_profile_capture(shell)
         return
     if UiHandles::callback_matches(widget, open_handle):
         run_shell_command(shell, ShellCommand.OpenDocument.u32())
@@ -2688,6 +3977,27 @@ def widget_event_events(shell: mutable Shell&, widget: usize, event: i32) -> boo
     return false
 
 def widget_event_rows(shell: mutable Shell&, widget: usize) -> bool:
+    if UiHandles::callback_matches(widget, shell.bottom_switch_button):
+        if shell.debug_session_active or shell.debug_snapshot_valid:
+            next_tab: i32 = 1 if shell.bottom_tab == 0 else (2 if shell.bottom_tab == 1 else 0)
+            select_bottom_tab(shell, next_tab)
+        else:
+            select_bottom_tab(shell, 1 if shell.bottom_tab == 0 else 0)
+        UiHandles::layout(UiCore::viewport_width(), UiCore::viewport_height())
+        return true
+    if shell.bottom_tab == 2:
+        if UiHandles::callback_matches(widget, shell.problem_previous_button):
+            ShellDebug::select_thread(shell, false)
+            return true
+        if UiHandles::callback_matches(widget, shell.problem_next_button):
+            ShellDebug::select_thread(shell, true)
+            return true
+        index: mutable i32 = 0
+        while index < shell.debug_frame_count:
+            if UiHandles::callback_matches(widget, shell.problem_rows[index.usize()]):
+                ShellDebug::select_frame_row(shell, index)
+                return true
+            index <- index + 1
     if UiHandles::callback_matches(widget, shell.source_symbol_search_button):
         request_workspace_symbol_search(shell)
         return true
@@ -2868,12 +4178,16 @@ def widget_event_rows(shell: mutable Shell&, widget: usize) -> bool:
             shell.problem_copy_truncated <- diagnostic_text.len > copied_length
             UiHandles::set_enabled(shell.problem_copy_button, copied_length > 0)
             logical_row: i64 = shell.problem_page.i64() * MAX_PROBLEM_ROWS.i64() + index.i64()
-            if logical_row < shell.projection.problem_count:
+            design_count: i64 = shell.projection.problem_count
+            lsp_count: i64 = shell.source_lsp_diagnostics.i64()
+            build_count: i64 = build_diagnostic_count(build_output_text(shell)).i64()
+            build_end: i64 = design_count + lsp_count + build_count
+            if logical_row < design_count:
                 target_row: i64 = HostClient::request(host_process, 100, logical_row, 0).result
                 if target_row >= 0:
                     command(shell, 31, target_row)
-            elif logical_row < shell.projection.problem_count + shell.source_lsp_diagnostics.i64():
-                diagnostic_index: i32 = (logical_row - shell.projection.problem_count).i32()
+            elif logical_row < design_count + lsp_count:
+                diagnostic_index: i32 = (logical_row - design_count).i32()
                 shell.selected_lsp_diagnostic_index <- diagnostic_index
                 capture_selected_related_locations(shell, diagnostic_index)
                 refresh_problems(shell, host_process)
@@ -2890,8 +4204,8 @@ def widget_event_rows(shell: mutable Shell&, widget: usize) -> bool:
                     set_status_view(shell, ShellBytes::view_of(&status))
                 else:
                     set_status_view(shell, "This Elisa-LSP diagnostic has no navigable source line")
-            else:
-                build_line: sview = build_diagnostic_at(build_output_text(shell), (logical_row - shell.projection.problem_count - shell.source_lsp_diagnostics.i64()).i32())
+            elif logical_row < build_end:
+                build_line: sview = build_diagnostic_at(build_output_text(shell), (logical_row - design_count - lsp_count).i32())
                 build_source_line: mutable i64 = -1
                 build_source_character: mutable i32 = -1
                 if build_diagnostic_matches_open_source(build_line, host_process, &build_source_line, &build_source_character):
@@ -2935,6 +4249,18 @@ def widget_event_rows(shell: mutable Shell&, widget: usize) -> bool:
                             _ = navigate_to_build_source(shell, ShellBytes::view_of(&location_path), location_line, location_character)
                         else:
                             set_status_view(shell, "Build diagnostic source mapping is unavailable for this output line")
+            else:
+                task_index: i32 = active_tool_problem_index(shell, logical_row - build_end)
+                if task_index >= 0:
+                    problem: ToolProblem& = &shell.tool_problems[task_index.usize()]
+                    status: mutable darray[u8] = []
+                    append_panel_text(&status, "Selected ")
+                    append_panel_text(&status, tool_problem_owner_name(problem.owner))
+                    append_panel_text(&status, " problem from task ")
+                    append_nonnegative(&status, problem.task_id)
+                    append_panel_text(&status, " at source revision ")
+                    append_nonnegative(&status, problem.source_revision)
+                    set_status_view(shell, ShellBytes::view_of(&status))
             return true
         index <- index + 1
     hierarchy_total: i32 = shell.hierarchy_count
@@ -2952,6 +4278,13 @@ def widget_event_rows(shell: mutable Shell&, widget: usize) -> bool:
 
 def init(shell: mutable Shell&) -> void:
     build_job <- BuildJob::empty()
+    toolchain_doctor_job <- BuildJob::empty()
+    toolchain_doctor_active <- false
+    profile_active <- false
+    profile_open_active <- false
+    profile_recovery_active <- false
+    shell.profile_report_ready <- false
+    shell.profile_recovery_ready <- false
     register_shortcuts()
     load_pane_preferences(shell)
     build_shell(shell)
@@ -2963,13 +4296,19 @@ def init(shell: mutable Shell&) -> void:
 
 def frame(shell: mutable Shell&) -> void can[Blocking.IO, Memory.Allocate, Memory.Release, Unsafe.PointerCast, Ui.Draw]:
     poll_build_process(shell)
+    poll_toolchain_doctor(shell)
     poll_run_process(shell)
+    ShellDebug::poll(shell)
     ShellLsp::poll(shell)
     if shell.source_lsp_problems_dirty:
         shell.source_lsp_problems_dirty <- false
         refresh_problems(shell, host_process)
         if shell.source_mode and not shell.source_compare_mode and HostClient::request(host_process, 113, 0, 0).result == 1:
             refresh_source_file_lines(shell, host_process)
+        UiHandles::layout(UiCore::viewport_width(), UiCore::viewport_height())
+    if shell.problems_dirty:
+        shell.problems_dirty <- false
+        refresh_problems(shell, host_process)
         UiHandles::layout(UiCore::viewport_width(), UiCore::viewport_height())
     open_definition_result(shell)
     if shell.source_lsp_symbol_results_ready:
@@ -2994,6 +4333,20 @@ def frame(shell: mutable Shell&) -> void can[Blocking.IO, Memory.Allocate, Memor
     update_status(shell)
 
 def update_status(shell: mutable Shell&) -> void:
+    UiHandles::set_visible(shell.profile_button, shell.source_mode and shell.standalone_source)
+    UiHandles::set_enabled(shell.profile_button, shell.source_mode and shell.standalone_source
+        and not shell_task_running() and not run_active and not shell.debug_session_active)
+    UiHandles::set_text(shell.profile_button, "Recover" if shell.profile_recovery_ready else "Open Report" if shell.profile_report_ready else "Profile", 12.0, shell_color(238, 242, 252))
+    UiHandles::set_help(shell.profile_button, "Recover complete frames from the matching private partial capture" if shell.profile_recovery_ready else "Open the latest validated report for this unchanged saved source" if shell.profile_report_ready else "Capture a private source-identified profile for this saved Elisa file")
+    if shell.debug_session_active:
+        UiHandles::set_text(shell.run_button, "Continue", 12.0, shell_color(238, 242, 252))
+        UiHandles::set_help(shell.run_button, "Continue (F8), step (F10), pause (F6); F7/Shift+F7 selects frames, Ctrl+F7/Ctrl+Shift+F7 selects threads")
+    elif shell.standalone_source:
+        UiHandles::set_text(shell.run_button, "Debug", 12.0, shell_color(238, 242, 252))
+        UiHandles::set_help(shell.run_button, "Build optimized managed EDIR and debug this saved source (F5); Ctrl+R runs the last native build")
+    else:
+        UiHandles::set_text(shell.run_button, "Run", 12.0, shell_color(238, 242, 252))
+        UiHandles::set_help(shell.run_button, "Run the last successful standalone-source or visual-project build")
     if shell.status_length > 0:
         UiHandles::set_text(shell.status_line, UiText::fixed_bytes_view_range[1024](shell.status_storage, 0, shell.status_length.usize()), 12.0, shell_color(148, 158, 180))
     if shell.form_title_length > 0:

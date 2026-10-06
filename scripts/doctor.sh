@@ -170,6 +170,17 @@ if [[ -d "$STAGE1_INPUT" ]]; then
     if [[ -x "$PRODUCT" ]]; then
         add_fact "stage1_product=$PRODUCT"
         add_fact "stage1_product_sha256=$(shasum -a 256 "$PRODUCT" | awk '{print $1}')"
+        FRESHNESS_CHECK="$STAGE1/scripts/assert_stage1_fresh.sh"
+        if [[ -x "$FRESHNESS_CHECK" ]]; then
+            if freshness_report="$(bash "$FRESHNESS_CHECK" "$PRODUCT" 2>&1)"; then
+                add_fact "stage1_product_freshness=pass"
+            else
+                freshness_report="$(printf '%s' "$freshness_report" | tr '\n' ' ')"
+                add_issue "toolchain: the selected stage1 product is stale or incompatible: $freshness_report (run: bash $STAGE1/scripts/elisac_stage1.sh --seed)"
+            fi
+        else
+            add_issue "toolchain: selected compiler checkout has no stage1 freshness verifier at $FRESHNESS_CHECK"
+        fi
     else
         add_issue "toolchain: no stage1 product at $PRODUCT (run scripts/elisac_stage1.sh --seed in the compiler checkout)"
     fi

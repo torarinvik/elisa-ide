@@ -1,0 +1,4 @@
+include "../../../../compiler/elisacore_std/elisacore_runtime.elisa"
+
+def main() -> i64:
+    return 0

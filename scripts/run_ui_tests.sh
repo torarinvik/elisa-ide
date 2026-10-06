@@ -22,11 +22,16 @@ bash scripts/build_native.sh test/ui/shell_inspector_test.elisa shell_inspector_
 ./build/shell_inspector_test
 bash scripts/build_native.sh test/ui/host_client_test.elisa host_client_test >/dev/null
 ./build/host_client_test
+bash scripts/build_native.sh test/ui/profile_shell_guard_test.elisa profile_shell_guard_test >/dev/null
+./build/profile_shell_guard_test
 
 # The shell integration exercises the real isolated preview worker and
 # validates the document snapshot through its AppKit render output.
 bash scripts/build_preview_worker.sh >/dev/null
+bash scripts/build_profile_worker.sh >/dev/null
+bash scripts/build_package_worker.sh >/dev/null
 bash scripts/build_native.sh test/ui/designer_shell_integration_test.elisa designer_shell_integration_test >/dev/null
+ELISA_IDE_PACKAGE_ONLY=1 ./build/designer_shell_integration_test
 ./build/designer_shell_integration_test
 
 bash scripts/build_shell_frame_test.sh >/dev/null

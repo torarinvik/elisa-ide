@@ -6,7 +6,8 @@
 *.o
 
 # Local workspace state, caches, and crash-recovery data.
-/.elisa-ide/
+# Workspace-local preferences, recovery data, caches, and package task history.
+.elisa-ide/
 *.tmp
 
 # macOS.
@@ -14,3 +15,4 @@
 /docs/development
 /docs/adr
 compiler
+/test/fixtures/build/profile-test-results

@@ -18,6 +18,10 @@ extern shell_frame_report_i64(label: cstr, value: i64) -> void
 extern shell_frame_report_text(text: cstr) -> void
 @link_name("designer_setenv")
 extern shell_frame_setenv(name: cstr, value: cstr) -> i64
+@link_name("designer_debug_breakpoints_load")
+extern shell_frame_load_breakpoints(path: cstr, fingerprint: i64, lines: mutable i64&, capacity: usize) -> i64 can[Blocking.IO]
+@link_name("designer_debug_breakpoints_save")
+extern shell_frame_save_breakpoints(path: cstr, fingerprint: i64, lines: i64&, count: usize) -> i64 can[Blocking.IO]
 
 def shell_frame_path_cstr(path: mutable darray[u8]&) -> cstr:
     path_c: mutable cstr = ""
@@ -47,6 +51,25 @@ def app_init() -> void:
     _ = PosixFile::remove("build/shell-frame-preferences-test/config/preferences.json.tmp")
     _ = shell_frame_setenv("ELISA_IDE_CONFIG", preference_cstr)
     expect_shell_frame(designer_workspace_preferences_save_ratios(0.3125, 0.34375, 0.28125) == 1, 70)
+    source_path: mutable darray[u8] = []
+    shell_frame_append_path(&source_path, "test/fixtures/source_task_fixture.elisa")
+    source_path.push(0)
+    breakpoint_source: cstr = shell_frame_path_cstr(&source_path)
+    seeded_breakpoints: mutable i64[4] = [4, 9, 17, 0]
+    loaded_breakpoints: mutable i64[4] = zeroed
+    expect_shell_frame(shell_frame_save_breakpoints(breakpoint_source, 8421,
+        &seeded_breakpoints[0], 3) == 1, 97)
+    restored_count: i64 = shell_frame_load_breakpoints(breakpoint_source, 8421,
+        &loaded_breakpoints[0], 4)
+    expect_shell_frame(restored_count == 3 and loaded_breakpoints[0.usize()] == 4
+        and loaded_breakpoints[1.usize()] == 9 and loaded_breakpoints[2.usize()] == 17, 98)
+    stale_count: i64 = shell_frame_load_breakpoints(breakpoint_source, 8422,
+        &loaded_breakpoints[0], 4)
+    expect_shell_frame(stale_count == 0, 99)
+    expect_shell_frame(shell_frame_load_breakpoints(breakpoint_source, 8421,
+        &loaded_breakpoints[0], 4) == 0, 100)
+    expect_shell_frame(shell_frame_save_breakpoints(breakpoint_source, 8421,
+        &seeded_breakpoints[0], 0) == 1, 101)
     load_pane_preferences(shell)
     expect_shell_frame(shell.left_ratio == 0.3125 and shell.right_ratio == 0.34375 and shell.bottom_ratio == 0.28125, 71)
     build_shell(shell)
@@ -77,6 +100,76 @@ def app_init() -> void:
     expect_shell_frame(UiHandles::is_valid(shell.surface_pane), 50)
     expect_shell_frame(UiHandles::is_valid(shell.bottom_splitter), 51)
     expect_shell_frame(UiHandles::is_valid(shell.bottom_pane), 8)
+    next_frame_shortcut: UiShortcuts::Decision = UiShortcuts::resolve(UiCore::Key.F7.i32(), 0, false, false)
+    previous_frame_shortcut: UiShortcuts::Decision = UiShortcuts::resolve(UiCore::Key.F7.i32(), UiShortcuts::MOD_SHIFT, false, false)
+    next_thread_shortcut: UiShortcuts::Decision = UiShortcuts::resolve(UiCore::Key.F7.i32(), UiShortcuts::MOD_CONTROL, false, false)
+    previous_thread_shortcut: UiShortcuts::Decision = UiShortcuts::resolve(UiCore::Key.F7.i32(), UiShortcuts::MOD_CONTROL | UiShortcuts::MOD_SHIFT, false, false)
+    expect_shell_frame(next_frame_shortcut.command == ShellCommand.NextDebugFrame.u32()
+        and previous_frame_shortcut.command == ShellCommand.PreviousDebugFrame.u32()
+        and next_thread_shortcut.command == ShellCommand.NextDebugThread.u32()
+        and previous_thread_shortcut.command == ShellCommand.PreviousDebugThread.u32(), 110)
+    expect_shell_frame(UiHandles::is_valid(shell.bottom_switch_button), 86)
+    expect_shell_frame(UiHandles::is_valid(shell.problem_navigation), 87)
+    expect_shell_frame(shell.bottom_tab == 0 and UiHandles::is_visible(shell.problem_list) and UiHandles::is_visible(shell.problem_navigation) and not UiHandles::is_visible(shell.build_output), 90)
+    widget_event(shell, shell.bottom_switch_button.widget_id.usize(), UiConst::WidgetEvent.Click.i32())
+    expect_shell_frame(shell.bottom_tab == 1 and not UiHandles::is_visible(shell.problem_list) and not UiHandles::is_visible(shell.problem_navigation) and UiHandles::is_visible(shell.build_output), 91)
+    widget_event(shell, shell.bottom_switch_button.widget_id.usize(), UiConst::WidgetEvent.Click.i32())
+    expect_shell_frame(shell.bottom_tab == 0 and UiHandles::is_visible(shell.problem_list) and UiHandles::is_visible(shell.problem_navigation) and not UiHandles::is_visible(shell.build_output), 92)
+    debug_sample: sview = "Debugger stopped (breakpoint) | thread 1: main\n  Threads: *1 main; 2 worker\n  > #0 main at sample.elisa:4:2\n      answer = 42\n    #1 helper at sample.elisa:8:3\n      label = inside helper"
+    debug_sample_index: mutable i64 = 0
+    while debug_sample_index < debug_sample.len:
+        shell.debug_snapshot_storage[debug_sample_index.usize()] <- debug_sample[debug_sample_index].u8()
+        debug_sample_index <- debug_sample_index + 1
+    shell.debug_snapshot_length <- debug_sample.len.i32()
+    shell.debug_snapshot_valid <- true
+    select_bottom_tab(shell, 2)
+    debugger_thread_label: sview = UiFlat::widget(shell.problem_page_label.widget_id.usize()).text
+    debugger_frame_zero: sview = UiFlat::widget(shell.problem_rows[0.usize()].widget_id.usize()).text
+    debugger_frame_one: sview = UiFlat::widget(shell.problem_rows[1.usize()].widget_id.usize()).text
+    debugger_locals: sview = UiFlat::widget(shell.build_output.widget_id.usize()).text
+    expect_shell_frame(shell.bottom_tab == 2 and shell.debug_frame_count == 2
+        and UiHandles::is_visible(shell.problem_list) and UiHandles::is_visible(shell.problem_navigation)
+        and UiHandles::is_visible(shell.build_output), 113)
+    expect_shell_frame(contains_ascii_fold(debugger_thread_label, "Threads: *1 main; 2 worker")
+        and contains_ascii_fold(debugger_frame_zero, "> #0 main")
+        and contains_ascii_fold(debugger_frame_one, "#1 helper")
+        and shell.debug_frame_indices[1.usize()] == 1, 114)
+    expect_shell_frame(contains_ascii_fold(debugger_locals, "Locals for selected stack frame")
+        and contains_ascii_fold(debugger_locals, "answer = 42")
+        and not contains_ascii_fold(debugger_locals, "inside helper"), 115)
+    expect_shell_frame(widget_event_rows(shell, shell.problem_rows[1.usize()].widget_id.usize())
+        and contains_ascii_fold(UiText::fixed_bytes_view_range[256](shell.status_storage, 0, shell.status_length.usize()), "start a debug session before selecting a stack frame"), 116)
+    select_bottom_tab(shell, 1)
+    debugger_raw_output: sview = UiFlat::widget(shell.build_output.widget_id.usize()).text
+    expect_shell_frame(shell.bottom_tab == 1 and not UiHandles::is_visible(shell.problem_list)
+        and contains_ascii_fold(debugger_raw_output, "#1 helper"), 117)
+    shell.debug_snapshot_valid <- false
+    shell.debug_frame_count <- 0
+    select_bottom_tab(shell, 0)
+    shell.projection.problem_count <- 0
+    shell.source_lsp_diagnostics <- 0
+    UiHandles::replace_text(shell.open_path_field, "build/forms/Main.elisaform")
+    record_tool_problem(shell, PROBLEM_TOOL_PREVIEW, 1, 23, 17, "Preview worker rejected the current form snapshot")
+    refresh_problems(shell, host_process)
+    preview_problem_text: sview = UiFlat::widget(shell.problem_rows[0.usize()].widget_id.usize()).text
+    preview_problem_help: sview = UiFlat::widget(shell.problem_rows[0.usize()].widget_id.usize()).help
+    expect_shell_frame(active_tool_problem_count(shell) == 1 and UiHandles::is_visible(shell.problem_rows[0]), 93)
+    expect_shell_frame(contains_ascii_fold(preview_problem_text, "Elisa-ui preview error: Preview worker rejected"), 94)
+    expect_shell_frame(contains_ascii_fold(preview_problem_help, "task 23 | source revision 17 | build/forms/Main.elisaform"), 95)
+    expect_shell_frame(widget_event_rows(shell, shell.problem_rows[0.usize()].widget_id.usize())
+        and contains_ascii_fold(UiText::fixed_bytes_view_range[256](shell.status_storage, 0, shell.status_length.usize()), "Selected Elisa-ui preview problem from task 23 at source revision 17"), 96)
+    clear_tool_problem(shell, PROBLEM_TOOL_PREVIEW)
+    refresh_problems(shell, host_process)
+    expect_shell_frame(active_tool_problem_count(shell) == 0 and not UiHandles::is_visible(shell.problem_rows[0]), 97)
+    record_tool_problem(shell, PROBLEM_TOOL_PROFILER, 2, 29, 18, "Profile result is stale for the current editor buffer")
+    refresh_problems(shell, host_process)
+    profiler_problem_text: sview = UiFlat::widget(shell.problem_rows[0.usize()].widget_id.usize()).text
+    profiler_problem_help: sview = UiFlat::widget(shell.problem_rows[0.usize()].widget_id.usize()).help
+    expect_shell_frame(active_tool_problem_count(shell) == 1 and contains_ascii_fold(profiler_problem_text, "Elisa profiler warning"), 98)
+    expect_shell_frame(contains_ascii_fold(profiler_problem_help, "task 29 | source revision 18"), 99)
+    clear_tool_problem(shell, PROBLEM_TOOL_PROFILER)
+    refresh_problems(shell, host_process)
+    expect_shell_frame(active_tool_problem_count(shell) == 0 and not UiHandles::is_visible(shell.problem_rows[0]), 100)
     expect_shell_frame(UiHandles::is_valid(shell.status_line), 9)
     expect_shell_frame(not UiFlat::overflowed() and UiHandles::is_valid(shell.status_line), 84)
     expect_shell_frame(UiHandles::is_valid(shell.inspector_list), 25)
@@ -114,7 +207,8 @@ def app_init() -> void:
     expect_shell_frame(UiHandles::is_valid(shell.problem_rows[5]), 20)
     expect_shell_frame(not UiHandles::overflowed(), 21)
     expect_shell_frame(UiHandles::count() > 0, 22)
-    expect_shell_frame(UiHandles::count() < 256, 34)
+    expect_shell_frame(not UiHandles::overflowed(), 34)
+    expect_shell_frame(UiHandles::is_valid(shell.profile_button), 85)
     expect_shell_frame(contains_ascii_fold("Text Field", "text"), 35)
     expect_shell_frame(not contains_ascii_fold("Text Field", "panel"), 36)
     expect_shell_frame(not shell.host_running, 23)

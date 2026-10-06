@@ -117,6 +117,14 @@ def geometry_bytes(text: sview) -> darray[u8]:
         bytes.push(text[index])
     return bytes
 
+def report_sview(text: sview) -> void can[Memory.Allocate, Memory.Release, Unsafe.PointerCast]:
+    bytes: mutable darray[u8] = geometry_bytes(text)
+    bytes.push(0)
+    pointer: mutable cstr = ""
+    can Unsafe.PointerCast:
+        pointer <- (&bytes[0]).cast[cstr] can Unsafe.PointerCast
+    integration_report_text(pointer)
+
 def geometry_was_invalidated(test_shell: Shell) -> bool:
     return test_shell.preview_region_count == 0 and test_shell.preview_geometry_revision == 0 and test_shell.preview_geometry_signature == 0 and test_shell.preview_form_width == 0.0 and test_shell.preview_form_height == 0.0
 
@@ -152,14 +160,38 @@ def test_geometry_acceptance() -> void:
 
     embedded_marker: mutable darray[u8] = geometry_bytes("worker output geometry_v1 7 123 node-root 0 0 102400 76800 1 0\n")
     embedded_accepted: bool = ShellPreview::accept_geometry_output(test_shell, embedded_marker, 7, 123, 100.0, 75.0)
-    expect_integration(not embedded_accepted and geometry_was_invalidated(test_shell), 67)
+    expect_integration(not embedded_accepted and geometry_was_invalidated(test_shell), 1067)
 
-def wait_preview_worker(process: PosixProcess::Process, budget_ms: i64) -> bool:
+def append_preview_capture(target: mutable darray[u8]&, chunk: darray[u8]&, truncated: mutable bool&) -> void:
+    index: mutable usize = 0
+    while index < chunk.count:
+        if target.count < 1048576:
+            target.push(chunk[index])
+        else:
+            truncated <- true
+        index <- index + 1
+
+def wait_preview_worker(process: PosixProcess::Process, budget_ms: i64,
+                        stdout: mutable darray[u8]&, stderr: mutable darray[u8]&, output_truncated: mutable bool&) -> bool:
     # Keep the small handle by value. A native pointer produced from an Elisa
     # reference-to-reference here does not preserve the original process handle.
+    # Drain both pipes during the wait so a worker cannot block while writing
+    # geometry or a bounded diagnostic before it exits.
     elapsed: mutable i64 = 0
     while elapsed < budget_ms:
+        stdout_chunk: mutable darray[u8] = []
+        _ = PosixProcess::read_stdout(&process, &stdout_chunk, 65536)
+        append_preview_capture(stdout, stdout_chunk, output_truncated)
+        stderr_chunk: mutable darray[u8] = []
+        _ = PosixProcess::read_stderr(&process, &stderr_chunk, 65536)
+        append_preview_capture(stderr, stderr_chunk, output_truncated)
         if PosixProcess::poll(&process, 20):
+            stdout_chunk <- []
+            _ = PosixProcess::read_stdout(&process, &stdout_chunk, 65536)
+            append_preview_capture(stdout, stdout_chunk, output_truncated)
+            stderr_chunk <- []
+            _ = PosixProcess::read_stderr(&process, &stderr_chunk, 65536)
+            append_preview_capture(stderr, stderr_chunk, output_truncated)
             return true
         elapsed <- elapsed + 20
     return false
@@ -305,6 +337,27 @@ def test_preview_path_isolation() -> void:
     bounded_failure: i64 = shell_preview_paths_create(&tiny_input[0], 2, &bounded_frame[0], INTEGRATION_PREVIEW_PATH_CAPACITY)
     expect_integration(bounded_failure != 0 and tiny_input[0] == 0 and bounded_frame[0] == 0, 72)
 
+def test_debuggee_terminal_state() -> void:
+    test_shell: mutable Shell = new_shell()
+    test_shell.debug_session_active <- true
+    test_shell.debug_poll_deadline_ms <- 750
+    test_shell.debug_breakpoint_count <- 1
+    test_shell.debug_breakpoint_lines[0.usize()] <- 12
+    test_shell.source_mode <- true
+    test_shell.standalone_source <- true
+    test_shell.source_line_count <- 32
+    not_terminal: bool = ShellDebug::handle_terminal_snapshot(test_shell,
+        "Debugger running. Continue, pause, or step when the target stops.")
+    expect_integration(not not_terminal and test_shell.debug_session_active, 366)
+    terminal: bool = ShellDebug::handle_terminal_snapshot(test_shell,
+        "Debuggee exited. Press Debug to launch it again.")
+    expect_integration(terminal and not test_shell.debug_session_active
+        and test_shell.debug_poll_deadline_ms == 0
+        and ShellDebug::has_breakpoint(test_shell, 12)
+        and test_shell.source_mode and test_shell.standalone_source
+        and test_shell.source_line_count == 32
+        and same_text(status_view(test_shell), "Debuggee exited. Press Debug to launch it again."), 367)
+
 def run_preview(snapshot: HostClient::HostReply) -> i64:
     return fail_preview(1) if snapshot.result != 1 or snapshot.text.count == 0
     input_storage: mutable u8[1024] = zeroed
@@ -334,19 +387,20 @@ def run_preview(snapshot: HostClient::HostReply) -> i64:
     if not PosixProcess::valid(&worker):
         _ = shell_preview_paths_cleanup(input_path, frame_path)
         return fail_preview(7)
-    if not wait_preview_worker(worker, 60000):
+    worker_stdout: mutable darray[u8] = []
+    worker_stderr: mutable darray[u8] = []
+    worker_output_truncated: mutable bool = false
+    if not wait_preview_worker(worker, 60000, &worker_stdout, &worker_stderr, &worker_output_truncated):
         _ = PosixProcess::cancel(&worker)
         PosixProcess::dispose(&worker)
         _ = shell_preview_paths_cleanup(input_path, frame_path)
         return fail_preview(8)
     status: PosixProcess::Status = PosixProcess::status(&worker)
-    stdout: mutable darray[u8] = []
-    _ = PosixProcess::read_stdout(&worker, &stdout, 1048576)
     PosixProcess::dispose(&worker)
-    if not status.finished or status.exit_code != 0 or status.stdout_truncated:
+    if not status.finished or status.exit_code != 0 or status.stdout_truncated or worker_output_truncated:
         _ = shell_preview_paths_cleanup(input_path, frame_path)
         return fail_preview(9)
-    if not bytes_contain(stdout, "preview_revision=") or not bytes_contain(stdout, "rect n2 ") or not bytes_contain(stdout, "rect n3 "):
+    if not bytes_contain(worker_stdout, "preview_revision=") or not bytes_contain(worker_stdout, "rect n2 ") or not bytes_contain(worker_stdout, "rect n3 "):
         _ = shell_preview_paths_cleanup(input_path, frame_path)
         return fail_preview(10)
     frame_bytes: mutable darray[u8] = []
@@ -364,15 +418,15 @@ def run_preview(snapshot: HostClient::HostReply) -> i64:
     identity_ok: bool = identity_status == 0
     snapshot_revision: u64 = preview_snapshot_revision(snapshot.text)
     snapshot_signature: i64 = preview_snapshot_signature(&snapshot.text)
-    manifest_ok: bool = ShellPreview::accept_frame_identity_output(stdout, snapshot_revision, snapshot_signature, identity_length, identity_hash_high, identity_hash_low)
+    manifest_ok: bool = ShellPreview::accept_frame_identity_output(worker_stdout, snapshot_revision, snapshot_signature, identity_length, identity_hash_high, identity_hash_low)
     if not identity_ok or not manifest_ok:
         integration_report_i64("preview_identity_status=", identity_status)
         integration_report_i64("preview_identity_length=", identity_length.i64())
         integration_report_i64("preview_identity_revision=", snapshot_revision.i64())
         integration_report_i64("preview_identity_signature=", snapshot_signature)
-        integration_report_i64("preview_manifest_present=", 1 if bytes_contain(stdout, "frame_v1 ") else 0)
+        integration_report_i64("preview_manifest_present=", 1 if bytes_contain(worker_stdout, "frame_v1 ") else 0)
         integration_report_i64("preview_manifest_accepted=", 1 if manifest_ok else 0)
-        report_frame_manifest(stdout)
+        report_frame_manifest(worker_stdout)
         _ = shell_preview_paths_cleanup(input_path, frame_path)
         return fail_preview(13)
     checksum: mutable i64 = 0
@@ -439,6 +493,82 @@ def dispatch_insert_shortcut() -> void:
     UiHarness::dispatch(UiCore::KeyEvent.Down(UiCore::Key.LeftSuper))
     UiHarness::dispatch(UiCore::KeyEvent.Down(UiCore::Key.I))
     UiHarness::dispatch(UiCore::KeyEvent.Up(UiCore::Key.I))
+    UiHarness::dispatch(UiCore::KeyEvent.Up(UiCore::Key.LeftSuper))
+
+def dispatch_package_test_shortcut() -> void:
+    UiHarness::dispatch(UiCore::KeyEvent.Down(UiCore::Key.LeftSuper))
+    UiHarness::dispatch(UiCore::KeyEvent.Down(UiCore::Key.LeftShift))
+    UiHarness::dispatch(UiCore::KeyEvent.Down(UiCore::Key.T))
+    UiHarness::dispatch(UiCore::KeyEvent.Up(UiCore::Key.T))
+    UiHarness::dispatch(UiCore::KeyEvent.Up(UiCore::Key.LeftShift))
+    UiHarness::dispatch(UiCore::KeyEvent.Up(UiCore::Key.LeftSuper))
+
+def dispatch_package_target_cycle_shortcut() -> void:
+    UiHarness::dispatch(UiCore::KeyEvent.Down(UiCore::Key.LeftSuper))
+    UiHarness::dispatch(UiCore::KeyEvent.Down(UiCore::Key.LeftShift))
+    UiHarness::dispatch(UiCore::KeyEvent.Down(UiCore::Key.LeftAlt))
+    UiHarness::dispatch(UiCore::KeyEvent.Down(UiCore::Key.T))
+    UiHarness::dispatch(UiCore::KeyEvent.Up(UiCore::Key.T))
+    UiHarness::dispatch(UiCore::KeyEvent.Up(UiCore::Key.LeftAlt))
+    UiHarness::dispatch(UiCore::KeyEvent.Up(UiCore::Key.LeftShift))
+    UiHarness::dispatch(UiCore::KeyEvent.Up(UiCore::Key.LeftSuper))
+
+def dispatch_package_history_shortcut() -> void:
+    UiHarness::dispatch(UiCore::KeyEvent.Down(UiCore::Key.LeftSuper))
+    UiHarness::dispatch(UiCore::KeyEvent.Down(UiCore::Key.LeftShift))
+    UiHarness::dispatch(UiCore::KeyEvent.Down(UiCore::Key.LeftAlt))
+    UiHarness::dispatch(UiCore::KeyEvent.Down(UiCore::Key.H))
+    UiHarness::dispatch(UiCore::KeyEvent.Up(UiCore::Key.H))
+    UiHarness::dispatch(UiCore::KeyEvent.Up(UiCore::Key.LeftAlt))
+    UiHarness::dispatch(UiCore::KeyEvent.Up(UiCore::Key.LeftShift))
+    UiHarness::dispatch(UiCore::KeyEvent.Up(UiCore::Key.LeftSuper))
+
+def dispatch_package_history_older_shortcut() -> void:
+    UiHarness::dispatch(UiCore::KeyEvent.Down(UiCore::Key.LeftSuper))
+    UiHarness::dispatch(UiCore::KeyEvent.Down(UiCore::Key.LeftShift))
+    UiHarness::dispatch(UiCore::KeyEvent.Down(UiCore::Key.LeftAlt))
+    UiHarness::dispatch(UiCore::KeyEvent.Down(UiCore::Key.J))
+    UiHarness::dispatch(UiCore::KeyEvent.Up(UiCore::Key.J))
+    UiHarness::dispatch(UiCore::KeyEvent.Up(UiCore::Key.LeftAlt))
+    UiHarness::dispatch(UiCore::KeyEvent.Up(UiCore::Key.LeftShift))
+    UiHarness::dispatch(UiCore::KeyEvent.Up(UiCore::Key.LeftSuper))
+
+def dispatch_package_history_newer_shortcut() -> void:
+    UiHarness::dispatch(UiCore::KeyEvent.Down(UiCore::Key.LeftSuper))
+    UiHarness::dispatch(UiCore::KeyEvent.Down(UiCore::Key.LeftShift))
+    UiHarness::dispatch(UiCore::KeyEvent.Down(UiCore::Key.LeftAlt))
+    UiHarness::dispatch(UiCore::KeyEvent.Down(UiCore::Key.K))
+    UiHarness::dispatch(UiCore::KeyEvent.Up(UiCore::Key.K))
+    UiHarness::dispatch(UiCore::KeyEvent.Up(UiCore::Key.LeftAlt))
+    UiHarness::dispatch(UiCore::KeyEvent.Up(UiCore::Key.LeftShift))
+    UiHarness::dispatch(UiCore::KeyEvent.Up(UiCore::Key.LeftSuper))
+
+def dispatch_package_test_explorer_shortcut() -> void:
+    UiHarness::dispatch(UiCore::KeyEvent.Down(UiCore::Key.LeftSuper))
+    UiHarness::dispatch(UiCore::KeyEvent.Down(UiCore::Key.LeftShift))
+    UiHarness::dispatch(UiCore::KeyEvent.Down(UiCore::Key.LeftAlt))
+    UiHarness::dispatch(UiCore::KeyEvent.Down(UiCore::Key.E))
+    UiHarness::dispatch(UiCore::KeyEvent.Up(UiCore::Key.E))
+    UiHarness::dispatch(UiCore::KeyEvent.Up(UiCore::Key.LeftAlt))
+    UiHarness::dispatch(UiCore::KeyEvent.Up(UiCore::Key.LeftShift))
+    UiHarness::dispatch(UiCore::KeyEvent.Up(UiCore::Key.LeftSuper))
+
+def dispatch_toolchain_doctor_shortcut() -> void:
+    UiHarness::dispatch(UiCore::KeyEvent.Down(UiCore::Key.LeftSuper))
+    UiHarness::dispatch(UiCore::KeyEvent.Down(UiCore::Key.LeftShift))
+    UiHarness::dispatch(UiCore::KeyEvent.Down(UiCore::Key.LeftAlt))
+    UiHarness::dispatch(UiCore::KeyEvent.Down(UiCore::Key.D))
+    UiHarness::dispatch(UiCore::KeyEvent.Up(UiCore::Key.D))
+    UiHarness::dispatch(UiCore::KeyEvent.Up(UiCore::Key.LeftAlt))
+    UiHarness::dispatch(UiCore::KeyEvent.Up(UiCore::Key.LeftShift))
+    UiHarness::dispatch(UiCore::KeyEvent.Up(UiCore::Key.LeftSuper))
+
+def dispatch_debug_restart_shortcut() -> void:
+    UiHarness::dispatch(UiCore::KeyEvent.Down(UiCore::Key.LeftSuper))
+    UiHarness::dispatch(UiCore::KeyEvent.Down(UiCore::Key.LeftShift))
+    UiHarness::dispatch(UiCore::KeyEvent.Down(UiCore::Key.F5))
+    UiHarness::dispatch(UiCore::KeyEvent.Up(UiCore::Key.F5))
+    UiHarness::dispatch(UiCore::KeyEvent.Up(UiCore::Key.LeftShift))
     UiHarness::dispatch(UiCore::KeyEvent.Up(UiCore::Key.LeftSuper))
 
 def drag_handle_to(source: UiHandles::Handle, target: UiHandles::Handle) -> void:
@@ -702,7 +832,8 @@ def test_related_dirty_guard() -> void:
     build_mapped_line: sview = UiHandles::text_value(shell.source_line_rows[3.usize()])
     expect_integration(shell.build_problem_count == 1 and shell.source_selected_line == 4
         and bytes_contain(geometry_bytes(build_mapped_line), "Source editor paging fixture, line 4.")
-        and UiFlat::selection_utf16_location(shell.source_line_rows[3.usize()].widget_id.usize()) == 7
+        and UiFlat::selection_utf16_location(shell.source_line_rows[3.usize()].widget_id.usize())
+            == source_line_prefix(shell, 4).count + 4
         and bytes_contain(geometry_bytes(status_view(shell)), "Selected build diagnostic at source line 4"), 247)
     UiHandles::set_text(shell.build_output, "build/shell-source-edit.elisa(3,2): error: parenthesized fixture error", 11.0, shell_color(172, 184, 204))
     shell.build_problem_count <- build_diagnostic_count(UiFlat::widget(shell.build_output.widget_id.usize()).text)
@@ -711,7 +842,8 @@ def test_related_dirty_guard() -> void:
     parenthesized_mapped_line: sview = UiHandles::text_value(shell.source_line_rows[2.usize()])
     expect_integration(shell.build_problem_count == 1 and shell.source_selected_line == 3
         and bytes_contain(geometry_bytes(parenthesized_mapped_line), "Source editor paging fixture, line 3.")
-        and UiFlat::selection_utf16_location(shell.source_line_rows[2.usize()].widget_id.usize()) == 4
+        and UiFlat::selection_utf16_location(shell.source_line_rows[2.usize()].widget_id.usize())
+            == source_line_prefix(shell, 3).count + 1
         and bytes_contain(geometry_bytes(status_view(shell)), "Selected build diagnostic at source line 3"), 248)
     UiHandles::set_text(shell.build_output, "build/shell-source-edit.elisa(3,): error: malformed fixture column", 11.0, shell_color(172, 184, 204))
     shell.build_problem_count <- build_diagnostic_count(UiFlat::widget(shell.build_output.widget_id.usize()).text)
@@ -731,22 +863,433 @@ def test_related_cycle() -> void:
     expect_integration(bytes_contain(geometry_bytes(status_view(shell)), "Opened related Elisa-LSP location 1 of 4 at line 1"), 240)
     expect_integration(bytes_contain(geometry_bytes(related_first_line), "module related_fixture:"), 237)
     expect_integration(shell.source_selected_line == 1, 238)
-    expect_integration(UiFlat::selection_utf16_location(shell.source_line_rows[0.usize()].widget_id.usize()) == 5, 239)
+    expect_integration(UiFlat::selection_utf16_location(shell.source_line_rows[0.usize()].widget_id.usize())
+        == source_line_prefix(shell, 1).count + 2, 239)
     _ = widget_event_rows(shell, shell.problem_related_button.widget_id.usize())
     next_related_line: sview = UiHandles::text_value(shell.source_line_rows[3.usize()])
     expect_integration(shell.source_selected_line == 4
         and bytes_contain(geometry_bytes(next_related_line), "Source editor paging fixture, line 4.")
-        and UiFlat::selection_utf16_location(shell.source_line_rows[3.usize()].widget_id.usize()) == 7
+        and UiFlat::selection_utf16_location(shell.source_line_rows[3.usize()].widget_id.usize())
+            == source_line_prefix(shell, 4).count + 4
         and bytes_contain(geometry_bytes(status_view(shell)), "Opened related Elisa-LSP location 2 of 4 at line 4"), 236)
+
+def test_toolchain_doctor() -> void:
+    shortcut_capacity: UiShortcuts::Snapshot = UiShortcuts::snapshot()
+    expect_integration(not shortcut_capacity.overflowed, 462)
+    doctor_shortcut: UiShortcuts::Decision = UiShortcuts::resolve(
+        UiCore::Key.D.i32(),
+        UiShortcuts::MOD_SUPER | UiShortcuts::MOD_ALT | UiShortcuts::MOD_SHIFT,
+        false,
+        false,
+    )
+    expect_integration(doctor_shortcut.layer == UiShortcuts::Layer.ApplicationCommand
+        and doctor_shortcut.command == ShellCommand.ToolchainDoctor.u32(), 461)
+    dispatch_toolchain_doctor_shortcut()
+    if not toolchain_doctor_active and not BuildJob::is_running(&toolchain_doctor_job):
+        integration_report_text("doctor command returned without starting a task")
+        integration_report_i64("doctor_job_state=", toolchain_doctor_job.state.i32().i64())
+        integration_report_i64("build_job_state=", build_job.state.i32().i64())
+        integration_report_i64("run_active=", 1 if run_active else 0)
+        integration_report_i64("debug_active=", 1 if shell.debug_session_active else 0)
+        report_sview(status_view(shell))
+    doctor_wait: mutable i64 = 0
+    while BuildJob::is_running(&toolchain_doctor_job) and doctor_wait < 30000:
+        app_frame()
+        doctor_wait <- doctor_wait + 1
+    doctor_output: darray[u8] = geometry_bytes(BuildJob::output_view(&toolchain_doctor_job))
+    doctor_ok: bool = (doctor_wait < 30000
+        and not toolchain_doctor_active
+        and toolchain_doctor_job.state == BuildJob::State.Succeeded
+        and bytes_contain(doctor_output, "stage1_product_freshness=pass")
+        and bytes_contain(doctor_output, "all required dependencies resolved")
+        and bytes_contain(geometry_bytes(status_view(shell)), "Toolchain doctor passed"))
+    if not doctor_ok:
+        integration_report_i64("doctor_wait=", doctor_wait)
+        integration_report_i64("doctor_active=", 1 if toolchain_doctor_active else 0)
+        report_sview(BuildJob::output_view(&toolchain_doctor_job))
+        report_sview(status_view(shell))
+    expect_integration(doctor_ok, 460)
+
+    previous_stage1: cstr? = getenv("ELISA_UI_STAGE1")
+    expect_integration(integration_setenv("ELISA_UI_STAGE1", "build/missing-stage1-for-doctor-test") == 0, 463)
+    dispatch_toolchain_doctor_shortcut()
+    doctor_failure_wait: mutable i64 = 0
+    while BuildJob::is_running(&toolchain_doctor_job) and doctor_failure_wait < 30000:
+        app_frame()
+        doctor_failure_wait <- doctor_failure_wait + 1
+    doctor_failure_output: darray[u8] = geometry_bytes(BuildJob::output_view(&toolchain_doctor_job))
+    doctor_failure_ok: bool = (doctor_failure_wait < 30000
+        and not toolchain_doctor_active
+        and toolchain_doctor_job.state == BuildJob::State.Failed
+        and bytes_contain(doctor_failure_output, "missing directory build/missing-stage1-for-doctor-test")
+        and bytes_contain(geometry_bytes(status_view(shell)), "Toolchain doctor found a missing or stale dependency"))
+    if not doctor_failure_ok:
+        integration_report_i64("doctor_failure_wait=", doctor_failure_wait)
+        integration_report_i64("doctor_failure_state=", toolchain_doctor_job.state.i32().i64())
+        report_sview(BuildJob::output_view(&toolchain_doctor_job))
+        report_sview(status_view(shell))
+    expect_integration(doctor_failure_ok, 464)
+    if previous_stage1 is value:
+        _ = integration_setenv("ELISA_UI_STAGE1", value)
+    else:
+        _ = integration_setenv("ELISA_UI_STAGE1", "")
+
+def test_debug_restart_shortcut() -> void:
+    restart: UiShortcuts::Decision = UiShortcuts::resolve(
+        UiCore::Key.F5.i32(),
+        UiShortcuts::MOD_SUPER | UiShortcuts::MOD_SHIFT,
+        false,
+        false,
+    )
+    expect_integration(restart.layer == UiShortcuts::Layer.ApplicationCommand
+        and restart.command == ShellCommand.RestartDebug.u32(), 465)
+
+def test_package_task_workflow() -> void:
+    _ = PosixFile::remove("build/fake-elisapkg-task.log")
+    expect_integration(integration_setenv("ELISA_IDE_ELISAPKG", "test/fixtures/fake_elisapkg.py") == 0, 420)
+    expect_integration(integration_setenv("FAKE_ELISAPKG_LOG", "../../../build/fake-elisapkg-task.log") == 0, 421)
+    package_source_path: sview = "test/fixtures/package_task/src/main.elisa"
+    if shell.compact_mode:
+        UiHandles::replace_text(shell.compact_open_path_field, package_source_path)
+    else:
+        UiHandles::replace_text(shell.open_path_field, package_source_path)
+    open_document(shell)
+    app_frame()
+    app_frame()
+    expect_integration(shell.standalone_source and shell.source_mode, 422)
+    dispatch_package_test_shortcut()
+    app_frame()
+    package_preview: darray[u8] = geometry_bytes(UiFlat::widget(shell.build_output.widget_id.usize()).text)
+    package_log: mutable darray[u8] = []
+    package_log_size: mutable usize = PosixFile::read_bytes(&package_log, "build/fake-elisapkg-task.log", 4096)
+    expect_integration(not BuildJob::is_running(&build_job) and not package_task_active, 423)
+    expect_integration(bytes_contain(package_preview, "Discovered test targets (2): unit-tests, integration-tests"), 426)
+    expect_integration(bytes_contain(package_preview, "No project code has run"), 427)
+    expect_integration(bytes_contain(package_preview, "press Ctrl/Cmd+Shift+T again"), 428)
+    expect_integration(package_log_size == 0, 429)
+    app_frame()
+    dispatch_package_test_shortcut()
+    if not BuildJob::is_running(&build_job):
+        report_sview(status_view(shell))
+        report_sview(UiFlat::widget(shell.build_output.widget_id.usize()).text)
+    package_task_wait: mutable i64 = 0
+    while BuildJob::is_running(&build_job) and package_task_wait < 30000:
+        app_frame()
+        package_task_wait <- package_task_wait + 1
+    package_task_output: darray[u8] = geometry_bytes(BuildJob::output_view(&build_job))
+    package_log <- []
+    package_log_size <- PosixFile::read_bytes(&package_log, "build/fake-elisapkg-task.log", 4096)
+    if build_job.state != BuildJob::State.Succeeded:
+        report_sview(BuildJob::output_view(&build_job))
+        integration_report_i64("package_task_wait=", package_task_wait)
+        integration_report_i64("package_task_active=", 1 if package_task_active else 0)
+    expect_integration(package_task_wait < 30000 and not package_task_active, 424)
+    expect_integration(build_job.state == BuildJob::State.Succeeded, 430)
+    expect_integration(bytes_contain(package_task_output, "fake elisapkg test succeeded"), 431)
+    expect_integration(package_log_size > 0, 432)
+    expect_integration(bytes_contain(package_log, "argv=test --offline --test unit-tests"), 433)
+    _ = PosixFile::remove("build/fake-elisapkg-task.log")
+    dispatch_package_history_shortcut()
+    package_history_preview: darray[u8] = geometry_bytes(UiFlat::widget(shell.build_output.widget_id.usize()).text)
+    expect_integration(not BuildJob::is_running(&build_job)
+        and bytes_contain(package_history_preview, "Recent package test runs")
+        and bytes_contain(package_history_preview, "succeeded | unit-tests | exit 0"), 457)
+    dispatch_package_history_older_shortcut()
+    package_history_detail: darray[u8] = geometry_bytes(UiFlat::widget(shell.build_output.widget_id.usize()).text)
+    expect_integration(bytes_contain(package_history_detail, "Package test run 1 of")
+        and bytes_contain(package_history_detail, "fake elisapkg test succeeded")
+        and bytes_contain(package_history_detail, "State: succeeded | target: unit-tests"), 458)
+    dispatch_package_history_newer_shortcut()
+    package_history_return: darray[u8] = geometry_bytes(UiFlat::widget(shell.build_output.widget_id.usize()).text)
+    expect_integration(bytes_contain(package_history_return, "Recent package test runs"), 459)
+    dispatch_package_target_cycle_shortcut()
+    selected_target_preview: darray[u8] = geometry_bytes(UiFlat::widget(shell.build_output.widget_id.usize()).text)
+    package_log <- []
+    package_log_size <- PosixFile::read_bytes(&package_log, "build/fake-elisapkg-task.log", 4096)
+    selection_preview_ok: bool = not BuildJob::is_running(&build_job) and not package_task_active and bytes_contain(selected_target_preview, "Selected test target: integration-tests") and bytes_contain(selected_target_preview, "Press Ctrl/Cmd+Option+Shift+T to cycle targets") and package_log_size == 0
+    if not selection_preview_ok:
+        report_sview(status_view(shell))
+        report_sview(UiFlat::widget(shell.build_output.widget_id.usize()).text)
+        integration_report_i64("package_test_target_count=", package_test_target_count)
+        integration_report_i64("package_selected_target_index=", package_selected_target_index)
+        integration_report_i64("package_log_size=", package_log_size.i64())
+    expect_integration(selection_preview_ok, 455)
+    run_shell_command(shell, ShellCommand.RunPackageTests.u32())
+    selected_target_wait: mutable i64 = 0
+    while BuildJob::is_running(&build_job) and selected_target_wait < 30000:
+        app_frame()
+        selected_target_wait <- selected_target_wait + 1
+    selected_target_output: darray[u8] = geometry_bytes(BuildJob::output_view(&build_job))
+    package_log <- []
+    package_log_size <- PosixFile::read_bytes(&package_log, "build/fake-elisapkg-task.log", 4096)
+    expect_integration(selected_target_wait < 30000 and build_job.state == BuildJob::State.Succeeded
+        and not package_task_active and bytes_contain(selected_target_output, "fake elisapkg test succeeded")
+        and package_log_size > 0 and bytes_contain(package_log, "argv=test --offline --test integration-tests"), 456)
+    _ = PosixFile::remove("build/fake-elisapkg-task.log")
+    expect_integration(integration_setenv("FAKE_ELISAPKG_EXIT", "7") == 0, 434)
+    run_shell_command(shell, ShellCommand.RunPackageTests.u32())
+    package_failure_wait: mutable i64 = 0
+    while BuildJob::is_running(&build_job) and package_failure_wait < 30000:
+        app_frame()
+        package_failure_wait <- package_failure_wait + 1
+    package_failure_output: darray[u8] = geometry_bytes(BuildJob::output_view(&build_job))
+    test_runner_problem: ToolProblem& = &shell.tool_problems[PROBLEM_TOOL_TEST_RUNNER.usize()]
+    expect_integration(package_failure_wait < 30000 and build_job.state == BuildJob::State.Failed
+        and not package_task_active and test_runner_problem.active
+        and test_runner_problem.severity == 1
+        and test_runner_problem.task_id == build_revision.i64()
+        and test_runner_problem.source_revision == package_task_source_fingerprint
+        and test_runner_problem.source_path_length > 0
+        and bytes_contain(package_failure_output, "fake elisapkg test failed"), 435)
+    dispatch_package_test_explorer_shortcut()
+    package_case_failure: darray[u8] = geometry_bytes(UiFlat::widget(shell.build_output.widget_id.usize()).text)
+    expect_integration(package_test_explorer_open
+        and bytes_contain(package_case_failure, "FAILED fixture_assertion")
+        and bytes_contain(package_case_failure, "fixture assertion output for the test explorer"), 467)
+    dispatch_package_history_older_shortcut()
+    package_case_next: darray[u8] = geometry_bytes(UiFlat::widget(shell.build_output.widget_id.usize()).text)
+    expect_integration(package_test_case_selection == 1
+        and bytes_contain(package_case_next, "PASSED fixture_cleanup")
+        and bytes_contain(package_case_next, "Selected case 2 of 2"), 468)
+    dispatch_package_history_newer_shortcut()
+    package_case_previous: darray[u8] = geometry_bytes(UiFlat::widget(shell.build_output.widget_id.usize()).text)
+    expect_integration(package_test_case_selection == 0
+        and bytes_contain(package_case_previous, "FAILED fixture_assertion")
+        and bytes_contain(package_case_previous, "fixture assertion output for the test explorer"), 469)
+    dispatch_package_test_explorer_shortcut()
+    package_case_return: darray[u8] = geometry_bytes(UiFlat::widget(shell.build_output.widget_id.usize()).text)
+    expect_integration(not package_test_explorer_open
+        and bytes_contain(package_case_return, "Package test run 1 of"), 470)
+    expect_integration(integration_setenv("FAKE_ELISAPKG_EXIT", "") == 0, 436)
+    expect_integration(integration_setenv("FAKE_ELISAPKG_SLEEP", "30") == 0, 437)
+    expect_integration(integration_setenv("FAKE_ELISAPKG_STARTED_FILE", "../../../build/fake-elisapkg-started") == 0, 438)
+    _ = PosixFile::remove("build/fake-elisapkg-started")
+    run_shell_command(shell, ShellCommand.RunPackageTests.u32())
+    package_started_wait: mutable i64 = 0
+    package_started: mutable darray[u8] = []
+    while (package_started.count == 0 or not BuildJob::is_running(&build_job)) and package_started_wait < 30000:
+        app_frame()
+        package_started <- []
+        _ = PosixFile::read_bytes(&package_started, "build/fake-elisapkg-started", 128)
+        package_started_wait <- package_started_wait + 1
+    expect_integration(package_started_wait < 30000 and package_started.count > 0
+        and BuildJob::is_running(&build_job) and package_task_active, 439)
+    click(shell.stop_button)
+    expect_integration(not package_task_active and not BuildJob::is_running(&build_job)
+        and build_job.state == BuildJob::State.Cancelled
+        and not shell.tool_problems[PROBLEM_TOOL_TEST_RUNNER.usize()].active, 440)
+    expect_integration(integration_setenv("FAKE_ELISAPKG_SLEEP", "") == 0, 441)
+    expect_integration(integration_setenv("FAKE_ELISAPKG_STARTED_FILE", "") == 0, 442)
+    _ = PosixFile::remove("build/fake-elisapkg-started")
+    expect_integration(integration_setenv("FAKE_ELISAPKG_SLEEP", "2") == 0, 443)
+    expect_integration(integration_setenv("FAKE_ELISAPKG_STARTED_FILE", "../../../build/fake-elisapkg-started") == 0, 444)
+    run_shell_command(shell, ShellCommand.RunPackageTests.u32())
+    stale_started_wait: mutable i64 = 0
+    stale_started: mutable darray[u8] = []
+    while (stale_started.count == 0 or not BuildJob::is_running(&build_job)) and stale_started_wait < 30000:
+        app_frame()
+        stale_started <- []
+        _ = PosixFile::read_bytes(&stale_started, "build/fake-elisapkg-started", 128)
+        stale_started_wait <- stale_started_wait + 1
+    source_bytes_before_edit: i64 = HostClient::request(host_process, 148, 0, 0).result
+    source_edit: sview = "\n# source changed while the package test was running\n"
+    stale_edit_result: HostClient::HostReply = HostClient::request_text(host_process, 133,
+        source_bytes_before_edit, source_bytes_before_edit, source_edit)
+    expect_integration(stale_started_wait < 30000 and stale_started.count > 0
+        and BuildJob::is_running(&build_job) and package_task_active
+        and stale_edit_result.result == 1, 445)
+    stale_package_wait: mutable i64 = 0
+    while BuildJob::is_running(&build_job) and stale_package_wait < 30000:
+        app_frame()
+        stale_package_wait <- stale_package_wait + 1
+    stale_package_output: darray[u8] = geometry_bytes(BuildJob::output_view(&build_job))
+    stale_test_runner_problem: ToolProblem& = &shell.tool_problems[PROBLEM_TOOL_TEST_RUNNER.usize()]
+    expect_integration(stale_package_wait < 30000 and build_job.state == BuildJob::State.Succeeded
+        and not package_task_active and stale_test_runner_problem.active and stale_test_runner_problem.severity == 2
+        and stale_test_runner_problem.source_revision == package_task_source_fingerprint
+        and bytes_contain(stale_package_output, "fake elisapkg test succeeded"), 446)
+    source_bytes_after_edit: i64 = HostClient::request(host_process, 148, 0, 0).result
+    reverted_source: HostClient::HostReply = HostClient::request_text(host_process, 133,
+        source_bytes_before_edit, source_bytes_after_edit, "")
+    expect_integration(reverted_source.result == 1 and HostClient::request(host_process, 130, 0, 0).result == 0, 447)
+    expect_integration(integration_setenv("FAKE_ELISAPKG_SLEEP", "2") == 0, 450)
+    expect_integration(integration_setenv("FAKE_ELISAPKG_STARTED_FILE", "../../../build/fake-elisapkg-tree-started") == 0, 451)
+    _ = PosixFile::remove("build/fake-elisapkg-tree-started")
+    package_tree_file: cstr = "test/fixtures/package_task/test/integration_tests.elisa"
+    original_package_tree_file: mutable darray[u8] = []
+    original_package_tree_size: usize = PosixFile::read_bytes(&original_package_tree_file, package_tree_file, 4096)
+    changed_package_tree_file: darray[u8] = geometry_bytes("def main() -> i64:\n    return 1\n")
+    run_shell_command(shell, ShellCommand.RunPackageTests.u32())
+    tree_started_wait: mutable i64 = 0
+    tree_started: mutable darray[u8] = []
+    while (tree_started.count == 0 or not BuildJob::is_running(&build_job)) and tree_started_wait < 30000:
+        app_frame()
+        tree_started <- []
+        _ = PosixFile::read_bytes(&tree_started, "build/fake-elisapkg-tree-started", 128)
+        tree_started_wait <- tree_started_wait + 1
+    _ = PosixFile::remove(package_tree_file)
+    changed_tree_write: i64 = PosixFile::write_bytes_plain(package_tree_file, changed_package_tree_file)
+    expect_integration(original_package_tree_size > 0 and tree_started_wait < 30000
+        and tree_started.count > 0 and BuildJob::is_running(&build_job)
+        and changed_tree_write == changed_package_tree_file.count.i64(), 452)
+    stale_tree_wait: mutable i64 = 0
+    while BuildJob::is_running(&build_job) and stale_tree_wait < 30000:
+        app_frame()
+        stale_tree_wait <- stale_tree_wait + 1
+    stale_tree_output: darray[u8] = geometry_bytes(BuildJob::output_view(&build_job))
+    stale_tree_problem: ToolProblem& = &shell.tool_problems[PROBLEM_TOOL_TEST_RUNNER.usize()]
+    expect_integration(stale_tree_wait < 30000 and build_job.state == BuildJob::State.Succeeded
+        and not package_task_active and stale_tree_problem.active and stale_tree_problem.severity == 2
+        and stale_tree_problem.source_revision == package_task_source_fingerprint
+        and bytes_contain(stale_tree_output, "Package test result is stale"), 453)
+    _ = PosixFile::remove(package_tree_file)
+    restored_tree_write: i64 = PosixFile::write_bytes_plain(package_tree_file, original_package_tree_file)
+    expect_integration(restored_tree_write == original_package_tree_size.i64(), 454)
+    clear_tool_problem(shell, PROBLEM_TOOL_TEST_RUNNER)
+    expect_integration(integration_setenv("FAKE_ELISAPKG_SLEEP", "") == 0, 448)
+    expect_integration(integration_setenv("FAKE_ELISAPKG_STARTED_FILE", "") == 0, 449)
+    _ = PosixFile::remove("build/fake-elisapkg-started")
+    _ = PosixFile::remove("build/fake-elisapkg-tree-started")
+    _ = PosixFile::remove("build/fake-elisapkg-task.log")
+    restored_source_path: sview = "test/fixtures/source_task_fixture.elisa"
+    if shell.compact_mode:
+        UiHandles::replace_text(shell.compact_open_path_field, restored_source_path)
+    else:
+        UiHandles::replace_text(shell.open_path_field, restored_source_path)
+    open_document(shell)
+    expect_integration(shell.standalone_source and shell.source_mode
+        and HostClient::request(host_process, 113, 0, 0).result == 1, 425)
 
 def main() -> i64:
     UiHarness::start(1180.0, 760.0)
     UiHarness::focus_gained()
+    profile_only: cstr? = getenv("ELISA_IDE_PROFILE_ONLY")
+    if profile_only is value:
+        profile_path: sview = "test/fixtures/source_task_fixture.elisa"
+        UiHandles::replace_text(shell.open_path_field, profile_path)
+        open_document(shell)
+        expect_integration(shell.standalone_source and shell.source_mode
+            and UiHandles::is_visible(shell.profile_button)
+            and UiHandles::is_enabled(shell.profile_button), 330)
+        expect_integration(integration_setenv("ELISA_PROFILER", "test/fixtures/fake_elisa_profiler.py") == 0, 331)
+        expect_integration(integration_setenv("ELISA_IDE_PROFILE_ROOT", "build/profile-test-results") == 0, 332)
+        click(shell.profile_button)
+        profile_wait: mutable i64 = 0
+        while BuildJob::is_running(&build_job) and profile_wait < 30000:
+            app_frame()
+            profile_wait <- profile_wait + 1
+        profile_output: darray[u8] = geometry_bytes(BuildJob::output_view(&build_job))
+        expect_integration(profile_wait < 30000 and not profile_active
+            and build_job.state == BuildJob::State.Succeeded
+            and bytes_contain(profile_output, "Profile capture accepted")
+            and bytes_contain(profile_output, "main: 1000 ns inclusive")
+            and bytes_contain(profile_output, "Profile progress: capture complete")
+            and bytes_contain(profile_output, "Allocation lifecycle: disabled")
+            and bytes_contain(profile_output, "Native/foreign frame unwind: not collected")
+            and bytes_contain(profile_output, "Artifact SHA-256:"), 333)
+        expect_integration(bytes_contain(geometry_bytes(status_view(shell)), "validated report is in Build Output"), 334)
+        expect_integration(bytes_contain(profile_output, "Profile report available"), 342)
+        expect_integration(shell.profile_report_ready, 335)
+        expect_integration(same_text(UiFlat::widget(shell.profile_button.widget_id.usize()).text, "Open Report"), 341)
+        expect_integration(integration_setenv("ELISA_IDE_VIEWER", "test/fixtures/fake_profile_viewer.py") == 0, 336)
+        click(shell.profile_button)
+        report_open_wait: mutable i64 = 0
+        while BuildJob::is_running(&build_job) and report_open_wait < 30000:
+            app_frame()
+            report_open_wait <- report_open_wait + 1
+        report_open_output: darray[u8] = geometry_bytes(BuildJob::output_view(&build_job))
+        expect_integration(report_open_wait < 30000 and not profile_active
+            and build_job.state == BuildJob::State.Succeeded
+            and bytes_contain(report_open_output, "Opened html profile report"), 337)
+        shell.profile_report_ready <- false
+        expect_integration(integration_setenv("ELISA_PROFILER", "build/missing-profile-tool") == 0, 359)
+        click(shell.profile_button)
+        profile_failure_wait: mutable i64 = 0
+        while BuildJob::is_running(&build_job) and profile_failure_wait < 30000:
+            app_frame()
+            profile_failure_wait <- profile_failure_wait + 1
+        profiler_problem: ToolProblem& = &shell.tool_problems[PROBLEM_TOOL_PROFILER.usize()]
+        expect_integration(profile_failure_wait < 30000 and not profile_active
+            and build_job.state == BuildJob::State.Failed
+            and profiler_problem.active and profiler_problem.severity == 1
+            and profiler_problem.task_id == build_revision.i64()
+            and profiler_problem.source_revision == shell.building_source_fingerprint
+            and profiler_problem.source_path_length > 0
+            and bytes_contain(geometry_bytes(UiText::fixed_bytes_view_range[512](profiler_problem.message_storage, 0, profiler_problem.message_length.usize())), "Profile failed"), 360)
+        expect_integration(integration_setenv("ELISA_PROFILER", "test/fixtures/fake_elisa_profiler.py") == 0, 361)
+        expect_integration(integration_setenv("FAKE_PROFILE_SLEEP", "1") == 0, 343)
+        _ = PosixFile::remove("build/profile-shell-started")
+        expect_integration(integration_setenv("FAKE_PROFILE_STARTED_FILE", "../../build/profile-shell-started") == 0, 354)
+        click(shell.profile_button)
+        profile_cancel_wait: mutable i64 = 0
+        while not profile_active and profile_cancel_wait < 1000:
+            app_frame()
+            profile_cancel_wait <- profile_cancel_wait + 1
+        expect_integration(profile_active and BuildJob::is_running(&build_job), 344)
+        profile_started_wait: mutable i64 = 0
+        profile_started: mutable darray[u8] = []
+        while profile_started.count == 0 and profile_started_wait < 30000:
+            app_frame()
+            profile_started <- []
+            _ = PosixFile::read_bytes(&profile_started, "build/profile-shell-started", 64)
+            profile_started_wait <- profile_started_wait + 1
+        expect_integration(profile_started_wait < 30000 and profile_started.count > 0, 355)
+        click(shell.stop_button)
+        expect_integration(not profile_active and build_job.state == BuildJob::State.Cancelled
+            and not shell.tool_problems[PROBLEM_TOOL_PROFILER.usize()].active, 345)
+        expect_integration(integration_setenv("FAKE_PROFILE_SLEEP", "") == 0, 346)
+        app_frame()
+        expect_integration(shell.profile_recovery_ready
+            and same_text(UiFlat::widget(shell.profile_button.widget_id.usize()).text, "Recover"), 356)
+        click(shell.profile_button)
+        profile_recovery_wait: mutable i64 = 0
+        while BuildJob::is_running(&build_job) and profile_recovery_wait < 30000:
+            app_frame()
+            profile_recovery_wait <- profile_recovery_wait + 1
+        profile_recovery_output: darray[u8] = geometry_bytes(BuildJob::output_view(&build_job))
+        expect_integration(profile_recovery_wait < 30000 and not profile_active
+            and build_job.state == BuildJob::State.Succeeded
+            and bytes_contain(profile_recovery_output, "Profile recovery accepted")
+            and bytes_contain(profile_recovery_output, "Compiler revision: not recorded")
+            and shell.profile_report_ready and not shell.profile_recovery_ready
+            and same_text(UiFlat::widget(shell.profile_button.widget_id.usize()).text, "Open Report"), 357)
+        click(shell.profile_button)
+        recovered_report_wait: mutable i64 = 0
+        while BuildJob::is_running(&build_job) and recovered_report_wait < 30000:
+            app_frame()
+            recovered_report_wait <- recovered_report_wait + 1
+        recovered_report_output: darray[u8] = geometry_bytes(BuildJob::output_view(&build_job))
+        expect_integration(recovered_report_wait < 30000 and not profile_active
+            and build_job.state == BuildJob::State.Succeeded
+            and bytes_contain(recovered_report_output, "Opened html profile report"), 358)
+        shell.profile_report_ready <- false
+        click(shell.build_button)
+        source_build_wait: mutable i64 = 0
+        while BuildJob::is_running(&build_job) and source_build_wait < 120000:
+            app_frame()
+            source_build_wait <- source_build_wait + 1
+        expect_integration(source_build_wait < 120000 and build_job.state == BuildJob::State.Succeeded, 347)
+        run_project(shell)
+        source_run_wait: mutable i64 = 0
+        while run_active and source_run_wait < 30000:
+            app_frame()
+            source_run_wait <- source_run_wait + 1
+        expect_integration(not run_active, 348)
+        expect_integration(bytes_contain(geometry_bytes(BuildJob::output_view(&build_job)), "source-task-ran"), 349)
+        expect_integration(same_text(status_view(shell), "Application finished"), 350)
+        return finish()
     test_geometry_acceptance()
+    test_debuggee_terminal_state()
     test_preview_path_isolation()
     test_frame_identity_acceptance()
     test_build_diagnostic_projection()
     test_lsp_coordinate_conversion()
+    test_debug_restart_shortcut()
+    package_only: cstr? = getenv("ELISA_IDE_PACKAGE_ONLY")
+    if package_only is value:
+        test_toolchain_doctor()
+        test_package_task_workflow()
+        return finish()
 
     # Cold launch owns a clean untitled form: New/Open remain usable and Save
     # is disabled until this document has a destination.
@@ -812,7 +1355,21 @@ def main() -> i64:
     click(shell.preview_retry_button)
     expect_integration(shell.preview_pending and shell.preview_ready and shell.preview_region_count == 0, 66)
     preview_retry_completed: bool = wait_for_shell_preview(60000)
-    expect_integration(preview_retry_completed and shell.preview_region_count == 2, 67)
+    preview_retry_ok: bool = preview_retry_completed and shell.preview_region_count == 2
+    expect_integration(preview_retry_ok, 2067)
+    if not preview_retry_ok:
+        integration_report_i64("preview_retry_pending=", 1 if shell.preview_pending else 0)
+        integration_report_i64("preview_retry_ready=", 1 if shell.preview_ready else 0)
+        integration_report_i64("preview_retry_regions=", shell.preview_region_count.i64())
+        integration_report_i64("preview_retry_revision=", shell.preview_revision.i64())
+        integration_report_i64("preview_retry_geometry_revision=", shell.preview_geometry_revision.i64())
+        integration_report_i64("preview_retry_signature=", shell.preview_signature)
+        integration_report_i64("preview_retry_geometry_signature=", shell.preview_geometry_signature)
+        report_sview(UiHandles::text_value(shell.preview_status))
+        report_sview(UiFlat::widget(shell.preview_status.widget_id.usize()).help)
+    preview_retry_only: cstr? = getenv("ELISA_IDE_PREVIEW_RETRY_ONLY")
+    if preview_retry_only is value:
+        return finish()
     expect_integration(UiHandles::activate(shell.undo_button), 22)
     undo_caption: HostClient::HostReply = HostClient::request(&host_process, 53, 0, 0)
     expect_integration(same_text(ShellBytes::view_of(&undo_caption.text), "Button"), 26)
@@ -911,6 +1468,15 @@ def main() -> i64:
         and decode_local_file_uri("https://example.invalid/source.elisa").count == 0
         and decode_local_file_uri("file:///tmp/bad%00.elisa").count == 0
         and decode_local_file_uri("file:///tmp/bad%2.elisa").count == 0, 231)
+    debug_preferences_path: mutable darray[u8] = []
+    append_panel_text(&debug_preferences_path, "build/debug-breakpoint-test-")
+    append_nonnegative(&debug_preferences_path, PosixProcess::monotonic_ms())
+    append_panel_text(&debug_preferences_path, "/preferences.json")
+    debug_preferences_path.push(0)
+    debug_preferences_config: mutable cstr = ""
+    can Unsafe.PointerCast:
+        debug_preferences_config <- (&debug_preferences_path[0]).cast[cstr] can Unsafe.PointerCast
+    expect_integration(integration_setenv("ELISA_IDE_CONFIG", debug_preferences_config) == 0, 368)
     UiHandles::replace_text(shell.open_path_field, sview(SOURCE_EDIT_PATH, 0, -1))
     click(shell.open_button)
     source_first_line: sview = UiHandles::text_value(shell.source_line_rows[0.usize()])
@@ -922,7 +1488,75 @@ def main() -> i64:
     expect_integration(UiHandles::is_visible(shell.source_reveal_button)
         and UiHandles::is_enabled(shell.source_reveal_button), 164)
     expect_integration(shell.source_line_count == 32
-        and bytes_contain(geometry_bytes(source_first_line), "1: module source_view:"), 155)
+        and bytes_contain(geometry_bytes(source_first_line), "1 | module source_view:"), 155)
+    breakpoint_marker_row: UiHandles::Handle = shell.source_line_rows[1.usize()]
+    if UiHandles::widget(breakpoint_marker_row) is breakpoint_widget:
+        UiHarness::dispatch(UiCore::PointerEvent.Down(at: UiCore::Vec2(breakpoint_widget.x + 2.0, breakpoint_widget.y + breakpoint_widget.height * 0.5), button: UiCore::PointerButton.Primary.i32()))
+        guttered_breakpoint_line: sview = UiHandles::text_value(breakpoint_marker_row)
+        expect_integration(shell.debug_breakpoint_count == 1
+            and ShellDebug::has_breakpoint(shell, 2)
+            and bytes_contain(geometry_bytes(guttered_breakpoint_line), "*      2 |"), 294)
+        source_identity: HostClient::HostReply = HostClient::request(host_process, 114, 0, 0)
+        source_identity_fingerprint: i64 = HostClient::request(host_process, 152, 0, 0).result
+        restored_breakpoint_shell: mutable Shell = new_shell()
+        ShellDebug::ensure_source(restored_breakpoint_shell,
+            ShellBytes::view_of(&source_identity.text), source_identity_fingerprint)
+        expect_integration(restored_breakpoint_shell.debug_breakpoint_count == 1
+            and ShellDebug::has_breakpoint(restored_breakpoint_shell, 2), 369)
+        relocated_breakpoint_shell: mutable Shell = new_shell()
+        ShellDebug::ensure_source(relocated_breakpoint_shell, SOURCE_RELATED_PATH,
+            source_identity_fingerprint)
+        expect_integration(relocated_breakpoint_shell.debug_breakpoint_count == 0, 370)
+        stale_breakpoint_shell: mutable Shell = new_shell()
+        ShellDebug::ensure_source(stale_breakpoint_shell,
+            ShellBytes::view_of(&source_identity.text), source_identity_fingerprint + 1)
+        expect_integration(stale_breakpoint_shell.debug_breakpoint_count == 0, 371)
+        UiHarness::dispatch(UiCore::PointerEvent.Down(at: UiCore::Vec2(breakpoint_widget.x + 2.0, breakpoint_widget.y + breakpoint_widget.height * 0.5), button: UiCore::PointerButton.Secondary.i32()))
+        expect_integration(shell.debug_breakpoint_count == 0
+            and not ShellDebug::has_breakpoint(shell, 2), 295)
+        cleared_breakpoint_shell: mutable Shell = new_shell()
+        ShellDebug::ensure_source(cleared_breakpoint_shell,
+            ShellBytes::view_of(&source_identity.text), source_identity_fingerprint)
+        expect_integration(cleared_breakpoint_shell.debug_breakpoint_count == 0, 372)
+    else:
+        expect_integration(false, 296)
+    debug_artifact_fixture: sview = "build/elisa_ide_debug.edir"
+    _ = PosixFile::remove("build/elisa_ide_debug.edir")
+    expect_integration(PosixFile::write_plain("build/elisa_ide_debug.edir", "fake debug artifact") > 0, 362)
+    debug_source_fingerprint: i64 = HostClient::request(host_process, 152, 0, 0).result
+    shell.debug_artifact_fingerprint <- debug_source_fingerprint
+    expect_integration(integration_setenv("ELISA_DEBUGGER_DAP", "build/missing-debug-adapter") == 0, 363)
+    debug_started: bool = ShellDebug::start(shell, debug_artifact_fixture, SOURCE_EDIT_PATH, 723, shell.source_selected_line)
+    debug_failure_wait: mutable i64 = 0
+    while not shell.tool_problems[PROBLEM_TOOL_DEBUGGER.usize()].active and debug_failure_wait < 500:
+        app_frame()
+        debug_failure_wait <- debug_failure_wait + 1
+    debugger_problem: ToolProblem& = &shell.tool_problems[PROBLEM_TOOL_DEBUGGER.usize()]
+    expect_integration(debug_started and debug_failure_wait < 500
+        and debugger_problem.active and debugger_problem.severity == 1
+        and debugger_problem.task_id == 723
+        and debugger_problem.source_revision == debug_source_fingerprint
+        and debugger_problem.source_path_length > 0
+        and bytes_contain(geometry_bytes(UiText::fixed_bytes_view_range[512](debugger_problem.message_storage, 0, debugger_problem.message_length.usize())), "Debugger error:")
+        and not shell.debug_session_active
+        and bytes_contain(geometry_bytes(status_view(shell)), "Debugger error:"), 364)
+    ShellDebug::stop(shell)
+    clear_tool_problem(shell, PROBLEM_TOOL_DEBUGGER)
+    stale_debug_source_bytes: i64 = HostClient::request(host_process, 148, 0, 0).result
+    stale_debug_edit: HostClient::HostReply = HostClient::request_text(host_process, 133,
+        stale_debug_source_bytes, stale_debug_source_bytes, "\n# stale debug source fixture\n")
+    shell.debug_session_active <- true
+    shell.debug_source_validation_deadline_ms <- 0
+    app_frame()
+    stale_debug_problem: ToolProblem& = &shell.tool_problems[PROBLEM_TOOL_DEBUGGER.usize()]
+    stale_debug_message: sview = UiText::fixed_bytes_view_range[512](stale_debug_problem.message_storage, 0, stale_debug_problem.message_length.usize())
+    expect_integration(stale_debug_edit.result == 1 and not shell.debug_session_active
+        and stale_debug_problem.active and bytes_contain(geometry_bytes(stale_debug_message), "unsaved edits")
+        and bytes_contain(geometry_bytes(status_view(shell)), "unsaved edits"), 365)
+    _ = HostClient::request(host_process, 134, 0, 0)
+    ShellDebug::stop(shell)
+    clear_tool_problem(shell, PROBLEM_TOOL_DEBUGGER)
+    _ = PosixFile::remove("build/elisa_ide_debug.edir")
     lsp_open_wait: mutable i64 = 0
     while (shell.source_lsp_version < 1 or shell.source_lsp_diagnostics != 1) and lsp_open_wait < 300:
         _ = PosixProcess::poll(&shell.source_lsp_process, 10)
@@ -945,7 +1579,7 @@ def main() -> i64:
         symbol_navigation_wait <- symbol_navigation_wait + 1
     symbol_target_path: HostClient::HostReply = HostClient::request(host_process, 114, 0, 0)
     symbol_target_line: sview = UiHandles::text_value(shell.source_line_rows[1.usize()])
-    symbol_target_prefix: darray[u8] = source_line_prefix(2)
+    symbol_target_prefix: darray[u8] = source_line_prefix(shell, 2)
     expect_integration(symbol_navigation_wait < 400 and ShellLsp::workspace_symbol_count(shell) == 1
         and shell.source_lsp_symbol_selected == 0
         and bytes_contain(geometry_bytes(status_view(shell)), "Opened workspace symbol related_entry"), 289)
@@ -988,15 +1622,18 @@ def main() -> i64:
         and bytes_contain(geometry_bytes(source_diag_widget.help), "fixture second related location")
         and bytes_contain(geometry_bytes(source_diag_widget.help), "Additional related locations omitted: 2"), 213)
     source_diag_widget_index: usize = shell.source_line_rows[0.usize()].widget_id.usize()
-    expect_integration(UiFlat::text_underline_start_utf16(source_diag_widget_index, 0) == 10
+    expect_integration(UiFlat::text_underline_start_utf16(source_diag_widget_index, 0)
+        == source_line_prefix(shell, 1).count + 7
         and UiFlat::text_underline_stop_utf16(source_diag_widget_index, 0) == UiFlat::text_utf16_length(source_diag_widget_index)
         and UiFlat::text_underline_color(source_diag_widget_index, 0).r == 126, 226)
     source_diag_middle_widget: usize = shell.source_line_rows[1.usize()].widget_id.usize()
     source_diag_end_widget: usize = shell.source_line_rows[3.usize()].widget_id.usize()
-    expect_integration(UiFlat::text_underline_start_utf16(source_diag_middle_widget, 0) == 3
+    expect_integration(UiFlat::text_underline_start_utf16(source_diag_middle_widget, 0)
+        == source_line_prefix(shell, 2).count
         and UiFlat::text_underline_stop_utf16(source_diag_middle_widget, 0) == UiFlat::text_utf16_length(source_diag_middle_widget), 227)
-    expect_integration(UiFlat::text_underline_start_utf16(source_diag_end_widget, 0) == 3
-        and UiFlat::text_underline_stop_utf16(source_diag_end_widget, 0) == 7, 228)
+    expect_integration(UiFlat::text_underline_start_utf16(source_diag_end_widget, 0)
+        == source_line_prefix(shell, 4).count
+        and UiFlat::text_underline_stop_utf16(source_diag_end_widget, 0) == source_line_prefix(shell, 4).count + 4, 228)
     expect_integration(ShellLsp::position_encoding(shell) == 16, 210)
     lsp_problem_text: sview = UiFlat::widget(shell.problem_rows[0.usize()].widget_id.usize()).text
     expect_integration(UiHandles::is_visible(shell.problem_rows[0.usize()])
@@ -1010,14 +1647,16 @@ def main() -> i64:
         and shell.source_selected_line == 1
         and bytes_contain(geometry_bytes(status_view(shell)), "Selected Elisa-LSP diagnostic"), 205)
     lsp_version_before_edit: i64 = shell.source_lsp_version
-    prefix_before_diagnostic: darray[u8] = source_line_prefix(1)
+    prefix_before_diagnostic: darray[u8] = source_line_prefix(shell, 1)
     expect_integration(UiFlat::selection_utf16_location(shell.source_line_rows[0.usize()].widget_id.usize())
         == prefix_before_diagnostic.count + 7, 209)
     source_editor: UiHandles::Handle = shell.source_line_rows[0.usize()]
     source_editor_original: sview = UiHandles::text_value(source_editor)
     source_editor_focused: bool = UiHandles::request_focus(source_editor)
     UiHandles::set_selection_utf16(source_editor, 0, source_editor_original.len.usize())
-    app_text_input("1: module source_view_edited:")
+    source_edit_input: mutable darray[u8] = source_line_prefix(shell, 1)
+    append_panel_text(&source_edit_input, "module source_view_edited:")
+    app_text_input(ShellBytes::view_of(&source_edit_input))
     app_widget_event(source_editor.widget_id.usize(), UiConst::WidgetEvent.Change.i32())
     edited_source_line: HostClient::HostReply = HostClient::request(host_process, 116, 0, 0)
     expect_integration(source_editor_focused and edited_source_line.result == 1
@@ -1030,12 +1669,6 @@ def main() -> i64:
         app_frame()
         lsp_change_wait <- lsp_change_wait + 1
     lsp_changed_status: sview = UiFlat::widget(shell.source_lsp_status.widget_id.usize()).text
-    integration_report_i64("lsp_change_wait=", lsp_change_wait)
-    integration_report_i64("lsp_state=", shell.source_lsp_state.i64())
-    integration_report_i64("lsp_version_before=", lsp_version_before_edit)
-    integration_report_i64("lsp_version_after=", shell.source_lsp_version)
-    integration_report_i64("lsp_version_valid=", 1 if shell.source_lsp_version_valid else 0)
-    integration_report_i64("lsp_diagnostics=", shell.source_lsp_diagnostics.i64())
     expect_integration(lsp_change_wait < 300 and shell.source_lsp_state == 1
         and shell.source_lsp_version > lsp_version_before_edit and shell.source_lsp_diagnostics == 1
         and bytes_contain(geometry_bytes(lsp_changed_status), "v"), 203)
@@ -1068,7 +1701,7 @@ def main() -> i64:
     expect_integration(UiHandles::activate(shell.source_next_button), 157)
     source_second_page: sview = UiHandles::text_value(shell.source_line_rows[0.usize()])
     expect_integration(shell.source_page_start == 32
-        and bytes_contain(geometry_bytes(source_second_page), "33:     def source_view_marker() -> i64:"), 158)
+        and bytes_contain(geometry_bytes(source_second_page), "33 |     def source_view_marker() -> i64:"), 158)
     click(shell.source_line_rows[0.usize()])
     expect_integration(shell.source_selected_line == 33
         and bytes_contain(geometry_bytes(status_view(shell)), "Selected source line 33"), 160)
@@ -1083,7 +1716,7 @@ def main() -> i64:
     expect_integration(UiHandles::is_visible(shell.source_lsp_definition_button)
         and UiHandles::is_enabled(shell.source_lsp_definition_button), 266)
     definition_source_row: UiHandles::Handle = shell.source_line_rows[0.usize()]
-    definition_source_prefix: darray[u8] = source_line_prefix(1)
+    definition_source_prefix: darray[u8] = source_line_prefix(shell, 1)
     expect_integration(UiHandles::request_focus(definition_source_row), 267)
     UiHandles::set_selection_utf16(definition_source_row, definition_source_prefix.count + 10, 0)
     click(shell.source_lsp_definition_button)
@@ -1095,7 +1728,7 @@ def main() -> i64:
         definition_wait <- definition_wait + 1
     definition_path_reply: HostClient::HostReply = HostClient::request(host_process, 114, 0, 0)
     definition_line_text: sview = UiHandles::text_value(shell.source_line_rows[1.usize()])
-    definition_prefix: darray[u8] = source_line_prefix(2)
+    definition_prefix: darray[u8] = source_line_prefix(shell, 2)
     expect_integration(definition_wait < 300 and not shell.source_lsp_definition_requested
         and bytes_contain(geometry_bytes(status_view(shell)), "Opened Elisa-LSP definition"), 268)
     expect_integration(definition_path_reply.result == 1
@@ -1224,6 +1857,9 @@ def main() -> i64:
     command(shell, 13, 0)
     click(shell.save_button)
     expect_integration(HostClient::request(host_process, 40, 0, 0).result == 0, 286)
+    # Task execution opens Output; return to Problems before verifying that
+    # compiler diagnostics remain navigable alongside the saved build log.
+    select_bottom_tab(shell, 0)
     # A compiler problem for a different handwritten file opens that file and
     # selects its exact UTF-8 byte location, even when another source document
     # is currently displayed in the Source pane.
@@ -1380,6 +2016,53 @@ def main() -> i64:
     open_document(shell)
     expect_integration(shell.standalone_source and shell.source_mode
         and HostClient::request(host_process, 113, 0, 0).result == 1, 276)
+    test_package_task_workflow()
+    expect_integration(UiHandles::is_visible(shell.profile_button)
+        and UiHandles::is_enabled(shell.profile_button), 320)
+    expect_integration(integration_setenv("ELISA_PROFILER", "test/fixtures/fake_elisa_profiler.py") == 0, 321)
+    expect_integration(integration_setenv("ELISA_IDE_PROFILE_ROOT", "../../build/profile-test-results") == 0, 322)
+    click(shell.profile_button)
+    profile_wait: mutable i64 = 0
+    while BuildJob::is_running(&build_job) and profile_wait < 30000:
+        app_frame()
+        profile_wait <- profile_wait + 1
+    profile_output: darray[u8] = geometry_bytes(BuildJob::output_view(&build_job))
+    expect_integration(profile_wait < 30000 and not profile_active
+        and build_job.state == BuildJob::State.Succeeded
+        and bytes_contain(profile_output, "Profile capture accepted")
+        and bytes_contain(profile_output, "main: 1000 ns inclusive")
+        and bytes_contain(profile_output, "Profile progress: capture complete")
+        and bytes_contain(profile_output, "Task lifecycle: unsupported")
+        and bytes_contain(profile_output, "Process attach: unavailable")
+        and bytes_contain(profile_output, "Artifact SHA-256:"), 323)
+    expect_integration(bytes_contain(geometry_bytes(status_view(shell)), "validated report is in Build Output"), 324)
+    expect_integration(shell.profile_report_ready, 338)
+    expect_integration(same_text(UiFlat::widget(shell.profile_button.widget_id.usize()).text, "Open Report"), 342)
+    expect_integration(integration_setenv("ELISA_IDE_VIEWER", "test/fixtures/fake_profile_viewer.py") == 0, 339)
+    click(shell.profile_button)
+    report_open_wait: mutable i64 = 0
+    while BuildJob::is_running(&build_job) and report_open_wait < 30000:
+        app_frame()
+        report_open_wait <- report_open_wait + 1
+    report_open_output: darray[u8] = geometry_bytes(BuildJob::output_view(&build_job))
+    expect_integration(report_open_wait < 30000 and not profile_active
+        and build_job.state == BuildJob::State.Succeeded
+        and bytes_contain(report_open_output, "Opened html profile report"), 340)
+
+    shell.profile_report_ready <- false
+    expect_integration(integration_setenv("FAKE_PROFILE_SLEEP", "1") == 0, 325)
+    click(shell.profile_button)
+    profile_cancel_wait: mutable i64 = 0
+    while not profile_active and profile_cancel_wait < 1000:
+        app_frame()
+        profile_cancel_wait <- profile_cancel_wait + 1
+    expect_integration(profile_active and BuildJob::is_running(&build_job), 326)
+    click(shell.stop_button)
+    expect_integration(not profile_active and not BuildJob::is_running(&build_job)
+        and build_job.state == BuildJob::State.Cancelled
+        and bytes_contain(geometry_bytes(status_view(shell)), "Profile cancelled"), 327)
+    expect_integration(integration_setenv("FAKE_PROFILE_SLEEP", "") == 0, 328)
+
     click(shell.build_button)
     source_build_wait: mutable i64 = 0
     while BuildJob::is_running(&build_job) and source_build_wait < 120000:
@@ -1387,24 +2070,45 @@ def main() -> i64:
         source_build_wait <- source_build_wait + 1
     source_artifact_bytes: mutable darray[u8] = []
     source_artifact_length: usize = PosixFile::read_bytes(&source_artifact_bytes, "build/elisa_ide_source_app", 8)
-    expect_integration(source_build_wait < 120000 and build_job.state == BuildJob::State.Succeeded
-        and shell.source_artifact_valid and source_artifact_length > 0
-        and bytes_contain(geometry_bytes(BuildJob::output_view(&build_job)), "elisa_ide_source_app"), 277)
+    source_build_ok: bool = source_build_wait < 120000 and build_job.state == BuildJob::State.Succeeded and shell.source_artifact_valid and source_artifact_length > 0 and bytes_contain(geometry_bytes(BuildJob::output_view(&build_job)), "elisa_ide_source_app")
+    if not source_build_ok:
+        report_sview(status_view(shell))
+        integration_report_i64("source_build_wait=", source_build_wait)
+        integration_report_i64("source_build_succeeded=", 1 if build_job.state == BuildJob::State.Succeeded else 0)
+        integration_report_i64("source_artifact_valid=", 1 if shell.source_artifact_valid else 0)
+        integration_report_i64("source_artifact_length=", source_artifact_length.i64())
+        integration_report_i64("source_build_output_length=", BuildJob::output_view(&build_job).len)
+        integration_report_i64("source_build_output_has_name=", 1 if bytes_contain(geometry_bytes(BuildJob::output_view(&build_job)), "elisa_ide_source_app") else 0)
+        report_sview(BuildJob::output_view(&build_job))
+    expect_integration(source_build_ok, 277)
     run_project(shell)
     source_run_wait: mutable i64 = 0
     while run_active and source_run_wait < 30000:
         app_frame()
         source_run_wait <- source_run_wait + 1
-    expect_integration(source_run_wait < 30000 and not run_active
-        and bytes_contain(geometry_bytes(BuildJob::output_view(&build_job)), "source-task-ran")
-        and same_text(status_view(shell), "Application finished"), 278)
+    expect_integration(source_run_wait < 30000 and not run_active, 351)
+    expect_integration(bytes_contain(geometry_bytes(BuildJob::output_view(&build_job)), "source-task-ran"), 352)
+    expect_integration(same_text(status_view(shell), "Application finished"), 353)
     source_dirty_row: UiHandles::Handle = shell.source_line_rows[2.usize()]
     source_dirty_focused: bool = UiHandles::request_focus(source_dirty_row)
     UiHandles::set_selection_utf16(source_dirty_row, 0, UiFlat::text_utf16_length(source_dirty_row.widget_id.usize()))
-    app_text_input("3: def main() -> i64: # unsaved source edit")
+    debug_dirty_input: mutable darray[u8] = source_line_prefix(shell, 3)
+    append_panel_text(&debug_dirty_input, "def main() -> i64: # unsaved source edit")
+    app_text_input(ShellBytes::view_of(&debug_dirty_input))
     app_widget_event(source_dirty_row.widget_id.usize(), UiConst::WidgetEvent.Change.i32())
     expect_integration(source_dirty_focused
         and HostClient::request(host_process, 130, 0, 0).result == 1, 279)
+    # Give the retained editor one normal frame after the source edit so its
+    # refreshed row geometry and toolbar hit targets are current before input.
+    app_frame()
+    expect_integration(UiHandles::is_visible(shell.profile_button)
+        and UiHandles::is_enabled(shell.profile_button), 337)
+    click(shell.profile_button)
+    expect_integration(not BuildJob::is_running(&build_job)
+        and bytes_contain(geometry_bytes(status_view(shell)), "Save the source file before profiling it"), 329)
+    dispatch_debug_restart_shortcut()
+    expect_integration(not BuildJob::is_running(&build_job)
+        and bytes_contain(geometry_bytes(status_view(shell)), "Save the source file before debugging it"), 466)
     run_project(shell)
     expect_integration(not run_active
         and bytes_contain(geometry_bytes(status_view(shell)), "Save the source file and rebuild"), 280)
@@ -1414,6 +2118,7 @@ def main() -> i64:
     return finish()
 
 def finish() -> i64:
+    ShellDebug::shutdown(shell)
     ShellLsp::stop(shell)
     ShellPreview::stop(shell)
     clean_host()

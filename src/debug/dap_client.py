@@ -231,6 +231,11 @@ class DapClient:
                 raise DapProtocolError(f"DAP response arrived for unknown request_seq {request_seq!r}")
             if not isinstance(message.get("command"), str) or type(message.get("success")) is not bool:
                 raise DapProtocolError("DAP response has an invalid shape")
+            if message["command"] != self._pending[request_seq]:
+                raise DapProtocolError(
+                    f"DAP response command {message['command']!r} does not match "
+                    f"request {self._pending[request_seq]!r}"
+                )
             self._responses[request_seq] = message
         elif kind == "event":
             if not isinstance(message.get("event"), str):
@@ -243,29 +248,157 @@ class DapClient:
             raise DapProtocolError(f"unknown DAP message type {kind!r}")
         self.messages.append(message)
 
-    def request(self, command: str, arguments: Mapping[str, Any] | None = None, *, timeout: float | None = None) -> dict[str, Any]:
-        duration = self.request_timeout if timeout is None else timeout
-        if duration <= 0:
-            raise ValueError("timeout must be positive")
+    def _send_request_until(
+        self,
+        command: str,
+        arguments: Mapping[str, Any] | None,
+        deadline: float,
+    ) -> int:
+        if not command or "\x00" in command:
+            raise ValueError("DAP command must be nonempty and NUL-free")
+        self._ensure_running()
         seq = self._next_seq
         self._next_seq += 1
         message: dict[str, Any] = {"seq": seq, "type": "request", "command": command}
         if arguments is not None:
             message["arguments"] = dict(arguments)
-        deadline = time.monotonic() + duration
         self._pending[seq] = command
         try:
             self._write_all(frame(message), deadline)
-            while seq not in self._responses:
+        except (DapError, FrameError):
+            self._pending.pop(seq, None)
+            self.abort()
+            raise
+        return seq
+
+    def send_request(
+        self,
+        command: str,
+        arguments: Mapping[str, Any] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> int:
+        """Write a request and return its sequence without waiting for a response."""
+
+        duration = self.request_timeout if timeout is None else timeout
+        if duration <= 0:
+            raise ValueError("timeout must be positive")
+        return self._send_request_until(command, arguments, time.monotonic() + duration)
+
+    def _wait_response_until(self, request_seq: int, deadline: float) -> dict[str, Any]:
+        if request_seq not in self._pending and request_seq not in self._responses:
+            raise DapError(f"DAP request sequence {request_seq} is not pending")
+        try:
+            while request_seq not in self._responses:
                 if self._stdout_eof:
+                    command = self._pending.get(request_seq, "unknown")
                     raise DapError(f"DAP stdout closed before response to {command}")
                 self._read(deadline)
-            return self._responses.pop(seq)
+            return self._responses.pop(request_seq)
         except (DapError, FrameError):
             self.abort()
             raise
         finally:
-            self._pending.pop(seq, None)
+            self._pending.pop(request_seq, None)
+
+    def wait_response(self, request_seq: int, *, timeout: float | None = None) -> dict[str, Any]:
+        """Wait for a previously sent request, preserving interleaved events."""
+
+        duration = self.request_timeout if timeout is None else timeout
+        if duration <= 0:
+            raise ValueError("timeout must be positive")
+        return self._wait_response_until(request_seq, time.monotonic() + duration)
+
+    def wait_event_or_response(
+        self,
+        request_seq: int,
+        event_name: str,
+        *,
+        timeout: float | None = None,
+    ) -> tuple[str, dict[str, Any]]:
+        """Wait for either one request response or a named interleaved event.
+
+        This supports adapters that announce a launch event before completing
+        the launch response after a later ``configurationDone`` request.
+        """
+
+        if not event_name:
+            raise ValueError("event name must be nonempty")
+        if request_seq not in self._pending and request_seq not in self._responses:
+            raise DapError(f"DAP request sequence {request_seq} is not pending")
+        duration = self.request_timeout if timeout is None else timeout
+        if duration <= 0:
+            raise ValueError("timeout must be positive")
+        deadline = time.monotonic() + duration
+        try:
+            while True:
+                if request_seq in self._responses:
+                    response = self._responses.pop(request_seq)
+                    self._pending.pop(request_seq, None)
+                    return ("response", response)
+                for index, event in enumerate(self.events):
+                    if event.get("event") == event_name:
+                        return ("event", self.events.pop(index))
+                if self._stdout_eof:
+                    raise DapError(
+                        f"DAP stdout closed before response to {self._pending.get(request_seq, 'unknown')} "
+                        f"or event {event_name!r}"
+                    )
+                self._read(deadline)
+        except (DapError, FrameError):
+            self._pending.pop(request_seq, None)
+            self.abort()
+            raise
+
+    def request(self, command: str, arguments: Mapping[str, Any] | None = None, *, timeout: float | None = None) -> dict[str, Any]:
+        duration = self.request_timeout if timeout is None else timeout
+        if duration <= 0:
+            raise ValueError("timeout must be positive")
+        deadline = time.monotonic() + duration
+        seq = self._send_request_until(command, arguments, deadline)
+        return self._wait_response_until(seq, deadline)
+
+    def poll_available(self, timeout: float = 0.0) -> int:
+        """Read any currently available DAP messages without failing on idle."""
+
+        if timeout < 0:
+            raise ValueError("poll timeout must not be negative")
+        process = self._ensure_running()
+        assert process.stdout is not None
+        try:
+            readable, _, _ = select.select([process.stdout.fileno()], [], [], timeout)
+        except InterruptedError:
+            return 0
+        if not readable:
+            return 0
+        try:
+            chunk = os.read(process.stdout.fileno(), 8192)
+        except OSError as exc:
+            self.abort()
+            raise DapError(f"could not read DAP adapter output: {exc}") from exc
+        if not chunk:
+            self._stdout_eof = True
+            try:
+                self.decoder.finish()
+            except FrameError as exc:
+                self.abort()
+                raise DapProtocolError(str(exc)) from exc
+            return 0
+        self._stream_bytes += len(chunk)
+        if self._stream_bytes > self.max_stream_bytes:
+            self.abort()
+            raise DapProtocolError(f"DAP stdout exceeds {self.max_stream_bytes} bytes")
+        try:
+            decoded = self.decoder.feed(chunk)
+            for item in decoded:
+                self._record(item.message)
+        except FrameError as exc:
+            self.abort()
+            raise DapProtocolError(str(exc)) from exc
+        except DapProtocolError:
+            self.abort()
+            raise
+        return len(decoded)
 
     def initialize(self, *, adapter_id: str = "elisa", client_name: str = "Elisa IDE", timeout: float | None = None) -> dict[str, Any]:
         response = self.request(
@@ -292,14 +425,20 @@ class DapClient:
 
     def wait_event(self, event_name: str, *, timeout: float | None = None) -> dict[str, Any]:
         duration = self.request_timeout if timeout is None else timeout
+        if duration <= 0:
+            raise ValueError("timeout must be positive")
         deadline = time.monotonic() + duration
-        while True:
-            for index, event in enumerate(self.events):
-                if event.get("event") == event_name:
-                    return self.events.pop(index)
-            if self._stdout_eof:
-                raise DapError(f"DAP stdout closed before event {event_name!r}")
-            self._read(deadline)
+        try:
+            while True:
+                for index, event in enumerate(self.events):
+                    if event.get("event") == event_name:
+                        return self.events.pop(index)
+                if self._stdout_eof:
+                    raise DapError(f"DAP stdout closed before event {event_name!r}")
+                self._read(deadline)
+        except DapError:
+            self.abort()
+            raise
 
     def supports(self, capability: str) -> bool:
         return bool(self.capabilities.get(capability))
@@ -319,6 +458,14 @@ class DapClient:
             except DapError:
                 self.abort()
                 raise
+            # Some adapters acknowledge disconnect but keep their stdio loop
+            # alive until the client closes input. EOF is the final process
+            # lifecycle signal after the DAP request has completed.
+            if process.stdin is not None:
+                try:
+                    process.stdin.close()
+                except OSError:
+                    pass
             try:
                 process.wait(timeout=duration)
             except subprocess.TimeoutExpired:
